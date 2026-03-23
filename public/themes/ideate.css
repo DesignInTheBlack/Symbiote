@@ -1,0 +1,293 @@
+:root {
+  --bg-color: #f5f6f8;
+  --surface-color: #ffffff;
+  --surface-gradient: linear-gradient(180deg, #ffffff, #f2f3f6);
+
+  --accent-color: #e64f8f;
+  --accent-color-hover: #f06aa3;
+  --text-primary: #2b2f36;
+  --text-secondary: #6b7280;
+  --accent-primary: var(--accent-color);
+  --accent-secondary: #f7b2d0;
+
+  --border-color: rgba(15, 23, 42, 0.08);
+  --error-color: #e24c5f;
+  --success-color: #2fbf71;
+
+  --neu-flat: 0 10px 18px rgba(18, 24, 32, 0.08), 0 -10px 18px rgba(255, 255, 255, 0.9);
+  --neu-pressed: inset 0 6px 12px rgba(18, 24, 32, 0.08), inset 0 -6px 12px rgba(255, 255, 255, 0.85);
+  --neu-convex: 0 10px 18px rgba(18, 24, 32, 0.08), 0 -10px 18px rgba(255, 255, 255, 0.9);
+  --neu-border: 1px solid rgba(15, 23, 42, 0.08);
+  --chamfer-top: 1px solid rgba(255, 255, 255, 0.6);
+  --chamfer-bottom: 1px solid rgba(15, 23, 42, 0.12);
+
+  --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-header: 'Outfit', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SF Mono', 'Monaco', 'Consolas', 'Courier New', monospace;
+  --panel-radius: 18px;
+  --panel-padding: 16px;
+  --panel-gap: 12px;
+  --control-height: 36px;
+  --control-radius: 10px;
+  --control-padding-x: 14px;
+  --control-padding-y: 6px;
+  --control-icon-size: 16px;
+
+  --text-on-accent: #ffffff;
+  --accent-glow: rgba(230, 79, 143, 0.45);
+
+  --surface-overlay: rgba(15, 23, 42, 0.06);
+  --surface-overlay-border: 1px solid rgba(15, 23, 42, 0.08);
+  --surface-muted: rgba(15, 23, 42, 0.04);
+  --scrollbar-thumb-hover: rgba(15, 23, 42, 0.2);
+
+  --code-bg: rgba(15, 23, 42, 0.06);
+  --code-border: 1px solid rgba(15, 23, 42, 0.08);
+  --code-text: #2b2f36;
+
+  --raw-bg: rgba(15, 23, 42, 0.06);
+  --raw-border: 1px solid rgba(15, 23, 42, 0.08);
+  --raw-text: #4b5563;
+
+  --task-card-bg: rgba(47, 191, 113, 0.12);
+  --task-card-border: 1px solid rgba(47, 191, 113, 0.35);
+  --reminder-card-bg: var(--task-card-bg);
+  --reminder-card-border: var(--task-card-border);
+  --reminder-card-shadow: var(--neu-pressed);
+  --reminder-card-title: var(--accent-color);
+  --reminder-card-text: var(--text-primary);
+  --reminder-card-meta: var(--text-secondary);
+  --reminder-card-icon: var(--accent-color);
+
+  --toast-bg: rgba(255, 255, 255, 0.95);
+  --toast-border: 1px solid rgba(15, 23, 42, 0.08);
+  --toast-shadow: 0 10px 24px rgba(18, 24, 32, 0.12);
+  --toast-text: #2b2f36;
+  --toast-muted: #6b7280;
+  --toast-action-border: rgba(15, 23, 42, 0.12);
+
+  --mic-recording-bg: rgba(226, 76, 95, 0.12);
+  --mic-speaking-bg: rgba(47, 191, 113, 0.12);
+  --mic-error-bg: rgba(226, 76, 95, 0.2);
+  --mic-reconnecting-bg: rgba(230, 79, 143, 0.12);
+
+  --spinner-border: rgba(15, 23, 42, 0.2);
+  --spinner-border-top: var(--accent-color);
+
+  --badge-text: #ffffff;
+  --badge-shadow: 0 2px 4px rgba(15, 23, 42, 0.12);
+
+  --time-badge-bg: rgba(0, 188, 212, 0.12);
+  --time-badge-text: #0891b2;
+  --time-badge-border: 1px solid rgba(0, 188, 212, 0.3);
+
+  --context-danger-bg: rgba(226, 76, 95, 0.12);
+
+  --danger-color: #e24c5f;
+  --danger-solid: #ef4444;
+  --danger-solid-text: #ffffff;
+
+  --status-success: #2fbf71;
+  --status-success-soft: rgba(47, 191, 113, 0.12);
+  --status-success-border: rgba(47, 191, 113, 0.35);
+  --status-warning: #f59e0b;
+  --status-caution: #f97316;
+  --status-caution-soft: rgba(249, 115, 22, 0.12);
+  --status-caution-border: rgba(249, 115, 22, 0.35);
+  --status-danger: #ef4444;
+  --status-danger-soft: rgba(239, 68, 68, 0.12);
+  --status-danger-border: rgba(239, 68, 68, 0.35);
+  --status-neutral: #9ca3af;
+
+  --health-banner-bg: linear-gradient(135deg,
+      color-mix(in srgb, var(--status-warning) 22%, var(--surface-color)) 0%,
+      color-mix(in srgb, var(--status-warning) 12%, var(--surface-color)) 100%);
+  --health-banner-border: 1px solid color-mix(in srgb, var(--status-warning) 45%, transparent);
+  --health-banner-text: color-mix(in srgb, var(--text-primary) 88%, var(--status-warning));
+  --health-banner-muted: color-mix(in srgb, var(--text-secondary) 82%, var(--status-warning));
+  --health-banner-shadow: var(--cockpit-panel-shadow);
+  --health-banner-action-border: color-mix(in srgb, var(--status-warning) 35%, transparent);
+  --health-banner-action-bg: color-mix(in srgb, var(--status-warning) 10%, transparent);
+
+  --avatar-stress-color: var(--status-warning);
+  --avatar-confidence-color: var(--success-color);
+  --avatar-pending-color: var(--accent-color);
+  --avatar-error-color: var(--error-color);
+
+  --input-inset-shadow: inset 3px 3px 6px rgba(15, 23, 42, 0.08), inset -3px -3px 6px rgba(255, 255, 255, 0.9);
+  --input-border: rgba(15, 23, 42, 0.15);
+  --input-placeholder: color-mix(in srgb, var(--text-secondary) 70%, transparent);
+
+  /* Cockpit tokens */
+  --cockpit-bg: radial-gradient(circle at 12% 10%, rgba(230, 79, 143, 0.12), transparent 48%),
+    radial-gradient(circle at 85% 20%, rgba(0, 188, 212, 0.12), transparent 45%);
+  --cockpit-header-bg: rgba(255, 255, 255, 0.85);
+  --cockpit-header-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-header-shadow: 0 20px 50px rgba(15, 23, 42, 0.12);
+  --cockpit-tab-bg: rgba(15, 23, 42, 0.06);
+  --cockpit-tab-border: 1px solid rgba(15, 23, 42, 0.12);
+  --cockpit-tab-active-bg: rgba(230, 79, 143, 0.14);
+  --cockpit-tab-active-border: 1px solid rgba(230, 79, 143, 0.35);
+  --cockpit-tab-active-text: var(--text-primary);
+  --cockpit-tab-badge-bg: rgba(15, 23, 42, 0.12);
+  --cockpit-tab-badge-text: var(--text-primary);
+  --cockpit-rail-bg: rgba(255, 255, 255, 0.9);
+  --cockpit-rail-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-rail-shadow: 0 16px 40px rgba(15, 23, 42, 0.12);
+  --cockpit-panel-bg: linear-gradient(160deg, rgba(255, 255, 255, 0.92), rgba(245, 246, 248, 0.9));
+  --cockpit-panel-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-panel-shadow: 0 18px 46px rgba(15, 23, 42, 0.12);
+  --cockpit-panel-muted-bg: rgba(15, 23, 42, 0.04);
+  --cockpit-panel-muted-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-card-bg: rgba(15, 23, 42, 0.04);
+  --cockpit-card-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-card-shadow: 0 10px 24px rgba(15, 23, 42, 0.12);
+  --cockpit-alert-bg: rgba(239, 68, 68, 0.12);
+  --cockpit-alert-border: 1px solid rgba(239, 68, 68, 0.3);
+  --cockpit-warn-bg: rgba(249, 115, 22, 0.12);
+  --cockpit-warn-border: 1px solid rgba(249, 115, 22, 0.3);
+  --cockpit-focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent-color) 60%, transparent);
+  --cockpit-avatar-bg: radial-gradient(circle at 50% 22%, color-mix(in srgb, var(--accent-color) 18%, transparent), transparent 55%),
+    radial-gradient(circle at 20% 80%, color-mix(in srgb, var(--accent-color) 10%, transparent), transparent 50%),
+    rgba(255, 255, 255, 0.7);
+  --avatar-saturation: 72%;
+  --avatar-lightness: 55%;
+  --avatar-field-alpha: 0.16;
+  --avatar-scan-alpha: 0.3;
+  --avatar-noise-alpha: 0.18;
+  --avatar-core-alpha: 0.75;
+  --avatar-glow-alpha: 0.35;
+  --avatar-color-fixed: #e64f8f;
+  --avatar-glow-fixed: rgba(230, 79, 143, 0.65);
+
+  --terminal-bg: #111827;
+  --terminal-text: #22c55e;
+  --terminal-shadow: inset 3px 3px 6px rgba(0, 0, 0, 0.35), inset -3px -3px 6px rgba(255, 255, 255, 0.05);
+  --terminal-select-bg: rgba(17, 24, 39, 0.65);
+
+  --graph-grid: rgba(15, 23, 42, 0.15);
+  --graph-minimap-stroke: var(--accent-color);
+  --graph-minimap-mask: rgba(15, 23, 42, 0.25);
+  --graph-activate: #00c2c7;
+  --graph-activate-shadow: 0 0 15px rgba(0, 194, 199, 0.5);
+  --graph-warning: #f59e0b;
+  --graph-warning-glow: 0 0 8px rgba(245, 158, 11, 0.55), 0 0 16px rgba(245, 158, 11, 0.45);
+
+  --graph-node-person: #00e676;
+  --graph-node-place: #00b0ff;
+  --graph-node-work: #ff9100;
+  --graph-node-concept: #d500f9;
+  --graph-node-event: #ff4081;
+  --graph-node-project: #7c4dff;
+  --graph-node-system: #00bcd4;
+  --graph-node-conflict: #ff3d00;
+  --graph-node-default: #78909c;
+  --graph-node-muted: #607d8b;
+
+  --graph-link-fact: #b0bec5;
+  --graph-link-supersedes: #ffab40;
+  --graph-link-contradicts: #ff5252;
+  --graph-link-supports: #69f0ae;
+  --graph-link-derived: #ea80fc;
+  --graph-link-relation: #81d4fa;
+  --graph-link-other: #ff4081;
+
+  --graph-label-base: #1f2937;
+  --graph-label-bg: rgba(255, 255, 255, 0.7);
+  --graph-label-selected: #be123c;
+  --graph-label-hover: #2563eb;
+  --graph-texture-line: rgba(31, 41, 55, 0.35);
+  --graph-texture-dot: rgba(31, 41, 55, 0.2);
+
+  --status-action-border: rgba(15, 23, 42, 0.2);
+  --status-action-hover-text: #111827;
+
+  --vortex-ring-gradient: conic-gradient(from 0deg, transparent 0%, rgba(230, 79, 143, 0.65) 20%, transparent 40%, rgba(230, 79, 143, 0.35) 60%, transparent 100%);
+  --vortex-ring-shadow: 0 0 20px rgba(230, 79, 143, 0.35), inset 0 0 20px rgba(230, 79, 143, 0.2);
+  --vortex-core-bg: #ffffff;
+  --vortex-core-shadow: 0 0 24px rgba(230, 79, 143, 0.45), 0 0 40px rgba(255, 255, 255, 0.6);
+
+  --core-gradient: conic-gradient(from 0deg, transparent 0%, #d94682 25%, #e64f8f 50%, #f06aa3 55%, transparent 100%);
+  --core-glow: 0 0 30px rgba(230, 79, 143, 0.35);
+  --core-hole-bg: #111827;
+  --core-hole-shadow: 0 0 15px rgba(230, 79, 143, 0.6), inset 0 0 40px #0f172a;
+  --core-hole-text: #ffffff;
+
+  --core-white-gradient: conic-gradient(from 0deg, transparent 0%, #e5e7eb 25%, #ffffff 50%, #f9fafb 55%, transparent 100%);
+  --core-white-bg: #ffffff;
+  --core-white-glow: 0 0 30px rgba(255, 255, 255, 0.6);
+  --core-white-shadow: 0 0 15px rgba(255, 255, 255, 0.9), inset 0 0 40px rgba(15, 23, 42, 0.5);
+  --core-white-text: #2b2f36;
+
+  --node-user-gradient: var(--core-white-gradient);
+  --node-user-bg: var(--core-white-bg);
+  --node-user-glow: var(--core-white-glow);
+  --node-user-shadow: var(--core-white-shadow);
+  --node-user-text: var(--core-white-text);
+  --node-user-handle: var(--accent-color);
+
+  --energy-stream-color: var(--accent-color);
+  --energy-stream-glow: drop-shadow(0 0 3px rgba(230, 79, 143, 0.6));
+
+  --slider-track-bg: #e5e7eb;
+  --slider-track-shadow: inset 2px 2px 5px rgba(15, 23, 42, 0.08), inset -1px -1px 3px rgba(255, 255, 255, 0.9);
+  --slider-track-border: 1px solid rgba(15, 23, 42, 0.12);
+
+  --slider-thumb-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(15, 23, 42, 0.25) 14px,
+      rgba(15, 23, 42, 0.25) 15px,
+      rgba(255, 255, 255, 0.5) 15px,
+      rgba(255, 255, 255, 0.5) 16px),
+    linear-gradient(180deg, #f8fafc, #d1d5db);
+  --slider-thumb-hover-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(15, 23, 42, 0.25) 14px,
+      rgba(15, 23, 42, 0.25) 15px,
+      rgba(255, 255, 255, 0.5) 15px,
+      rgba(255, 255, 255, 0.5) 16px),
+    linear-gradient(180deg, #e5e7eb, #cbd5e1);
+  --slider-thumb-active-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(15, 23, 42, 0.25) 14px,
+      rgba(15, 23, 42, 0.25) 15px,
+      rgba(255, 255, 255, 0.5) 15px,
+      rgba(255, 255, 255, 0.5) 16px),
+    linear-gradient(180deg, #e2e8f0, #cbd5e1);
+  --slider-thumb-shadow: 0 4px 6px rgba(15, 23, 42, 0.15),
+    inset 0 1px 1px rgba(255, 255, 255, 0.6),
+    0 0 2px rgba(15, 23, 42, 0.2);
+  --slider-thumb-hover-shadow: 0 5px 8px rgba(15, 23, 42, 0.2),
+    inset 0 1px 1px rgba(255, 255, 255, 0.7),
+    0 0 2px rgba(15, 23, 42, 0.2);
+  --slider-thumb-active-shadow: 0 2px 4px rgba(15, 23, 42, 0.25),
+    inset 0 1px 2px rgba(15, 23, 42, 0.2);
+  --slider-thumb-border: 1px solid rgba(15, 23, 42, 0.2);
+  --slider-thumb-border-top: 1px solid rgba(255, 255, 255, 0.7);
+
+  --confidence-track-shadow: inset 1px 1px 2px rgba(15, 23, 42, 0.15);
+  --confidence-fill-gradient: linear-gradient(90deg, var(--success-color), #a3e635);
+  --confidence-glow: 0 0 8px rgba(47, 191, 113, 0.35);
+
+  --titlebar-height: 34px;
+  --titlebar-bg: #ffffff;
+  --titlebar-text: #6b7280;
+  --titlebar-border: 1px solid rgba(15, 23, 42, 0.08);
+  --titlebar-shadow: 0 6px 12px rgba(18, 24, 32, 0.12);
+  --titlebar-control-hover: rgba(230, 79, 143, 0.12);
+  --titlebar-control-close-hover: rgba(226, 76, 95, 0.16);
+  --titlebar-control-close-text: #e24c5f;
+
+  --sidebar-shadow: 4px 0 12px rgba(18, 24, 32, 0.08);
+  --memory-graph-bg: radial-gradient(circle at center, #f8f9fb 0%, #e9edf2 100%);
+  --episodic-panel-bg: rgba(255, 255, 255, 0.92);
+  --episodic-panel-border: 1px solid rgba(15, 23, 42, 0.08);
+  --episodic-panel-shadow: 0 10px 24px rgba(18, 24, 32, 0.12);
+  --episodic-item-bg: rgba(240, 242, 246, 0.9);
+  --episodic-item-border: 1px solid rgba(15, 23, 42, 0.06);
+
+  --input-focus-shadow: inset 4px 4px 10px rgba(17, 24, 39, 0.08), inset -4px -4px 10px rgba(255, 255, 255, 0.9), 0 0 6px rgba(230, 79, 143, 0.35);
+}

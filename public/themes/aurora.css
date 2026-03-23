@@ -1,0 +1,288 @@
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --bg-color: #0b0f1a;
+  --surface-color: #111827;
+  --surface-gradient: linear-gradient(180deg, rgba(26, 35, 64, 0.9), rgba(14, 19, 35, 0.98));
+
+  --accent-color: #22d3ee;
+  --accent-color-hover: #38bdf8;
+  --text-primary: #e6f1ff;
+  --text-secondary: #90a4c0;
+  --accent-primary: var(--accent-color);
+  --accent-secondary: #a78bfa;
+
+  --border-color: rgba(148, 163, 184, 0.16);
+  --error-color: #fb7185;
+  --success-color: #34d399;
+
+  --neu-flat: 0 12px 28px rgba(5, 8, 16, 0.85), 0 -12px 28px rgba(26, 39, 70, 0.6);
+  --neu-pressed: inset 0 10px 20px rgba(4, 6, 12, 0.9), inset 0 -10px 20px rgba(32, 46, 80, 0.65);
+  --neu-convex: 0 12px 24px rgba(7, 10, 18, 0.85), 0 -12px 24px rgba(28, 42, 72, 0.6);
+  --neu-border: 1px solid rgba(148, 163, 184, 0.12);
+  --chamfer-top: 1px solid rgba(255, 255, 255, 0.08);
+  --chamfer-bottom: 1px solid rgba(0, 0, 0, 0.35);
+
+  --font-family: 'Sora', system-ui, -apple-system, sans-serif;
+  --font-header: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Monaco', 'Consolas', 'Courier New', monospace;
+  --panel-radius: 18px;
+  --panel-padding: 16px;
+  --panel-gap: 12px;
+  --control-height: 36px;
+  --control-radius: 10px;
+  --control-padding-x: 14px;
+  --control-padding-y: 6px;
+  --control-icon-size: 16px;
+
+  --text-on-accent: #081018;
+  --accent-glow: rgba(34, 211, 238, 0.55);
+
+  --surface-overlay: rgba(15, 23, 42, 0.55);
+  --surface-overlay-border: 1px solid rgba(148, 163, 184, 0.18);
+  --surface-muted: rgba(148, 163, 184, 0.12);
+  --scrollbar-thumb-hover: rgba(226, 232, 240, 0.25);
+
+  --code-bg: rgba(15, 23, 42, 0.6);
+  --code-border: 1px solid rgba(148, 163, 184, 0.18);
+  --code-text: #cbd5f5;
+
+  --raw-bg: rgba(15, 23, 42, 0.4);
+  --raw-border: 1px solid rgba(148, 163, 184, 0.2);
+  --raw-text: #b0c4de;
+
+  --task-card-bg: rgba(52, 211, 153, 0.14);
+  --task-card-border: 1px solid rgba(52, 211, 153, 0.4);
+  --reminder-card-bg: var(--task-card-bg);
+  --reminder-card-border: var(--task-card-border);
+  --reminder-card-shadow: var(--neu-pressed);
+  --reminder-card-title: var(--accent-color);
+  --reminder-card-text: var(--text-primary);
+  --reminder-card-meta: var(--text-secondary);
+  --reminder-card-icon: var(--accent-color);
+
+  --toast-bg: rgba(15, 23, 42, 0.92);
+  --toast-border: 1px solid rgba(148, 163, 184, 0.2);
+  --toast-shadow: 0 12px 28px rgba(3, 7, 18, 0.6);
+  --toast-text: #e6f1ff;
+  --toast-muted: #94a3b8;
+  --toast-action-border: rgba(148, 163, 184, 0.3);
+
+  --mic-recording-bg: rgba(251, 113, 133, 0.18);
+  --mic-speaking-bg: rgba(52, 211, 153, 0.18);
+  --mic-error-bg: rgba(251, 113, 133, 0.22);
+  --mic-reconnecting-bg: rgba(34, 211, 238, 0.18);
+
+  --spinner-border: rgba(226, 232, 240, 0.25);
+  --spinner-border-top: #e6f1ff;
+
+  --badge-text: #07121f;
+  --badge-shadow: 0 2px 6px rgba(8, 12, 24, 0.4);
+
+  --time-badge-bg: rgba(94, 234, 212, 0.16);
+  --time-badge-text: #5eead4;
+  --time-badge-border: 1px solid rgba(94, 234, 212, 0.4);
+
+  --context-danger-bg: rgba(251, 113, 133, 0.2);
+
+  --danger-color: #fb7185;
+  --danger-solid: #f43f5e;
+  --danger-solid-text: #fff1f2;
+
+  --status-success: #34d399;
+  --status-success-soft: rgba(52, 211, 153, 0.16);
+  --status-success-border: rgba(52, 211, 153, 0.42);
+  --status-warning: #fbbf24;
+  --status-caution: #f97316;
+  --status-caution-soft: rgba(249, 115, 22, 0.16);
+  --status-caution-border: rgba(249, 115, 22, 0.45);
+  --status-danger: #fb7185;
+  --status-danger-soft: rgba(251, 113, 133, 0.18);
+  --status-danger-border: rgba(251, 113, 133, 0.4);
+  --status-neutral: #94a3b8;
+
+  --health-banner-bg: linear-gradient(135deg,
+      color-mix(in srgb, var(--status-warning) 22%, var(--surface-color)) 0%,
+      color-mix(in srgb, var(--status-warning) 12%, var(--surface-color)) 100%);
+  --health-banner-border: 1px solid color-mix(in srgb, var(--status-warning) 45%, transparent);
+  --health-banner-text: color-mix(in srgb, var(--text-primary) 88%, var(--status-warning));
+  --health-banner-muted: color-mix(in srgb, var(--text-secondary) 82%, var(--status-warning));
+  --health-banner-shadow: var(--cockpit-panel-shadow);
+  --health-banner-action-border: color-mix(in srgb, var(--status-warning) 35%, transparent);
+  --health-banner-action-bg: color-mix(in srgb, var(--status-warning) 10%, transparent);
+
+  --avatar-stress-color: var(--status-warning);
+  --avatar-confidence-color: var(--success-color);
+  --avatar-pending-color: var(--accent-color);
+  --avatar-error-color: var(--error-color);
+
+  --input-inset-shadow: inset 3px 3px 6px rgba(3, 6, 12, 0.8), inset -3px -3px 6px rgba(33, 49, 88, 0.55);
+  --input-border: rgba(148, 163, 184, 0.28);
+  --input-placeholder: color-mix(in srgb, var(--text-secondary) 70%, transparent);
+
+  /* Cockpit tokens */
+  --cockpit-bg: radial-gradient(circle at 12% 10%, rgba(34, 211, 238, 0.14), transparent 50%),
+    radial-gradient(circle at 85% 20%, rgba(167, 139, 250, 0.16), transparent 45%);
+  --cockpit-header-bg: rgba(11, 18, 32, 0.78);
+  --cockpit-header-border: 1px solid rgba(148, 163, 184, 0.18);
+  --cockpit-header-shadow: 0 20px 50px rgba(4, 8, 18, 0.6);
+  --cockpit-tab-bg: rgba(148, 163, 184, 0.12);
+  --cockpit-tab-border: 1px solid rgba(148, 163, 184, 0.2);
+  --cockpit-tab-active-bg: rgba(34, 211, 238, 0.18);
+  --cockpit-tab-active-border: 1px solid rgba(34, 211, 238, 0.45);
+  --cockpit-tab-active-text: var(--text-primary);
+  --cockpit-tab-badge-bg: rgba(148, 163, 184, 0.25);
+  --cockpit-tab-badge-text: var(--text-primary);
+  --cockpit-rail-bg: rgba(9, 15, 28, 0.75);
+  --cockpit-rail-border: 1px solid rgba(148, 163, 184, 0.18);
+  --cockpit-rail-shadow: 0 16px 40px rgba(3, 7, 18, 0.55);
+  --cockpit-panel-bg: linear-gradient(160deg, rgba(18, 28, 52, 0.9), rgba(10, 14, 26, 0.85));
+  --cockpit-panel-border: 1px solid rgba(148, 163, 184, 0.2);
+  --cockpit-panel-shadow: 0 18px 46px rgba(4, 8, 18, 0.55);
+  --cockpit-panel-muted-bg: rgba(148, 163, 184, 0.12);
+  --cockpit-panel-muted-border: 1px solid rgba(148, 163, 184, 0.2);
+  --cockpit-card-bg: rgba(148, 163, 184, 0.12);
+  --cockpit-card-border: 1px solid rgba(148, 163, 184, 0.2);
+  --cockpit-card-shadow: 0 10px 24px rgba(4, 8, 18, 0.4);
+  --cockpit-alert-bg: rgba(251, 113, 133, 0.18);
+  --cockpit-alert-border: 1px solid rgba(251, 113, 133, 0.45);
+  --cockpit-warn-bg: rgba(251, 191, 36, 0.18);
+  --cockpit-warn-border: 1px solid rgba(251, 191, 36, 0.45);
+  --cockpit-focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent-color) 60%, transparent);
+  --cockpit-avatar-bg: radial-gradient(circle at 50% 22%, color-mix(in srgb, var(--accent-color) 26%, transparent), transparent 55%),
+    radial-gradient(circle at 20% 80%, color-mix(in srgb, var(--accent-color) 14%, transparent), transparent 50%),
+    rgba(6, 10, 20, 0.35);
+  --avatar-saturation: 84%;
+  --avatar-lightness: 62%;
+  --avatar-field-alpha: 0.22;
+  --avatar-scan-alpha: 0.45;
+  --avatar-noise-alpha: 0.22;
+  --avatar-core-alpha: 0.9;
+  --avatar-glow-alpha: 0.5;
+  --avatar-color-fixed: #22d3ee;
+  --avatar-glow-fixed: rgba(34, 211, 238, 0.75);
+
+  --terminal-bg: #0a0f1c;
+  --terminal-text: #5eead4;
+  --terminal-shadow: inset 3px 3px 6px rgba(0, 0, 0, 0.6), inset -3px -3px 6px rgba(27, 39, 70, 0.6);
+  --terminal-select-bg: rgba(14, 19, 35, 0.65);
+
+  --graph-grid: rgba(148, 163, 184, 0.18);
+  --graph-minimap-stroke: #38bdf8;
+  --graph-minimap-mask: rgba(15, 23, 42, 0.5);
+  --graph-activate: #22d3ee;
+  --graph-activate-shadow: 0 0 16px rgba(34, 211, 238, 0.6);
+  --graph-warning: #fbbf24;
+  --graph-warning-glow: 0 0 8px rgba(251, 191, 36, 0.65), 0 0 16px rgba(251, 191, 36, 0.45);
+
+  --graph-node-person: #5eead4;
+  --graph-node-place: #60a5fa;
+  --graph-node-work: #f59e0b;
+  --graph-node-concept: #c084fc;
+  --graph-node-event: #f472b6;
+  --graph-node-project: #a78bfa;
+  --graph-node-system: #38bdf8;
+  --graph-node-conflict: #fb7185;
+  --graph-node-default: #94a3b8;
+  --graph-node-muted: #64748b;
+
+  --graph-link-fact: #94a3b8;
+  --graph-link-supersedes: #fbbf24;
+  --graph-link-contradicts: #fb7185;
+  --graph-link-supports: #34d399;
+  --graph-link-derived: #c084fc;
+  --graph-link-relation: #7dd3fc;
+  --graph-link-other: #f472b6;
+
+  --graph-label-base: #e2e8f0;
+  --graph-label-bg: rgba(15, 23, 42, 0.7);
+  --graph-label-selected: #a5f3fc;
+  --graph-label-hover: #38bdf8;
+  --graph-texture-line: rgba(148, 163, 184, 0.45);
+  --graph-texture-dot: rgba(148, 163, 184, 0.25);
+
+  --status-action-border: rgba(148, 163, 184, 0.35);
+  --status-action-hover-text: #e6f1ff;
+
+  --vortex-ring-gradient: conic-gradient(from 0deg, transparent 0%, rgba(34, 211, 238, 0.7) 20%, transparent 40%, rgba(168, 85, 247, 0.4) 60%, transparent 100%);
+  --vortex-ring-shadow: 0 0 24px rgba(34, 211, 238, 0.45), inset 0 0 24px rgba(34, 211, 238, 0.25);
+  --vortex-core-bg: #0f172a;
+  --vortex-core-shadow: 0 0 28px rgba(168, 85, 247, 0.5), 0 0 48px rgba(34, 211, 238, 0.4);
+
+  --core-gradient: conic-gradient(from 0deg, transparent 0%, #38bdf8 25%, #22d3ee 50%, #a78bfa 55%, transparent 100%);
+  --core-glow: 0 0 32px rgba(34, 211, 238, 0.45);
+  --core-hole-bg: #060b16;
+  --core-hole-shadow: 0 0 18px rgba(34, 211, 238, 0.6), inset 0 0 40px rgba(3, 7, 18, 0.95);
+  --core-hole-text: #e6f1ff;
+
+  --core-white-gradient: conic-gradient(from 0deg, transparent 0%, #e2e8f0 25%, #f8fafc 50%, #e5e7eb 55%, transparent 100%);
+  --core-white-glow: 0 0 30px rgba(248, 250, 252, 0.6);
+  --core-white-bg: #f8fafc;
+  --core-white-shadow: 0 0 16px rgba(248, 250, 252, 0.8), inset 0 0 36px rgba(15, 23, 42, 0.35);
+  --core-white-text: #0f172a;
+
+  --energy-stream-color: #22d3ee;
+  --energy-stream-glow: drop-shadow(0 0 4px rgba(34, 211, 238, 0.7));
+
+  --slider-track-bg: #0f172a;
+  --slider-track-shadow: inset 2px 2px 5px rgba(3, 6, 12, 0.85), inset -1px -1px 3px rgba(38, 55, 92, 0.6);
+  --slider-track-border: 1px solid rgba(148, 163, 184, 0.25);
+
+  --slider-thumb-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(34, 211, 238, 0.35) 14px,
+      rgba(34, 211, 238, 0.35) 15px,
+      rgba(255, 255, 255, 0.12) 15px,
+      rgba(255, 255, 255, 0.12) 16px),
+    linear-gradient(180deg, #1f2937, #0f172a);
+  --slider-thumb-hover-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(34, 211, 238, 0.4) 14px,
+      rgba(34, 211, 238, 0.4) 15px,
+      rgba(255, 255, 255, 0.2) 15px,
+      rgba(255, 255, 255, 0.2) 16px),
+    linear-gradient(180deg, #273449, #0f172a);
+  --slider-thumb-active-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(34, 211, 238, 0.5) 14px,
+      rgba(34, 211, 238, 0.5) 15px,
+      rgba(255, 255, 255, 0.25) 15px,
+      rgba(255, 255, 255, 0.25) 16px),
+    linear-gradient(180deg, #334155, #111827);
+  --slider-thumb-shadow: 0 4px 8px rgba(3, 7, 18, 0.6),
+    inset 0 1px 1px rgba(255, 255, 255, 0.2),
+    0 0 6px rgba(34, 211, 238, 0.35);
+  --slider-thumb-hover-shadow: 0 6px 10px rgba(3, 7, 18, 0.65),
+    inset 0 1px 2px rgba(255, 255, 255, 0.25),
+    0 0 8px rgba(34, 211, 238, 0.45);
+  --slider-thumb-active-shadow: 0 3px 6px rgba(3, 7, 18, 0.7),
+    inset 0 1px 2px rgba(0, 0, 0, 0.35);
+  --slider-thumb-border: 1px solid rgba(34, 211, 238, 0.35);
+  --slider-thumb-border-top: 1px solid rgba(255, 255, 255, 0.12);
+
+  --confidence-track-shadow: inset 1px 1px 2px rgba(3, 7, 18, 0.65);
+  --confidence-fill-gradient: linear-gradient(90deg, #34d399, #22d3ee);
+  --confidence-glow: 0 0 10px rgba(34, 211, 238, 0.45);
+
+  --titlebar-height: 34px;
+  --titlebar-bg: rgba(10, 15, 28, 0.92);
+  --titlebar-text: #9fb3d1;
+  --titlebar-border: 1px solid rgba(148, 163, 184, 0.16);
+  --titlebar-shadow: 0 6px 14px rgba(3, 7, 18, 0.6);
+  --titlebar-control-hover: rgba(34, 211, 238, 0.16);
+  --titlebar-control-close-hover: rgba(251, 113, 133, 0.18);
+  --titlebar-control-close-text: #fb7185;
+
+  --sidebar-shadow: 6px 0 16px rgba(3, 7, 18, 0.7);
+  --memory-graph-bg: radial-gradient(circle at center, #121a2b 0%, #070b14 100%);
+  --episodic-panel-bg: rgba(15, 23, 42, 0.92);
+  --episodic-panel-border: 1px solid rgba(148, 163, 184, 0.2);
+  --episodic-panel-shadow: 0 12px 28px rgba(3, 7, 18, 0.6);
+  --episodic-item-bg: rgba(15, 23, 42, 0.7);
+  --episodic-item-border: 1px solid rgba(148, 163, 184, 0.12);
+
+  --input-focus-shadow: inset 4px 4px 10px rgba(3, 6, 12, 0.8), inset -4px -4px 10px rgba(35, 50, 86, 0.6), 0 0 8px rgba(34, 211, 238, 0.4);
+}

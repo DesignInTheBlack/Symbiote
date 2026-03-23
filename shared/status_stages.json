@@ -1,0 +1,24 @@
+{
+  "stages": [
+    { "id": "idle", "label": "Idle", "default_detail": "Standing by" },
+    { "id": "queued", "label": "Queued", "default_detail": "Queued for processing" },
+    { "id": "ingest_input", "label": "Ingesting input", "default_detail": "Parsing request" },
+    { "id": "prompt_build", "label": "Building prompt", "default_detail": "Assembling context" },
+    { "id": "memory_retrieval", "label": "Retrieving memory", "default_detail": "Searching memory" },
+    { "id": "tool_select", "label": "Tool selection", "default_detail": "Selecting tool calls" },
+    { "id": "tool_call", "label": "Calling tool", "default_detail": "Running tool" },
+    { "id": "llm_wait", "label": "Waiting on LLM", "default_detail": "Generating response" },
+    { "id": "streaming", "label": "Streaming reply", "default_detail": "Streaming response" },
+    { "id": "arbitration", "label": "Arbitrating", "default_detail": "Choosing candidates" },
+    { "id": "grounding", "label": "Grounding", "default_detail": "Verifying evidence" },
+    { "id": "memory_pass", "label": "Writing memory", "default_detail": "Updating memory" },
+    { "id": "rolling_summary", "label": "Updating rolling summary", "default_detail": "Summarizing conversation" },
+    { "id": "inner_summary", "label": "Inner summary update", "default_detail": "Updating internal state" },
+    { "id": "commit_cycle", "label": "Finalizing", "default_detail": "Committing updates" },
+    { "id": "thread_run", "label": "Thread run", "default_detail": "Advancing thread" },
+    { "id": "post_processing", "label": "Post-processing", "default_detail": "Finalizing updates" },
+    { "id": "finalize", "label": "Finalizing", "default_detail": "Wrapping up" },
+    { "id": "cancelled", "label": "Cancelled", "default_detail": "Cancelled" },
+    { "id": "error", "label": "Error", "default_detail": "Encountered error" }
+  ]
+}

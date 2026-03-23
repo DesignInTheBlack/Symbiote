@@ -1,0 +1,286 @@
+:root {
+  --bg-color: #181818;
+  --surface-color: #181818;
+  --surface-gradient: linear-gradient(180deg, #1c1c1c, #151515);
+
+  --accent-color: #bb86fc;
+  --accent-color-hover: #d0b3ff;
+  --text-primary: #eaeaea;
+  --text-secondary: #888888;
+  --accent-primary: var(--text-primary);
+  --accent-secondary: var(--text-secondary);
+
+  --border-color: transparent;
+  --error-color: #cf6679;
+  --success-color: #03dac6;
+
+  --neu-flat: 0 10px 20px #101010, 0 -10px 20px #262626;
+  --neu-pressed: inset 0 10px 20px #101010, inset 0 -10px 20px #262626;
+  --neu-convex: 0 10px 20px #101010, 0 -10px 20px #262626;
+  --neu-border: 1px solid rgba(255, 255, 255, 0.03);
+  --chamfer-top: 1px solid rgba(255, 255, 255, 0.08);
+  --chamfer-bottom: 1px solid rgba(0, 0, 0, 0.2);
+
+  --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-header: 'Outfit', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SF Mono', 'Monaco', 'Consolas', 'Courier New', monospace;
+  --panel-radius: 18px;
+  --panel-padding: 16px;
+  --panel-gap: 12px;
+  --control-height: 36px;
+  --control-radius: 10px;
+  --control-padding-x: 14px;
+  --control-padding-y: 6px;
+  --control-icon-size: 16px;
+
+  --text-on-accent: #fff;
+  --accent-glow: rgba(187, 134, 252, 0.6);
+
+  --surface-overlay: rgba(0, 0, 0, 0.2);
+  --surface-overlay-border: 1px solid rgba(255, 255, 255, 0.08);
+  --surface-muted: rgba(255, 255, 255, 0.05);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.2);
+
+  --code-bg: rgba(0, 0, 0, 0.3);
+  --code-border: 1px solid rgba(255, 255, 255, 0.1);
+  --code-text: #e0e0e0;
+
+  --raw-bg: rgba(0, 0, 0, 0.2);
+  --raw-border: 1px solid rgba(255, 255, 255, 0.1);
+  --raw-text: var(--text-secondary);
+
+  --task-card-bg: rgba(0, 255, 128, 0.1);
+  --task-card-border: 1px solid rgba(0, 255, 128, 0.3);
+  --reminder-card-bg: var(--task-card-bg);
+  --reminder-card-border: var(--task-card-border);
+  --reminder-card-shadow: var(--neu-pressed);
+  --reminder-card-title: var(--accent-color);
+  --reminder-card-text: var(--text-primary);
+  --reminder-card-meta: var(--text-secondary);
+  --reminder-card-icon: var(--accent-color);
+
+  --toast-bg: rgba(20, 25, 35, 0.95);
+  --toast-border: 1px solid rgba(255, 255, 255, 0.1);
+  --toast-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --toast-text: #fff;
+  --toast-muted: #888;
+  --toast-action-border: rgba(255, 255, 255, 0.2);
+
+  --mic-recording-bg: rgba(255, 82, 82, 0.1);
+  --mic-speaking-bg: rgba(76, 175, 80, 0.1);
+  --mic-error-bg: rgba(255, 82, 82, 0.15);
+  --mic-reconnecting-bg: rgba(187, 134, 252, 0.1);
+
+  --spinner-border: rgba(255, 255, 255, 0.3);
+  --spinner-border-top: #ffffff;
+
+  --badge-text: #fff;
+  --badge-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+
+  --time-badge-bg: rgba(0, 188, 212, 0.1);
+  --time-badge-text: #4DD0E1;
+  --time-badge-border: 1px solid rgba(0, 188, 212, 0.2);
+
+  --context-danger-bg: rgba(244, 67, 54, 0.1);
+
+  --danger-color: #ff5252;
+  --danger-solid: #EF4444;
+  --danger-solid-text: #fff;
+
+  --status-success: #00ff00;
+  --status-success-soft: rgba(0, 255, 128, 0.1);
+  --status-success-border: rgba(0, 255, 128, 0.3);
+  --status-warning: #f59e0b;
+  --status-caution: #ff6600;
+  --status-caution-soft: rgba(255, 102, 0, 0.1);
+  --status-caution-border: rgba(255, 102, 0, 0.3);
+  --status-danger: #ff0000;
+  --status-danger-soft: rgba(255, 0, 0, 0.1);
+  --status-danger-border: rgba(255, 0, 0, 0.3);
+  --status-neutral: #aaa;
+
+  --health-banner-bg: linear-gradient(135deg,
+      color-mix(in srgb, var(--status-warning) 22%, var(--surface-color)) 0%,
+      color-mix(in srgb, var(--status-warning) 12%, var(--surface-color)) 100%);
+  --health-banner-border: 1px solid color-mix(in srgb, var(--status-warning) 45%, transparent);
+  --health-banner-text: color-mix(in srgb, var(--text-primary) 88%, var(--status-warning));
+  --health-banner-muted: color-mix(in srgb, var(--text-secondary) 82%, var(--status-warning));
+  --health-banner-shadow: var(--cockpit-panel-shadow);
+  --health-banner-action-border: color-mix(in srgb, var(--status-warning) 35%, transparent);
+  --health-banner-action-bg: color-mix(in srgb, var(--status-warning) 10%, transparent);
+
+  --avatar-stress-color: var(--status-warning);
+  --avatar-confidence-color: var(--success-color);
+  --avatar-pending-color: var(--accent-color);
+  --avatar-error-color: var(--error-color);
+
+  --input-inset-shadow: inset 3px 3px 6px #0f0f0f, inset -3px -3px 6px #242424;
+  --input-border: #333;
+  --input-placeholder: color-mix(in srgb, var(--text-secondary) 70%, transparent);
+
+  --terminal-bg: #111;
+  --terminal-text: #0f0;
+  --terminal-shadow: inset 3px 3px 6px #050505, inset -3px -3px 6px #1a1a1a;
+  --terminal-select-bg: rgba(0, 0, 0, 0.5);
+
+  --graph-grid: #333;
+  --graph-minimap-stroke: #7c4dff;
+  --graph-minimap-mask: rgba(0, 0, 0, 0.5);
+  --graph-activate: #00fff2;
+  --graph-activate-shadow: 0 0 15px #00fff2;
+  --graph-warning: #f59e0b;
+  --graph-warning-glow: 0 0 8px #f59e0b, 0 0 16px #f59e0b;
+
+  --graph-node-person: #00e676;
+  --graph-node-place: #00b0ff;
+  --graph-node-work: #ff9100;
+  --graph-node-concept: #d500f9;
+  --graph-node-event: #ff4081;
+  --graph-node-project: #7c4dff;
+  --graph-node-system: #00bcd4;
+  --graph-node-conflict: #ff3d00;
+  --graph-node-default: #78909c;
+  --graph-node-muted: #607d8b;
+
+  --graph-link-fact: #b0bec5;
+  --graph-link-supersedes: #ffab40;
+  --graph-link-contradicts: #ff5252;
+  --graph-link-supports: #69f0ae;
+  --graph-link-derived: #ea80fc;
+  --graph-link-relation: #81d4fa;
+  --graph-link-other: #ff4081;
+
+  --graph-label-base: #ffffff;
+  --graph-label-bg: rgba(0, 0, 0, 0.35);
+  --graph-label-selected: #ffb3b3;
+  --graph-label-hover: #9fe7ff;
+  --graph-texture-line: rgba(255, 255, 255, 0.8);
+  --graph-texture-dot: rgba(255, 255, 255, 0.4);
+
+  --status-action-border: rgba(255, 255, 255, 0.2);
+  --status-action-hover-text: #fff;
+
+  --vortex-ring-gradient: conic-gradient(from 0deg, transparent 0%, rgba(255, 255, 255, 0.8) 20%, transparent 40%, rgba(255, 255, 255, 0.4) 60%, transparent 100%);
+  --vortex-ring-shadow: 0 0 20px rgba(255, 255, 255, 0.4), inset 0 0 20px rgba(255, 255, 255, 0.2);
+  --vortex-core-bg: #fff;
+  --vortex-core-shadow: 0 0 30px #fff, 0 0 60px rgba(255, 255, 255, 0.8);
+
+  --core-gradient: conic-gradient(from 0deg, transparent 0%, #4a0072 25%, #bb86fc 50%, #7c4dff 55%, transparent 100%);
+  --core-glow: 0 0 30px rgba(124, 77, 255, 0.4);
+  --core-hole-bg: #000;
+  --core-hole-shadow: 0 0 15px #bb86fc, inset 0 0 40px #000;
+  --core-hole-text: #ffffff;
+
+  --core-white-gradient: conic-gradient(from 0deg, transparent 0%, #e0e0e0 25%, #ffffff 50%, #f5f5f5 55%, transparent 100%);
+  --core-white-bg: #ffffff;
+  --core-white-glow: 0 0 30px rgba(255, 255, 255, 0.4);
+  --core-white-shadow: 0 0 15px #ffffff, inset 0 0 40px #000;
+  --core-white-text: #000000;
+
+  --energy-stream-color: #bb86fc;
+  --energy-stream-glow: drop-shadow(0 0 3px #bb86fc);
+
+  --slider-track-bg: #121212;
+  --slider-track-shadow: inset 2px 2px 5px #0a0a0a, inset -1px -1px 3px #2a2a2a;
+  --slider-track-border: 1px solid rgba(0, 0, 0, 0.5);
+
+  --slider-thumb-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(0, 0, 0, 0.6) 14px,
+      rgba(0, 0, 0, 0.6) 15px,
+      rgba(255, 255, 255, 0.05) 15px,
+      rgba(255, 255, 255, 0.05) 16px),
+    linear-gradient(180deg, #3a3a3a, #2a2a2a);
+  --slider-thumb-hover-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(0, 0, 0, 0.6) 14px,
+      rgba(0, 0, 0, 0.6) 15px,
+      rgba(255, 255, 255, 0.05) 15px,
+      rgba(255, 255, 255, 0.05) 16px),
+    linear-gradient(180deg, #444444, #333333);
+  --slider-thumb-active-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(0, 0, 0, 0.6) 14px,
+      rgba(0, 0, 0, 0.6) 15px,
+      rgba(255, 255, 255, 0.05) 15px,
+      rgba(255, 255, 255, 0.05) 16px),
+    linear-gradient(180deg, #303030, #202020);
+  --slider-thumb-shadow: 0 4px 6px rgba(0, 0, 0, 0.5),
+    inset 0 1px 1px rgba(255, 255, 255, 0.1),
+    0 0 2px rgba(0, 0, 0, 0.8);
+  --slider-thumb-hover-shadow: 0 5px 8px rgba(0, 0, 0, 0.6),
+    inset 0 1px 1px rgba(255, 255, 255, 0.2),
+    0 0 2px rgba(0, 0, 0, 0.8);
+  --slider-thumb-active-shadow: 0 2px 4px rgba(0, 0, 0, 0.6),
+    inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  --slider-thumb-border: 1px solid rgba(0, 0, 0, 0.8);
+  --slider-thumb-border-top: 1px solid rgba(255, 255, 255, 0.1);
+
+  --confidence-track-shadow: inset 1px 1px 2px rgba(0, 0, 0, 0.5);
+  --confidence-fill-gradient: linear-gradient(90deg, var(--success-color), #CDDC39);
+  --confidence-glow: 0 0 8px rgba(76, 175, 80, 0.4);
+
+  --titlebar-height: 34px;
+  --titlebar-bg: var(--surface-color);
+  --titlebar-text: var(--text-secondary);
+  --titlebar-border: var(--neu-border);
+  --titlebar-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  --titlebar-control-hover: rgba(255, 255, 255, 0.08);
+  --titlebar-control-close-hover: rgba(255, 82, 82, 0.15);
+  --titlebar-control-close-text: var(--error-color);
+
+  --sidebar-shadow: 6px 0 12px #181818;
+  --memory-graph-bg: radial-gradient(circle at center, #1a202c 0%, #000000 100%);
+  --episodic-panel-bg: rgba(20, 25, 35, 0.95);
+  --episodic-panel-border: 1px solid rgba(255, 255, 255, 0.1);
+  --episodic-panel-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --episodic-item-bg: rgba(0, 0, 0, 0.25);
+  --episodic-item-border: 1px solid rgba(255, 255, 255, 0.08);
+
+  --input-focus-shadow: inset 6px 6px 12px #161616, inset -6px -6px 12px #2c2c2c, 0 0 5px var(--accent-color);
+
+  /* Cockpit tokens */
+  --cockpit-bg: radial-gradient(circle at 12% 10%, rgba(94, 234, 212, 0.08), transparent 45%),
+    radial-gradient(circle at 85% 20%, rgba(59, 130, 246, 0.1), transparent 40%);
+  --cockpit-header-bg: rgba(16, 19, 24, 0.8);
+  --cockpit-header-border: 1px solid rgba(255, 255, 255, 0.08);
+  --cockpit-header-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+  --cockpit-tab-bg: rgba(255, 255, 255, 0.03);
+  --cockpit-tab-border: 1px solid rgba(255, 255, 255, 0.08);
+  --cockpit-tab-active-bg: rgba(187, 134, 252, 0.16);
+  --cockpit-tab-active-border: 1px solid rgba(187, 134, 252, 0.35);
+  --cockpit-tab-active-text: var(--text-primary);
+  --cockpit-tab-badge-bg: rgba(255, 255, 255, 0.15);
+  --cockpit-tab-badge-text: var(--text-primary);
+  --cockpit-rail-bg: rgba(12, 15, 20, 0.72);
+  --cockpit-rail-border: 1px solid rgba(255, 255, 255, 0.08);
+  --cockpit-rail-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+  --cockpit-panel-bg: linear-gradient(160deg, rgba(20, 24, 31, 0.92), rgba(12, 14, 18, 0.85));
+  --cockpit-panel-border: 1px solid rgba(255, 255, 255, 0.08);
+  --cockpit-panel-shadow: 0 18px 46px rgba(0, 0, 0, 0.35);
+  --cockpit-panel-muted-bg: rgba(255, 255, 255, 0.03);
+  --cockpit-panel-muted-border: 1px solid rgba(255, 255, 255, 0.08);
+  --cockpit-card-bg: rgba(255, 255, 255, 0.03);
+  --cockpit-card-border: 1px solid rgba(255, 255, 255, 0.08);
+  --cockpit-card-shadow: 0 10px 24px rgba(0, 0, 0, 0.25);
+  --cockpit-alert-bg: rgba(239, 68, 68, 0.12);
+  --cockpit-alert-border: 1px solid rgba(239, 68, 68, 0.35);
+  --cockpit-warn-bg: rgba(245, 158, 11, 0.12);
+  --cockpit-warn-border: 1px solid rgba(245, 158, 11, 0.3);
+  --cockpit-focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent-color) 50%, transparent);
+  --cockpit-avatar-bg: radial-gradient(circle at 50% 22%, color-mix(in srgb, var(--accent-color) 22%, transparent), transparent 55%),
+    radial-gradient(circle at 20% 80%, color-mix(in srgb, var(--accent-color) 10%, transparent), transparent 50%),
+    rgba(0, 0, 0, 0.25);
+  --avatar-saturation: 78%;
+  --avatar-lightness: 58%;
+  --avatar-field-alpha: 0.18;
+  --avatar-scan-alpha: 0.35;
+  --avatar-noise-alpha: 0.2;
+  --avatar-core-alpha: 0.85;
+  --avatar-glow-alpha: 0.45;
+  --avatar-color-fixed: #bb86fc;
+  --avatar-glow-fixed: rgba(187, 134, 252, 0.75);
+}

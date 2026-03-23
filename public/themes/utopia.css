@@ -1,0 +1,322 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg-color: #f6f8fb;
+  --surface-color: rgba(255, 255, 255, 0.86);
+  --surface-gradient: linear-gradient(180deg, #ffffff, #f1f4f8);
+
+  --accent-color: #0f172a;
+  --accent-color-hover: #0b111f;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --accent-primary: var(--accent-color);
+  --accent-secondary: #1f2937;
+
+  --border-color: rgba(15, 23, 42, 0.12);
+  --error-color: #d94857;
+  --success-color: #1aa6a6;
+
+  --neu-flat: 0 12px 24px rgba(15, 23, 42, 0.08), 0 -12px 24px rgba(255, 255, 255, 0.9);
+  --neu-pressed: inset 0 8px 16px rgba(15, 23, 42, 0.08), inset 0 -8px 16px rgba(255, 255, 255, 0.85);
+  --neu-convex: 0 10px 20px rgba(15, 23, 42, 0.08), 0 -10px 20px rgba(255, 255, 255, 0.9);
+  --neu-border: 1px solid rgba(15, 23, 42, 0.08);
+  --chamfer-top: 1px solid rgba(255, 255, 255, 0.7);
+  --chamfer-bottom: 1px solid rgba(15, 23, 42, 0.12);
+
+  --font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --font-header: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', 'Monaco', 'Consolas', 'Courier New', monospace;
+  --panel-radius: 18px;
+  --panel-padding: 16px;
+  --panel-gap: 12px;
+  --control-height: 36px;
+  --control-radius: 10px;
+  --control-padding-x: 14px;
+  --control-padding-y: 6px;
+  --control-icon-size: 16px;
+
+  --text-on-accent: #f8fafc;
+  --accent-glow: rgba(230, 238, 246, 0.75);
+
+  --surface-overlay: rgba(255, 255, 255, 0.7);
+  --surface-overlay-border: 1px solid rgba(15, 23, 42, 0.1);
+  --surface-muted: rgba(15, 23, 42, 0.04);
+  --scrollbar-thumb-hover: rgba(15, 23, 42, 0.2);
+
+  --code-bg: rgba(15, 23, 42, 0.04);
+  --code-border: 1px solid rgba(15, 23, 42, 0.08);
+  --code-text: #0f172a;
+
+  --raw-bg: rgba(15, 23, 42, 0.04);
+  --raw-border: 1px solid rgba(15, 23, 42, 0.08);
+  --raw-text: #475569;
+
+  --task-card-bg: rgba(26, 166, 166, 0.12);
+  --task-card-border: 1px solid rgba(26, 166, 166, 0.3);
+  --reminder-card-bg: var(--task-card-bg);
+  --reminder-card-border: var(--task-card-border);
+  --reminder-card-shadow: var(--neu-pressed);
+  --reminder-card-title: var(--accent-color);
+  --reminder-card-text: var(--text-primary);
+  --reminder-card-meta: var(--text-secondary);
+  --reminder-card-icon: var(--accent-color);
+
+  --toast-bg: rgba(255, 255, 255, 0.95);
+  --toast-border: 1px solid rgba(15, 23, 42, 0.1);
+  --toast-shadow: 0 12px 28px rgba(15, 23, 42, 0.15);
+  --toast-text: #0f172a;
+  --toast-muted: #64748b;
+  --toast-action-border: rgba(15, 23, 42, 0.12);
+
+  --mic-recording-bg: rgba(217, 72, 87, 0.12);
+  --mic-speaking-bg: rgba(26, 166, 166, 0.12);
+  --mic-error-bg: rgba(217, 72, 87, 0.18);
+  --mic-reconnecting-bg: rgba(15, 23, 42, 0.08);
+
+  --spinner-border: rgba(15, 23, 42, 0.2);
+  --spinner-border-top: #0f172a;
+
+  --badge-text: #ffffff;
+  --badge-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);
+
+  --time-badge-bg: rgba(15, 23, 42, 0.08);
+  --time-badge-text: #0f172a;
+  --time-badge-border: 1px solid rgba(15, 23, 42, 0.2);
+
+  --context-danger-bg: rgba(217, 72, 87, 0.12);
+
+  --danger-color: #d94857;
+  --danger-solid: #d94857;
+  --danger-solid-text: #ffffff;
+
+  --status-success: #1aa6a6;
+  --status-success-soft: rgba(26, 166, 166, 0.12);
+  --status-success-border: rgba(26, 166, 166, 0.35);
+  --status-warning: #d97706;
+  --status-caution: #c2410c;
+  --status-caution-soft: rgba(194, 65, 12, 0.12);
+  --status-caution-border: rgba(194, 65, 12, 0.35);
+  --status-danger: #d94857;
+  --status-danger-soft: rgba(217, 72, 87, 0.12);
+  --status-danger-border: rgba(217, 72, 87, 0.35);
+  --status-neutral: #64748b;
+
+  --health-banner-bg: linear-gradient(135deg,
+      color-mix(in srgb, var(--status-warning) 22%, var(--surface-color)) 0%,
+      color-mix(in srgb, var(--status-warning) 12%, var(--surface-color)) 100%);
+  --health-banner-border: 1px solid color-mix(in srgb, var(--status-warning) 45%, transparent);
+  --health-banner-text: color-mix(in srgb, var(--text-primary) 88%, var(--status-warning));
+  --health-banner-muted: color-mix(in srgb, var(--text-secondary) 82%, var(--status-warning));
+  --health-banner-shadow: var(--cockpit-panel-shadow);
+  --health-banner-action-border: color-mix(in srgb, var(--status-warning) 35%, transparent);
+  --health-banner-action-bg: color-mix(in srgb, var(--status-warning) 10%, transparent);
+
+  --avatar-stress-color: var(--status-warning);
+  --avatar-confidence-color: var(--success-color);
+  --avatar-pending-color: var(--accent-color);
+  --avatar-error-color: var(--error-color);
+
+  --input-inset-shadow: inset 3px 3px 6px rgba(15, 23, 42, 0.08), inset -3px -3px 6px rgba(255, 255, 255, 0.9);
+  --input-border: rgba(15, 23, 42, 0.12);
+  --input-placeholder: color-mix(in srgb, var(--text-secondary) 70%, transparent);
+
+  --terminal-bg: #f1f4f8;
+  --terminal-text: #0f172a;
+  --terminal-shadow: inset 3px 3px 6px rgba(15, 23, 42, 0.08), inset -3px -3px 6px rgba(255, 255, 255, 0.9);
+  --terminal-select-bg: rgba(15, 23, 42, 0.1);
+
+  --graph-grid: rgba(15, 23, 42, 0.12);
+  --graph-minimap-stroke: #0f172a;
+  --graph-minimap-mask: rgba(255, 255, 255, 0.6);
+  --graph-activate: #0f172a;
+  --graph-activate-shadow: 0 0 12px rgba(15, 23, 42, 0.25);
+  --graph-warning: #d97706;
+  --graph-warning-glow: 0 0 8px rgba(217, 119, 6, 0.45), 0 0 16px rgba(217, 119, 6, 0.35);
+
+  --graph-node-person: #1f2937;
+  --graph-node-place: #2b3645;
+  --graph-node-work: #334155;
+  --graph-node-concept: #3b4b61;
+  --graph-node-event: #111827;
+  --graph-node-project: #2f3b4f;
+  --graph-node-system: #1f2a37;
+  --graph-node-conflict: #b91c1c;
+  --graph-node-default: #4b5563;
+  --graph-node-muted: #6b7280;
+
+  --graph-link-fact: #64748b;
+  --graph-link-supersedes: #94a3b8;
+  --graph-link-contradicts: #d94857;
+  --graph-link-supports: #1aa6a6;
+  --graph-link-derived: #8ea2b6;
+  --graph-link-relation: #7b8ea3;
+  --graph-link-other: #94a3b8;
+
+  --graph-label-base: #0f172a;
+  --graph-label-bg: rgba(255, 255, 255, 0.85);
+  --graph-label-selected: #000000;
+  --graph-label-hover: #0f172a;
+  --graph-texture-line: rgba(15, 23, 42, 0.3);
+  --graph-texture-dot: rgba(15, 23, 42, 0.2);
+
+  --status-action-border: rgba(15, 23, 42, 0.2);
+  --status-action-hover-text: #0f172a;
+
+  --vortex-ring-gradient: conic-gradient(from 0deg, transparent 0%, rgba(15, 23, 42, 0.45) 20%, transparent 40%, rgba(15, 23, 42, 0.25) 60%, transparent 100%);
+  --vortex-ring-shadow: 0 0 16px rgba(15, 23, 42, 0.2), inset 0 0 16px rgba(15, 23, 42, 0.12);
+  --vortex-core-bg: #ffffff;
+  --vortex-core-shadow: 0 0 24px rgba(230, 238, 246, 0.8);
+
+  --core-gradient: conic-gradient(from 0deg, transparent 0%, #111827 25%, #0f172a 50%, #1f2937 55%, transparent 100%);
+  --core-glow: 0 0 24px rgba(230, 238, 246, 0.75);
+  --core-hole-bg: #0f172a;
+  --core-hole-shadow: 0 0 20px rgba(15, 23, 42, 0.45), inset 0 0 36px rgba(15, 23, 42, 0.35);
+  --core-hole-text: #f8fafc;
+
+  --core-white-gradient: conic-gradient(from 0deg, transparent 0%, #e5e7eb 25%, #ffffff 50%, #eef2f7 55%, transparent 100%);
+  --core-white-glow: 0 0 28px rgba(255, 255, 255, 0.8);
+  --core-white-bg: #ffffff;
+  --core-white-shadow: 0 0 18px rgba(255, 255, 255, 0.8), inset 0 0 30px rgba(15, 23, 42, 0.08);
+  --core-white-text: #0f172a;
+
+  --node-user-gradient: var(--core-white-gradient);
+  --node-user-bg: var(--core-white-bg);
+  --node-user-glow: var(--core-white-glow);
+  --node-user-shadow: var(--core-white-shadow);
+  --node-user-text: var(--core-white-text);
+  --node-user-handle: var(--accent-color);
+
+  --energy-stream-color: #0f172a;
+  --energy-stream-glow: drop-shadow(0 0 3px rgba(15, 23, 42, 0.25));
+
+  --slider-track-bg: #e5e7eb;
+  --slider-track-shadow: inset 2px 2px 5px rgba(15, 23, 42, 0.08), inset -1px -1px 3px rgba(255, 255, 255, 0.9);
+  --slider-track-border: 1px solid rgba(15, 23, 42, 0.12);
+
+  --slider-thumb-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(15, 23, 42, 0.2) 14px,
+      rgba(15, 23, 42, 0.2) 15px,
+      rgba(255, 255, 255, 0.5) 15px,
+      rgba(255, 255, 255, 0.5) 16px),
+    linear-gradient(180deg, #ffffff, #e5e7eb);
+  --slider-thumb-hover-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(15, 23, 42, 0.25) 14px,
+      rgba(15, 23, 42, 0.25) 15px,
+      rgba(255, 255, 255, 0.6) 15px,
+      rgba(255, 255, 255, 0.6) 16px),
+    linear-gradient(180deg, #f8fafc, #e2e8f0);
+  --slider-thumb-active-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(15, 23, 42, 0.3) 14px,
+      rgba(15, 23, 42, 0.3) 15px,
+      rgba(255, 255, 255, 0.7) 15px,
+      rgba(255, 255, 255, 0.7) 16px),
+    linear-gradient(180deg, #eef2f7, #dbe2ea);
+  --slider-thumb-shadow: 0 4px 8px rgba(15, 23, 42, 0.12),
+    inset 0 1px 1px rgba(255, 255, 255, 0.7),
+    0 0 6px rgba(15, 23, 42, 0.12);
+  --slider-thumb-hover-shadow: 0 6px 10px rgba(15, 23, 42, 0.16),
+    inset 0 1px 2px rgba(255, 255, 255, 0.8),
+    0 0 8px rgba(15, 23, 42, 0.15);
+  --slider-thumb-active-shadow: 0 3px 6px rgba(15, 23, 42, 0.18),
+    inset 0 1px 2px rgba(15, 23, 42, 0.2);
+  --slider-thumb-border: 1px solid rgba(15, 23, 42, 0.2);
+  --slider-thumb-border-top: 1px solid rgba(255, 255, 255, 0.8);
+
+  --confidence-track-shadow: inset 1px 1px 2px rgba(15, 23, 42, 0.12);
+  --confidence-fill-gradient: linear-gradient(90deg, #1aa6a6, #0f172a);
+  --confidence-glow: 0 0 8px rgba(15, 23, 42, 0.2);
+
+  --titlebar-height: 34px;
+  --titlebar-bg: #f3f5f8;
+  --titlebar-text: #475569;
+  --titlebar-border: 1px solid rgba(15, 23, 42, 0.08);
+  --titlebar-shadow: 0 6px 12px rgba(15, 23, 42, 0.08);
+  --titlebar-control-hover: rgba(15, 23, 42, 0.08);
+  --titlebar-control-close-hover: rgba(217, 72, 87, 0.15);
+  --titlebar-control-close-text: #d94857;
+
+  --sidebar-shadow: 6px 0 18px rgba(15, 23, 42, 0.08);
+  --memory-graph-bg: radial-gradient(circle at center, #f7f9fc 0%, #e9eef4 100%);
+  --episodic-panel-bg: rgba(255, 255, 255, 0.92);
+  --episodic-panel-border: 1px solid rgba(15, 23, 42, 0.08);
+  --episodic-panel-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+  --episodic-item-bg: rgba(245, 247, 250, 0.9);
+  --episodic-item-border: 1px solid rgba(15, 23, 42, 0.06);
+
+  --input-focus-shadow: inset 4px 4px 10px rgba(15, 23, 42, 0.08), inset -4px -4px 10px rgba(255, 255, 255, 0.9), 0 0 6px rgba(15, 23, 42, 0.15);
+
+  /* Cockpit tokens */
+  --cockpit-bg: radial-gradient(circle at 12% 10%, rgba(230, 238, 246, 0.35), transparent 50%),
+    radial-gradient(circle at 85% 20%, rgba(170, 180, 192, 0.25), transparent 45%);
+  --cockpit-header-bg: rgba(255, 255, 255, 0.9);
+  --cockpit-header-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-header-shadow: 0 20px 50px rgba(15, 23, 42, 0.12);
+  --cockpit-tab-bg: rgba(15, 23, 42, 0.04);
+  --cockpit-tab-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-tab-active-bg: rgba(15, 23, 42, 0.08);
+  --cockpit-tab-active-border: 1px solid rgba(15, 23, 42, 0.2);
+  --cockpit-tab-active-text: var(--text-primary);
+  --cockpit-tab-badge-bg: rgba(15, 23, 42, 0.12);
+  --cockpit-tab-badge-text: var(--text-primary);
+  --cockpit-rail-bg: rgba(255, 255, 255, 0.9);
+  --cockpit-rail-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-rail-shadow: 0 16px 40px rgba(15, 23, 42, 0.1);
+  --cockpit-panel-bg: linear-gradient(160deg, rgba(255, 255, 255, 0.96), rgba(242, 245, 249, 0.92));
+  --cockpit-panel-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-panel-shadow: 0 18px 46px rgba(15, 23, 42, 0.12);
+  --cockpit-panel-muted-bg: rgba(15, 23, 42, 0.04);
+  --cockpit-panel-muted-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-card-bg: rgba(15, 23, 42, 0.04);
+  --cockpit-card-border: 1px solid rgba(15, 23, 42, 0.08);
+  --cockpit-card-shadow: 0 10px 24px rgba(15, 23, 42, 0.1);
+  --cockpit-alert-bg: rgba(217, 72, 87, 0.12);
+  --cockpit-alert-border: 1px solid rgba(217, 72, 87, 0.3);
+  --cockpit-warn-bg: rgba(217, 119, 6, 0.12);
+  --cockpit-warn-border: 1px solid rgba(217, 119, 6, 0.3);
+  --cockpit-focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent-color) 35%, transparent);
+  --cockpit-avatar-bg: radial-gradient(circle at 50% 22%, color-mix(in srgb, var(--accent-color) 10%, transparent), transparent 55%),
+    radial-gradient(circle at 20% 80%, color-mix(in srgb, var(--accent-color) 6%, transparent), transparent 50%),
+    rgba(255, 255, 255, 0.7);
+  --avatar-saturation: 18%;
+  --avatar-lightness: 24%;
+  --avatar-field-alpha: 0.12;
+  --avatar-scan-alpha: 0.28;
+  --avatar-noise-alpha: 0.16;
+  --avatar-core-alpha: 0.82;
+  --avatar-glow-alpha: 0.4;
+  --avatar-color-fixed: #0f172a;
+  --avatar-glow-fixed: rgba(15, 23, 42, 0.45);
+}
+
+body {
+  background-color: var(--bg-color);
+  background-image:
+    linear-gradient(rgba(15, 23, 42, 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 23, 42, 0.07) 1px, transparent 1px),
+    radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.9), transparent 45%),
+    radial-gradient(circle at 80% 12%, rgba(220, 230, 240, 0.8), transparent 48%);
+  background-size: 56px 56px, 56px 56px, auto, auto;
+  background-attachment: fixed;
+  animation: utopiaGridDrift 26s linear infinite;
+}
+
+@keyframes utopiaGridDrift {
+  0% {
+    background-position: 0 0, 0 0, 0 0, 0 0;
+  }
+  100% {
+    background-position: 140px 140px, -140px 140px, 0 0, 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body {
+    animation: none;
+  }
+}

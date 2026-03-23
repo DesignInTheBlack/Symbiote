@@ -1,0 +1,304 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=League+Spartan:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap');
+
+:root {
+  --bg-color: #b33a1e;
+  --surface-color: #a2341b;
+  --surface-gradient: linear-gradient(180deg, #c24925 0%, #b33a1e 50%, #9a2d16 100%);
+
+  --accent-color: #f7e4d6;
+  --accent-color-hover: #fff2e9;
+  --text-primary: #ffe8dc;
+  --text-secondary: #f2c7b6;
+  --accent-primary: var(--accent-color);
+  --accent-secondary: #ffcbb2;
+
+  --border-color: rgba(255, 220, 200, 0.16);
+  --error-color: #ff6b6b;
+  --success-color: #3dd69c;
+
+  --neu-flat: 0 14px 28px rgba(64, 16, 8, 0.55), 0 -10px 22px rgba(255, 140, 110, 0.18);
+  --neu-pressed: inset 0 10px 20px rgba(64, 16, 8, 0.6), inset 0 -10px 20px rgba(255, 140, 110, 0.2);
+  --neu-convex: 0 12px 24px rgba(64, 16, 8, 0.5), 0 -8px 18px rgba(255, 150, 120, 0.2);
+  --neu-border: 1px solid rgba(255, 220, 200, 0.12);
+  --chamfer-top: 1px solid rgba(255, 235, 223, 0.2);
+  --chamfer-bottom: 1px solid rgba(64, 16, 8, 0.35);
+
+  --font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-header: 'League Spartan', system-ui, -apple-system, sans-serif;
+  --font-mono: 'DM Mono', 'SF Mono', 'Monaco', 'Consolas', 'Courier New', monospace;
+  --panel-radius: 18px;
+  --panel-padding: 16px;
+  --panel-gap: 12px;
+  --control-height: 36px;
+  --control-radius: 10px;
+  --control-padding-x: 14px;
+  --control-padding-y: 6px;
+  --control-icon-size: 16px;
+
+  --text-on-accent: #5a1e10;
+  --accent-glow: rgba(255, 214, 194, 0.55);
+
+  --surface-overlay: rgba(106, 32, 16, 0.6);
+  --surface-overlay-border: 1px solid rgba(255, 220, 200, 0.22);
+  --surface-muted: rgba(255, 220, 200, 0.08);
+  --scrollbar-thumb-hover: rgba(255, 230, 214, 0.28);
+
+  --code-bg: rgba(64, 18, 8, 0.45);
+  --code-border: 1px solid rgba(255, 209, 189, 0.2);
+  --code-text: #ffe8dc;
+
+  --raw-bg: rgba(64, 18, 8, 0.3);
+  --raw-border: 1px solid rgba(255, 209, 189, 0.18);
+  --raw-text: #f2c7b6;
+
+  --task-card-bg: rgba(61, 214, 156, 0.18);
+  --task-card-border: 1px solid rgba(61, 214, 156, 0.4);
+  --reminder-card-bg: var(--task-card-bg);
+  --reminder-card-border: var(--task-card-border);
+  --reminder-card-shadow: var(--neu-pressed);
+  --reminder-card-title: var(--accent-color);
+  --reminder-card-text: var(--text-primary);
+  --reminder-card-meta: var(--text-secondary);
+  --reminder-card-icon: var(--accent-color);
+
+  --toast-bg: rgba(70, 22, 12, 0.95);
+  --toast-border: 1px solid rgba(255, 220, 200, 0.2);
+  --toast-shadow: 0 12px 28px rgba(40, 10, 5, 0.5);
+  --toast-text: #ffe8dc;
+  --toast-muted: #f2c0a8;
+  --toast-action-border: rgba(255, 220, 200, 0.25);
+
+  --mic-recording-bg: rgba(255, 107, 107, 0.2);
+  --mic-speaking-bg: rgba(61, 214, 156, 0.2);
+  --mic-error-bg: rgba(255, 107, 107, 0.28);
+  --mic-reconnecting-bg: rgba(255, 228, 214, 0.12);
+
+  --spinner-border: rgba(255, 235, 223, 0.3);
+  --spinner-border-top: #fff5ee;
+
+  --badge-text: #5a1e10;
+  --badge-shadow: 0 2px 6px rgba(64, 16, 8, 0.35);
+
+  --time-badge-bg: rgba(255, 214, 194, 0.2);
+  --time-badge-text: #ffd7c2;
+  --time-badge-border: 1px solid rgba(255, 214, 194, 0.32);
+
+  --context-danger-bg: rgba(255, 107, 107, 0.2);
+
+  --danger-color: #ff7b7b;
+  --danger-solid: #ff4d4d;
+  --danger-solid-text: #fff0ea;
+
+  --status-success: #3dd69c;
+  --status-success-soft: rgba(61, 214, 156, 0.2);
+  --status-success-border: rgba(61, 214, 156, 0.45);
+  --status-warning: #f6b26b;
+  --status-caution: #f38b2a;
+  --status-caution-soft: rgba(243, 139, 42, 0.2);
+  --status-caution-border: rgba(243, 139, 42, 0.45);
+  --status-danger: #ff6b6b;
+  --status-danger-soft: rgba(255, 107, 107, 0.22);
+  --status-danger-border: rgba(255, 107, 107, 0.45);
+  --status-neutral: #f0b9a0;
+
+  --health-banner-bg: linear-gradient(135deg,
+      color-mix(in srgb, var(--status-warning) 22%, var(--surface-color)) 0%,
+      color-mix(in srgb, var(--status-warning) 12%, var(--surface-color)) 100%);
+  --health-banner-border: 1px solid color-mix(in srgb, var(--status-warning) 45%, transparent);
+  --health-banner-text: color-mix(in srgb, var(--text-primary) 88%, var(--status-warning));
+  --health-banner-muted: color-mix(in srgb, var(--text-secondary) 82%, var(--status-warning));
+  --health-banner-shadow: var(--cockpit-panel-shadow);
+  --health-banner-action-border: color-mix(in srgb, var(--status-warning) 35%, transparent);
+  --health-banner-action-bg: color-mix(in srgb, var(--status-warning) 10%, transparent);
+
+  --avatar-stress-color: var(--status-warning);
+  --avatar-confidence-color: var(--success-color);
+  --avatar-pending-color: var(--accent-color);
+  --avatar-error-color: var(--error-color);
+
+  --input-inset-shadow: inset 3px 3px 6px rgba(64, 16, 8, 0.6), inset -3px -3px 6px rgba(255, 150, 120, 0.2);
+  --input-border: rgba(255, 213, 194, 0.25);
+  --input-placeholder: color-mix(in srgb, var(--text-secondary) 70%, transparent);
+
+  --terminal-bg: #7b2511;
+  --terminal-text: #ffd9c8;
+  --terminal-shadow: inset 3px 3px 6px rgba(52, 12, 6, 0.6), inset -3px -3px 6px rgba(255, 150, 120, 0.2);
+  --terminal-select-bg: rgba(255, 230, 214, 0.25);
+
+  --graph-grid: rgba(255, 220, 200, 0.16);
+  --graph-minimap-stroke: #ffd1b8;
+  --graph-minimap-mask: rgba(87, 23, 12, 0.65);
+  --graph-activate: #ffd1b8;
+  --graph-activate-shadow: 0 0 16px rgba(255, 209, 184, 0.6);
+  --graph-warning: #f6b26b;
+  --graph-warning-glow: 0 0 8px rgba(246, 178, 107, 0.6), 0 0 16px rgba(246, 178, 107, 0.4);
+
+  --graph-node-person: #ffd1b8;
+  --graph-node-place: #f6b26b;
+  --graph-node-work: #ff8c61;
+  --graph-node-concept: #ff9ad5;
+  --graph-node-event: #ff6b6b;
+  --graph-node-project: #f6d365;
+  --graph-node-system: #4dd6c0;
+  --graph-node-conflict: #ff4d4d;
+  --graph-node-default: #e2a48f;
+  --graph-node-muted: #c48d7b;
+
+  --graph-link-fact: #f4c1aa;
+  --graph-link-supersedes: #f7c58a;
+  --graph-link-contradicts: #ff7b7b;
+  --graph-link-supports: #58d6a0;
+  --graph-link-derived: #ffb3e6;
+  --graph-link-relation: #f6a97b;
+  --graph-link-other: #f28c8c;
+
+  --graph-label-base: #fff1e8;
+  --graph-label-bg: rgba(87, 23, 12, 0.6);
+  --graph-label-selected: #fff3e8;
+  --graph-label-hover: #ffe1d3;
+  --graph-texture-line: rgba(255, 220, 200, 0.28);
+  --graph-texture-dot: rgba(255, 220, 200, 0.18);
+
+  --status-action-border: rgba(255, 214, 194, 0.35);
+  --status-action-hover-text: #fff1e8;
+
+  --vortex-ring-gradient: conic-gradient(from 0deg, transparent 0%, rgba(255, 226, 210, 0.7) 20%, transparent 40%, rgba(255, 226, 210, 0.35) 60%, transparent 100%);
+  --vortex-ring-shadow: 0 0 24px rgba(255, 214, 194, 0.4), inset 0 0 24px rgba(255, 214, 194, 0.2);
+  --vortex-core-bg: #f9e8dd;
+  --vortex-core-shadow: 0 0 28px rgba(255, 226, 210, 0.55), 0 0 48px rgba(255, 226, 210, 0.35);
+
+  --core-gradient: conic-gradient(from 0deg, transparent 0%, #ffd1b8 25%, #f7e4d6 50%, #ffbfa4 55%, transparent 100%);
+  --core-glow: 0 0 32px rgba(255, 214, 194, 0.45);
+  --core-hole-bg: #6a1f0f;
+  --core-hole-shadow: 0 0 18px rgba(255, 214, 194, 0.5), inset 0 0 40px rgba(48, 10, 5, 0.85);
+  --core-hole-text: #fff0e8;
+
+  --core-white-gradient: conic-gradient(from 0deg, transparent 0%, #ffe7da 25%, #ffffff 50%, #fcebe1 55%, transparent 100%);
+  --core-white-bg: #fff5ee;
+  --core-white-glow: 0 0 30px rgba(255, 245, 238, 0.65);
+  --core-white-shadow: 0 0 18px rgba(255, 245, 238, 0.85), inset 0 0 36px rgba(106, 31, 15, 0.35);
+  --core-white-text: #5a1e10;
+
+  --node-user-gradient: var(--core-white-gradient);
+  --node-user-bg: var(--core-white-bg);
+  --node-user-glow: var(--core-white-glow);
+  --node-user-shadow: var(--core-white-shadow);
+  --node-user-text: var(--core-white-text);
+  --node-user-handle: #ffd1b8;
+
+  --energy-stream-color: #ffe1d3;
+  --energy-stream-glow: drop-shadow(0 0 4px rgba(255, 214, 194, 0.55));
+
+  --slider-track-bg: #922c15;
+  --slider-track-shadow: inset 2px 2px 5px rgba(58, 14, 7, 0.75), inset -1px -1px 3px rgba(255, 150, 120, 0.2);
+  --slider-track-border: 1px solid rgba(255, 213, 194, 0.2);
+
+  --slider-thumb-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(90, 30, 16, 0.6) 14px,
+      rgba(90, 30, 16, 0.6) 15px,
+      rgba(255, 225, 210, 0.25) 15px,
+      rgba(255, 225, 210, 0.25) 16px),
+    linear-gradient(180deg, #f6d7c8, #e9b9a4);
+  --slider-thumb-hover-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(90, 30, 16, 0.7) 14px,
+      rgba(90, 30, 16, 0.7) 15px,
+      rgba(255, 225, 210, 0.35) 15px,
+      rgba(255, 225, 210, 0.35) 16px),
+    linear-gradient(180deg, #ffe1d2, #efc3b0);
+  --slider-thumb-active-bg: repeating-linear-gradient(90deg,
+      transparent,
+      transparent 14px,
+      rgba(90, 30, 16, 0.8) 14px,
+      rgba(90, 30, 16, 0.8) 15px,
+      rgba(255, 225, 210, 0.45) 15px,
+      rgba(255, 225, 210, 0.45) 16px),
+    linear-gradient(180deg, #f2c8b3, #e6ad96);
+  --slider-thumb-shadow: 0 4px 8px rgba(58, 14, 7, 0.5),
+    inset 0 1px 1px rgba(255, 240, 232, 0.6),
+    0 0 6px rgba(255, 214, 194, 0.3);
+  --slider-thumb-hover-shadow: 0 6px 10px rgba(58, 14, 7, 0.55),
+    inset 0 1px 2px rgba(255, 240, 232, 0.7),
+    0 0 8px rgba(255, 214, 194, 0.4);
+  --slider-thumb-active-shadow: 0 3px 6px rgba(58, 14, 7, 0.6),
+    inset 0 1px 2px rgba(90, 30, 16, 0.35);
+  --slider-thumb-border: 1px solid rgba(90, 30, 16, 0.5);
+  --slider-thumb-border-top: 1px solid rgba(255, 240, 232, 0.6);
+
+  --confidence-track-shadow: inset 1px 1px 2px rgba(58, 14, 7, 0.45);
+  --confidence-fill-gradient: linear-gradient(90deg, #3dd69c, #ffd1b8);
+  --confidence-glow: 0 0 10px rgba(255, 214, 194, 0.45);
+
+  --titlebar-height: 34px;
+  --titlebar-bg: rgba(138, 43, 20, 0.9);
+  --titlebar-text: #f7c9b4;
+  --titlebar-border: 1px solid rgba(255, 213, 194, 0.18);
+  --titlebar-shadow: 0 6px 14px rgba(40, 10, 5, 0.5);
+  --titlebar-control-hover: rgba(255, 214, 194, 0.18);
+  --titlebar-control-close-hover: rgba(255, 107, 107, 0.2);
+  --titlebar-control-close-text: #ff7b7b;
+
+  --sidebar-shadow: 6px 0 18px rgba(58, 14, 7, 0.45);
+  --memory-graph-bg: radial-gradient(circle at center, #9b2f16 0%, #6e1f0f 100%);
+  --episodic-panel-bg: rgba(112, 32, 16, 0.92);
+  --episodic-panel-border: 1px solid rgba(255, 220, 200, 0.18);
+  --episodic-panel-shadow: 0 12px 28px rgba(40, 10, 5, 0.5);
+  --episodic-item-bg: rgba(78, 22, 11, 0.7);
+  --episodic-item-border: 1px solid rgba(255, 214, 194, 0.12);
+
+  --input-focus-shadow: inset 4px 4px 10px rgba(58, 14, 7, 0.6), inset -4px -4px 10px rgba(255, 150, 120, 0.25), 0 0 8px rgba(255, 214, 194, 0.35);
+
+  /* Cockpit tokens */
+  --cockpit-bg: radial-gradient(circle at 12% 10%, rgba(255, 214, 194, 0.18), transparent 50%),
+    radial-gradient(circle at 85% 20%, rgba(255, 160, 130, 0.2), transparent 45%);
+  --cockpit-header-bg: rgba(112, 32, 16, 0.88);
+  --cockpit-header-border: 1px solid rgba(255, 220, 200, 0.18);
+  --cockpit-header-shadow: 0 20px 50px rgba(40, 10, 5, 0.5);
+  --cockpit-tab-bg: rgba(255, 220, 200, 0.12);
+  --cockpit-tab-border: 1px solid rgba(255, 220, 200, 0.2);
+  --cockpit-tab-active-bg: rgba(255, 214, 194, 0.2);
+  --cockpit-tab-active-border: 1px solid rgba(255, 214, 194, 0.45);
+  --cockpit-tab-active-text: var(--text-primary);
+  --cockpit-tab-badge-bg: rgba(255, 220, 200, 0.25);
+  --cockpit-tab-badge-text: var(--text-primary);
+  --cockpit-rail-bg: rgba(90, 26, 13, 0.78);
+  --cockpit-rail-border: 1px solid rgba(255, 214, 194, 0.18);
+  --cockpit-rail-shadow: 0 16px 40px rgba(40, 10, 5, 0.45);
+  --cockpit-panel-bg: linear-gradient(160deg, rgba(120, 36, 18, 0.92), rgba(86, 24, 12, 0.88));
+  --cockpit-panel-border: 1px solid rgba(255, 214, 194, 0.18);
+  --cockpit-panel-shadow: 0 18px 46px rgba(40, 10, 5, 0.45);
+  --cockpit-panel-muted-bg: rgba(255, 220, 200, 0.08);
+  --cockpit-panel-muted-border: 1px solid rgba(255, 214, 194, 0.18);
+  --cockpit-card-bg: rgba(255, 220, 200, 0.08);
+  --cockpit-card-border: 1px solid rgba(255, 214, 194, 0.18);
+  --cockpit-card-shadow: 0 10px 24px rgba(40, 10, 5, 0.4);
+  --cockpit-alert-bg: rgba(255, 107, 107, 0.2);
+  --cockpit-alert-border: 1px solid rgba(255, 107, 107, 0.4);
+  --cockpit-warn-bg: rgba(243, 139, 42, 0.2);
+  --cockpit-warn-border: 1px solid rgba(243, 139, 42, 0.4);
+  --cockpit-focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent-color) 55%, transparent);
+  --cockpit-avatar-bg: radial-gradient(circle at 50% 22%, color-mix(in srgb, var(--accent-color) 24%, transparent), transparent 55%),
+    radial-gradient(circle at 20% 80%, color-mix(in srgb, var(--accent-color) 12%, transparent), transparent 50%),
+    rgba(78, 22, 11, 0.55);
+  --avatar-saturation: 78%;
+  --avatar-lightness: 62%;
+  --avatar-field-alpha: 0.22;
+  --avatar-scan-alpha: 0.42;
+  --avatar-noise-alpha: 0.2;
+  --avatar-core-alpha: 0.88;
+  --avatar-glow-alpha: 0.48;
+  --avatar-color-fixed: #f4c76a;
+  --avatar-glow-fixed: rgba(244, 199, 106, 0.75);
+}
+
+body {
+  background-color: var(--bg-color);
+  background-image:
+    radial-gradient(circle at 50% 35%, rgba(255, 214, 194, 0.35), transparent 55%),
+    radial-gradient(circle at 15% 10%, rgba(255, 160, 130, 0.2), transparent 45%),
+    linear-gradient(180deg, #c64a27 0%, #b33a1e 45%, #962a15 100%);
+  background-attachment: fixed;
+}
