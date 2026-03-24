@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, test } from "vitest";
 
 import { TraceView } from "../TraceView";
@@ -76,9 +76,11 @@ describe("TraceView", () => {
     );
 
     expect(screen.getByText(/system cockpit/i)).toBeTruthy();
-    expect(screen.getByText(/memory_pass_start/i)).toBeTruthy();
-    expect(screen.getByText(/kernel loop/i)).toBeTruthy();
-    expect(screen.getByText(/control history/i)).toBeTruthy();
-    expect(screen.getByText(/health timeline/i)).toBeTruthy();
+    expect(screen.getByText(/system status/i)).toBeTruthy();
+    expect(screen.getByText(/active alerts/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: /logs/i }));
+    expect(screen.getByText(/system logs/i)).toBeTruthy();
+    expect(screen.getByText(/memory pass started/i)).toBeTruthy();
   });
 });

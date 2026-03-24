@@ -657,6 +657,7 @@ pub struct Settings {
     pub injection_policy: String, // 'include', 'exclude'
     pub request_defaults: Option<serde_json::Value>,
     pub active_model_id: Option<String>,
+    pub json_reliable_model_id: Option<String>,
     pub system_prompt: Option<String>,
     pub voice_name: Option<String>,
     pub voice_speed: Option<f32>,
@@ -709,6 +710,7 @@ pub struct Settings {
     pub dream_enabled: Option<bool>,
     pub binding_enforcement_enabled: Option<bool>,
     pub pending_prompt_alignment_enabled: Option<bool>,
+    pub pending_prompt_recency_secs: Option<i64>,
     pub auto_memory_pass_enabled: Option<bool>,
     pub summary_cohesion_enabled: Option<bool>,
     pub compact_prompt_enabled: Option<bool>,
@@ -795,6 +797,13 @@ impl Settings {
             5,
             None,
             "monologue_retry_timeout_secs",
+            &mut adjustments,
+        );
+        clamp_opt_i64(
+            &mut self.pending_prompt_recency_secs,
+            10,
+            None,
+            "pending_prompt_recency_secs",
             &mut adjustments,
         );
         clamp_opt_i32(

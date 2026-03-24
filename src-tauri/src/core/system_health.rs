@@ -352,6 +352,44 @@ impl HealthAggregator {
             count_system_log_event(&self.db.pool, "monologue_tick_end", &since_str).await;
         let monologue_tick_timeout =
             count_system_log_event(&self.db.pool, "monologue_tick_timeout", &since_str).await;
+        let json_label_filter = "json_extract(payload, '$.request_label') IN ('qualia_auto_label','qualia_auto_label_retry','prediction_generation','prediction_generation_retry','prediction_generation_parse_retry','prediction_generation_fallback')";
+        let json_strict_filter = format!(
+            "json_extract(payload, '$.json_strict') = 1 AND {}",
+            json_label_filter
+        );
+        let json_strict_requests = count_system_log_event_filtered(
+            &self.db.pool,
+            "request",
+            &since_str,
+            Some(json_strict_filter.as_str()),
+        )
+        .await;
+        let json_invalid = count_system_log_event_filtered(
+            &self.db.pool,
+            "response_reasoning_json_invalid",
+            &since_str,
+            Some(json_label_filter),
+        )
+        .await;
+        let json_retry = count_system_log_event_filtered(
+            &self.db.pool,
+            "response_reasoning_json_retry",
+            &since_str,
+            Some(json_label_filter),
+        )
+        .await;
+        let json_success = json_strict_requests.saturating_sub(json_invalid);
+        let json_clean = json_success.saturating_sub(json_retry);
+        let json_compliance_rate = if json_strict_requests > 0 {
+            json_success as f64 / json_strict_requests as f64
+        } else {
+            1.0
+        };
+        let json_clean_rate = if json_strict_requests > 0 {
+            json_clean as f64 / json_strict_requests as f64
+        } else {
+            1.0
+        };
         let loop_outcomes =
             count_system_log_event(&self.db.pool, "monologue_loop_outcome", &since_str).await;
         let loop_noop = count_system_log_event_filtered(
@@ -794,6 +832,21 @@ impl HealthAggregator {
                 } else {
                     0.0
                 },
+            },
+            "json_compliance": {
+                "labels": [
+                    "qualia_auto_label",
+                    "qualia_auto_label_retry",
+                    "prediction_generation",
+                    "prediction_generation_retry",
+                    "prediction_generation_parse_retry",
+                    "prediction_generation_fallback",
+                ],
+                "strict_requests": json_strict_requests,
+                "invalid": json_invalid,
+                "retry": json_retry,
+                "compliance_rate": json_compliance_rate,
+                "clean_rate": json_clean_rate,
             },
             "gate": {
                 "counts": {

@@ -5,18 +5,21 @@ fn pending_prompt_looks_jsonish(prompt: &str) -> bool {
     if trimmed.len() < 2 {
         return false;
     }
+    let lower = trimmed.to_lowercase();
+    let starts_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    let has_marker = lower.contains("\"stance\"")
+        || lower.contains("\"candidates\"")
+        || lower.contains("\"decision_packet\"")
+        || lower.contains("\"required_slots\"")
+        || lower.contains("\"done\"")
+        || lower.contains("\"message\"");
+    if starts_json && has_marker {
+        return true;
+    }
     let wrapped = (trimmed.starts_with('{') && trimmed.ends_with('}'))
         || (trimmed.starts_with('[') && trimmed.ends_with(']'));
     if !wrapped {
         return false;
-    }
-    let lower = trimmed.to_lowercase();
-    if lower.contains("\"stance\"")
-        || lower.contains("\"candidates\"")
-        || lower.contains("\"done\"")
-        || lower.contains("\"message\"")
-    {
-        return true;
     }
     serde_json::from_str::<Value>(trimmed).is_ok()
 }
@@ -456,6 +459,33 @@ pub(crate) async fn record_monologue_intent(
         return None;
     }
     clear_monologue_intents(kernel, conversation_id).await;
+    let latest_user = kernel
+        .db
+        .get_latest_user_message(conversation_id)
+        .await
+        .ok()
+        .flatten();
+    let Some((anchor_message_id, anchor_content, anchor_created_at)) = latest_user else {
+        let _ = system_log::log_event(
+            &kernel.db.pool,
+            Some(&kernel.app_handle),
+            "info",
+            "kernel",
+            None,
+            None,
+            json!( {
+                "event": "pending_prompt_anchor_missing",
+                "candidate_kind": intent_kind,
+                "source": "monologue",
+                "reason": "no_user_message",
+            }),
+        )
+        .await;
+        return None;
+    };
+    let anchor_hash = crate::core::kernel::utils::text::hash_payload(
+        &crate::core::kernel::utils::text::summarize_snippet(&anchor_content, 160),
+    );
     let bridge_id = Uuid::new_v4().to_string();
     let expires_at = compute_expires_at(Utc::now(), PENDING_PROMPT_EXPIRES_SECS);
     let prompt_id = kernel
@@ -468,6 +498,10 @@ pub(crate) async fn record_monologue_intent(
             Some(intent_kind),
             Some(&bridge_id),
             Some(&expires_at),
+            Some(&anchor_message_id),
+            Some(&anchor_hash),
+            Some(&anchor_created_at),
+            Some("user"),
         )
         .await
         .ok()?;

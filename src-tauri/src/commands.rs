@@ -1432,6 +1432,10 @@ pub struct PendingPromptView {
     pub auto_surface: bool,
     pub intent_kind: Option<String>,
     pub bridge_id: Option<String>,
+    pub anchor_message_id: Option<String>,
+    pub anchor_hash: Option<String>,
+    pub anchor_created_at: Option<String>,
+    pub anchor_role: Option<String>,
 }
 
 fn sanitize_theme_name(name: &str) -> Result<&str, String> {
@@ -1513,7 +1517,7 @@ pub async fn list_pending_prompts(
         .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
-        .map(|(id, prompt, source, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at)| PendingPromptView {
+        .map(|(id, prompt, source, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at, anchor_message_id, anchor_hash, anchor_created_at, anchor_role)| PendingPromptView {
             id,
             prompt,
             source,
@@ -1525,6 +1529,10 @@ pub async fn list_pending_prompts(
             auto_surface,
             intent_kind,
             bridge_id,
+            anchor_message_id,
+            anchor_hash,
+            anchor_created_at,
+            anchor_role,
         })
         .collect())
 }
@@ -1595,7 +1603,7 @@ pub async fn send_pending_prompt(
     chat: State<'_, Arc<ChatManager>>,
     prompt_id: String,
 ) -> Result<(), String> {
-    let Some((pending_id, _prompt, source, conversation_id, _created_at, _skip_count, _auto_surface, _intent_kind, _bridge_id, _attempt_count, _last_asked_at, _expires_at)) = chat
+    let Some((pending_id, _prompt, source, conversation_id, _created_at, _skip_count, _auto_surface, _intent_kind, _bridge_id, _attempt_count, _last_asked_at, _expires_at, _anchor_message_id, _anchor_hash, _anchor_created_at, _anchor_role)) = chat
         .db
         .get_pending_prompt_by_id(&prompt_id)
         .await

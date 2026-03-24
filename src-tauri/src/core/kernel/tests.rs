@@ -14,7 +14,7 @@
     use crate::core::self_model_controller;
     use crate::models::{ControllerGate, GoalStackItem, GoalStep};
     use serde_json::{json, Value};
-    use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+    use sqlx::{sqlite::SqlitePoolOptions, SqlitePool, Row};
     use std::fs;
     use std::path::PathBuf;
     use tokio::sync::watch;
@@ -29,6 +29,7 @@
             injection_policy: "include".to_string(),
             request_defaults: None,
             active_model_id: None,
+            json_reliable_model_id: None,
             system_prompt: None,
             voice_name: None,
             voice_speed: None,
@@ -77,6 +78,7 @@
             dream_enabled: None,
             binding_enforcement_enabled: None,
             pending_prompt_alignment_enabled: None,
+            pending_prompt_recency_secs: None,
             auto_memory_pass_enabled: None,
             summary_cohesion_enabled: None,
             compact_prompt_enabled: None,
@@ -132,6 +134,30 @@
             empty_response_retry_max: None,
             empty_response_retry_timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn unwrap_primary_response_message_prefers_message_text_content() {
+        let raw = r#"{"message":"Hello there","candidates":[{"kind":"emit_message"}]}"#;
+        assert_eq!(
+            unwrap_primary_response_message(raw),
+            Some("Hello there".to_string())
+        );
+        let raw_text = r#"{"text":"Hi","done":true}"#;
+        assert_eq!(unwrap_primary_response_message(raw_text), Some("Hi".to_string()));
+        let raw_content = r#"{"content":"Yo"}"#;
+        assert_eq!(
+            unwrap_primary_response_message(raw_content),
+            Some("Yo".to_string())
+        );
+    }
+
+    #[test]
+    fn unwrap_primary_response_message_ignores_candidate_only_packets() {
+        let raw = r#"[{"kind":"emit_message","payload":{"text":"hello"}}]"#;
+        assert!(unwrap_primary_response_message(raw).is_none());
+        let raw_obj = r#"{"candidates":[{"kind":"emit_message"}],"decision_packet":{"intent":"ask"}}"#;
+        assert!(unwrap_primary_response_message(raw_obj).is_none());
     }
 
     async fn setup_pool() -> SqlitePool {
@@ -481,6 +507,38 @@
     #[tokio::test]
     async fn monologue_json_prompt_is_sanitized() {
         let (kernel, _settings) = setup_kernel_for_gate_tests().await;
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let metadata = json!({ "execution_mode": "direct" }).to_string();
+        sqlx::query(
+            "INSERT INTO runs (run_id, trace_id, conversation_id, started_at, heartbeat_at, status, metadata)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&run_id)
+        .bind(&run_id)
+        .bind("default")
+        .bind(now)
+        .bind(now)
+        .bind("active")
+        .bind(metadata)
+        .execute(&kernel.db.pool)
+        .await
+        .expect("insert run");
+        let message_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, run_id, trace_id, role, content, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'complete', ?)",
+        )
+        .bind(&message_id)
+        .bind("default")
+        .bind(&run_id)
+        .bind(&run_id)
+        .bind("user")
+        .bind("Test user input")
+        .bind(now)
+        .execute(&kernel.db.pool)
+        .await
+        .expect("insert user message");
         let json_prompt = r#"{"stance":"skeptic","message":"test","candidates":[{"kind":"tool_call"}]}"#;
         let result = record_monologue_intent(&kernel, "default", json_prompt, "AskUserQuestion").await;
         assert!(result.is_none());
@@ -490,6 +548,251 @@
             .await
             .unwrap_or(0);
         assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn record_monologue_intent_anchors_latest_user_message() {
+        let (kernel, _settings) = setup_kernel_for_gate_tests().await;
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let metadata = json!({ "execution_mode": "direct" }).to_string();
+        sqlx::query(
+            "INSERT INTO runs (run_id, trace_id, conversation_id, started_at, heartbeat_at, status, metadata)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&run_id)
+        .bind(&run_id)
+        .bind("default")
+        .bind(now)
+        .bind(now)
+        .bind("active")
+        .bind(metadata)
+        .execute(&kernel.db.pool)
+        .await
+        .expect("insert run");
+
+        let first_id = Uuid::new_v4().to_string();
+        let first_at = (now - ChronoDuration::seconds(120)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, run_id, trace_id, role, content, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'complete', ?)",
+        )
+        .bind(&first_id)
+        .bind("default")
+        .bind(&run_id)
+        .bind(&run_id)
+        .bind("user")
+        .bind("First input")
+        .bind(&first_at)
+        .execute(&kernel.db.pool)
+        .await
+        .expect("insert first message");
+
+        let second_id = Uuid::new_v4().to_string();
+        let second_at = (now - ChronoDuration::seconds(30)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, run_id, trace_id, role, content, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'complete', ?)",
+        )
+        .bind(&second_id)
+        .bind("default")
+        .bind(&run_id)
+        .bind(&run_id)
+        .bind("user")
+        .bind("Second input")
+        .bind(&second_at)
+        .execute(&kernel.db.pool)
+        .await
+        .expect("insert second message");
+
+        let result = record_monologue_intent(&kernel, "default", "Follow up?", "AskUserQuestion")
+            .await
+            .expect("intent queued");
+        let prompt_id = result.0;
+
+        let row = sqlx::query(
+            "SELECT anchor_message_id, anchor_hash FROM pending_user_prompts WHERE id = ?",
+        )
+        .bind(&prompt_id)
+        .fetch_one(&kernel.db.pool)
+        .await
+        .expect("fetch pending prompt");
+        let anchor_message_id: String = row.get("anchor_message_id");
+        let anchor_hash: String = row.get("anchor_hash");
+        let expected_hash = crate::core::kernel::utils::text::hash_payload(
+            &crate::core::kernel::utils::text::summarize_snippet("Second input", 160),
+        );
+        assert_eq!(anchor_message_id, second_id);
+        assert_eq!(anchor_hash, expected_hash);
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_blocks_without_user_turn_after_enqueue() {
+        let (kernel, settings) = setup_kernel_for_gate_tests().await;
+        let mut state = KernelState::default_for("default");
+        let now = Utc::now();
+        let last_input_at = (now - ChronoDuration::seconds(10)).to_rfc3339();
+        state.last_user_input = Some("Test input".to_string());
+        state.last_user_input_at = Some(last_input_at.clone());
+        state.last_user_message_id = Some("user_msg_1".to_string());
+        let anchor_hash = crate::core::kernel::utils::text::hash_payload(
+            &crate::core::kernel::utils::text::summarize_snippet("Test input", 160),
+        );
+        let expires_at = compute_expires_at(now, PENDING_PROMPT_EXPIRES_SECS);
+        let _ = kernel
+            .db
+            .enqueue_pending_prompt(
+                "default",
+                "Can you clarify?",
+                "monologue",
+                true,
+                Some("AskUserQuestion"),
+                None,
+                Some(&expires_at),
+                state.last_user_message_id.as_deref(),
+                Some(&anchor_hash),
+                state.last_user_input_at.as_deref(),
+                Some("user"),
+            )
+            .await
+            .expect("enqueue pending prompt");
+
+        let selection = kernel
+            .select_pending_prompt_for_proactive("default", &state, &settings, true, Some("monologue"))
+            .await;
+        assert!(selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_blocks_when_user_input_stale() {
+        let (kernel, mut settings) = setup_kernel_for_gate_tests().await;
+        settings.pending_prompt_recency_secs = Some(30);
+        let mut state = KernelState::default_for("default");
+        let now = Utc::now();
+        let last_input_at = (now - ChronoDuration::seconds(120)).to_rfc3339();
+        state.last_user_input = Some("Recent enough content".to_string());
+        state.last_user_input_at = Some(last_input_at.clone());
+        state.last_user_message_id = Some("user_msg_stale".to_string());
+        let anchor_hash = crate::core::kernel::utils::text::hash_payload(
+            &crate::core::kernel::utils::text::summarize_snippet("Recent enough content", 160),
+        );
+        let expires_at = compute_expires_at(now, PENDING_PROMPT_EXPIRES_SECS);
+        let prompt_id = kernel
+            .db
+            .enqueue_pending_prompt(
+                "default",
+                "Can you clarify your last point?",
+                "monologue",
+                true,
+                Some("AskUserQuestion"),
+                None,
+                Some(&expires_at),
+                state.last_user_message_id.as_deref(),
+                Some(&anchor_hash),
+                state.last_user_input_at.as_deref(),
+                Some("user"),
+            )
+            .await
+            .expect("enqueue pending prompt");
+        let created_at = (now - ChronoDuration::seconds(300)).to_rfc3339();
+        let _ = sqlx::query("UPDATE pending_user_prompts SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(&prompt_id)
+            .execute(&kernel.db.pool)
+            .await
+            .expect("backdate pending prompt");
+
+        let selection = kernel
+            .select_pending_prompt_for_proactive("default", &state, &settings, true, Some("monologue"))
+            .await;
+        assert!(selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_allows_after_user_turn_and_anchor_match() {
+        let (kernel, settings) = setup_kernel_for_gate_tests().await;
+        let mut state = KernelState::default_for("default");
+        let now = Utc::now();
+        state.last_user_input = Some("Latest input".to_string());
+        state.last_user_input_at = Some(now.to_rfc3339());
+        state.last_user_message_id = Some("user_msg_2".to_string());
+        let anchor_hash = crate::core::kernel::utils::text::hash_payload(
+            &crate::core::kernel::utils::text::summarize_snippet("Latest input", 160),
+        );
+        let expires_at = compute_expires_at(now, PENDING_PROMPT_EXPIRES_SECS);
+        let prompt_id = kernel
+            .db
+            .enqueue_pending_prompt(
+                "default",
+                "What part should we explore next?",
+                "monologue",
+                true,
+                Some("AskUserQuestion"),
+                None,
+                Some(&expires_at),
+                state.last_user_message_id.as_deref(),
+                Some(&anchor_hash),
+                state.last_user_input_at.as_deref(),
+                Some("user"),
+            )
+            .await
+            .expect("enqueue pending prompt");
+        let created_at = (now - ChronoDuration::seconds(30)).to_rfc3339();
+        let _ = sqlx::query("UPDATE pending_user_prompts SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(&prompt_id)
+            .execute(&kernel.db.pool)
+            .await
+            .expect("backdate pending prompt");
+
+        let selection = kernel
+            .select_pending_prompt_for_proactive("default", &state, &settings, true, Some("monologue"))
+            .await;
+        assert!(selection.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_blocks_when_anchor_overlap_missing() {
+        let (kernel, settings) = setup_kernel_for_gate_tests().await;
+        let mut state = KernelState::default_for("default");
+        let now = Utc::now();
+        state.last_user_input = Some("Plan a vacation itinerary".to_string());
+        state.last_user_input_at = Some(now.to_rfc3339());
+        state.last_user_message_id = Some("user_msg_overlap".to_string());
+        state.workspace_current_focus = Some("Discuss database batching pipeline".to_string());
+        let anchor_hash = crate::core::kernel::utils::text::hash_payload(
+            &crate::core::kernel::utils::text::summarize_snippet("Plan a vacation itinerary", 160),
+        );
+        let expires_at = compute_expires_at(now, PENDING_PROMPT_EXPIRES_SECS);
+        let prompt_id = kernel
+            .db
+            .enqueue_pending_prompt(
+                "default",
+                "Discuss database batching pipeline",
+                "monologue",
+                true,
+                Some("AskUserQuestion"),
+                None,
+                Some(&expires_at),
+                state.last_user_message_id.as_deref(),
+                Some(&anchor_hash),
+                state.last_user_input_at.as_deref(),
+                Some("user"),
+            )
+            .await
+            .expect("enqueue pending prompt");
+        let created_at = (now - ChronoDuration::seconds(60)).to_rfc3339();
+        let _ = sqlx::query("UPDATE pending_user_prompts SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(&prompt_id)
+            .execute(&kernel.db.pool)
+            .await
+            .expect("backdate pending prompt");
+
+        let selection = kernel
+            .select_pending_prompt_for_proactive("default", &state, &settings, true, Some("monologue"))
+            .await;
+        assert!(selection.is_none());
     }
 
     #[tokio::test]
@@ -1860,7 +2163,16 @@
     fn response_has_user_attribution_detects_patterns() {
         assert!(response_has_user_attribution("Ken said the system is stable.", "Ken"));
         assert!(response_has_user_attribution("As Ken mentioned, the logs changed.", "Ken"));
+        assert!(response_has_user_attribution("I appreciate your assessment here.", "Ken"));
         assert!(!response_has_user_attribution("The system said it is stable.", "Ken"));
+    }
+
+    #[test]
+    fn user_attribution_rewrite_handles_assessment() {
+        let text = "While I appreciate your assessment, I want to ask a question.";
+        let rewritten = rewrite_user_attribution_text(text, "Ken");
+        assert!(!rewritten.to_lowercase().contains("your assessment"));
+        assert!(rewritten.to_lowercase().contains("the assessment"));
     }
 
     #[test]
@@ -1914,11 +2226,11 @@
     #[test]
     fn working_hypothesis_prefix_adds_marker() {
         let prefixed = working_hypothesis_prefix("Speculative response", false);
-        assert_eq!(prefixed, "Speculative response");
+        assert_eq!(prefixed, "Working hypothesis: Speculative response");
         let already = working_hypothesis_prefix("Working hypothesis: ok", false);
         assert_eq!(already, "Working hypothesis: ok");
         let disabled = working_hypothesis_prefix("Speculative response", true);
-        assert_eq!(disabled, "Speculative response");
+        assert_eq!(disabled, "Speculative response (speculative=true)");
     }
 
     #[test]

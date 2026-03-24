@@ -215,6 +215,26 @@ impl Db {
                 .execute(&self.pool)
                 .await;
         }
+        if !column_exists(&self.pool, "pending_user_prompts", "anchor_message_id").await {
+            let _ = sqlx::query("ALTER TABLE pending_user_prompts ADD COLUMN anchor_message_id TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+        if !column_exists(&self.pool, "pending_user_prompts", "anchor_hash").await {
+            let _ = sqlx::query("ALTER TABLE pending_user_prompts ADD COLUMN anchor_hash TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+        if !column_exists(&self.pool, "pending_user_prompts", "anchor_created_at").await {
+            let _ = sqlx::query("ALTER TABLE pending_user_prompts ADD COLUMN anchor_created_at DATETIME")
+                .execute(&self.pool)
+                .await;
+        }
+        if !column_exists(&self.pool, "pending_user_prompts", "anchor_role").await {
+            let _ = sqlx::query("ALTER TABLE pending_user_prompts ADD COLUMN anchor_role TEXT")
+                .execute(&self.pool)
+                .await;
+        }
 
         if !column_exists(&self.pool, "post_processing_jobs", "priority").await {
             let _ = sqlx::query("ALTER TABLE post_processing_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 1")
@@ -2198,8 +2218,8 @@ No other text before or after.
     pub async fn get_settings(&self) -> Result<Settings, Box<dyn std::error::Error + Send + Sync>> {
         self.ensure_settings_columns().await?;
         let row = sqlx::query(
-            "SELECT schema_version, api_base_url, api_key, streaming_enabled, history_window, injection_policy, request_defaults, active_model_id, system_prompt, voice_name, voice_speed, summarization_api_url, summarization_model, embedding_model, user_display_name, assistant_display_name, onboarding_completed, ui_theme, voice_pitch_semitones, voice_reverb_amount, voice_compression, voice_formant_shift, trace_history_limit, cockpit_write_enabled, episodic_enabled, episodic_injection_enabled, episodic_compaction_enabled, episodic_injection_limit, episodic_opt_out, memory_claims_enabled, phi_consent, seed_personal_user, lexical_fallback_enabled, memory_half_life_hours, research_budget_per_hour, research_budget_reset_window,
-research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, monologue_retry_timeout_secs, empty_response_retry_max, empty_response_retry_timeout_ms, monologue_max_per_hour, thread_max_depth, allow_shell_tool, shell_command_allowlist, ask_budget_max, calculator_followups_max, loop_similarity_threshold, loop_recent_k, meta_cog_outcome_turns, meta_cog_cycle_window_turns, meta_cog_outcome_timeout_s, meta_cog_cooldown_s, meta_cog_streak_limit, registry_profile_name, controller_enabled, monologue_stabilization_enabled, monologue_surface_enabled, show_monologue_in_chat, enable_introspection, heartbeat_enabled, dream_enabled, binding_enforcement_enabled, pending_prompt_alignment_enabled, auto_memory_pass_enabled, summary_cohesion_enabled, compact_prompt_enabled, context_hydration_mode, context_budgeter_enabled, context_miss_detector_enabled, world_model_reconcile_mode, goal_loop_enabled, goal_loop_interval_turns, goal_loop_load_threshold_ms, json_only_disabled_models, tool_failure_gate_window_mins, tool_failure_gate_tool_names, gate_default_soft, gate_shadow_mode, gate_rollout_percent, self_report_channel, self_awareness_expression_mode, explicit_feedback_only, weight_user_satisfaction, weight_policy_rigor, weight_latency, weight_evidence_strictness, weight_exploration, monologue_provenance_guard, organism_decay, model_context_limit, introspection_confidence_threshold, introspection_drift_threshold, introspection_ambiguity_threshold, enable_attribution_gate, enable_user_utterance_evidence, enable_attribution_metadata, enable_tool_schema_validation, enable_context_evidence, enable_monologue_validator, enable_memory_evidence_gating, enable_speculative_workspace_containment, stability_prompt_override_guard, stability_monologue_tagged, stability_introspection_structured, stability_disable_working_hypothesis, stability_state_disclosure_expanded, stability_transcript_normalization, stability_memory_hygiene, stability_non_stream_sanitization FROM settings WHERE id = 1"
+            "SELECT schema_version, api_base_url, api_key, streaming_enabled, history_window, injection_policy, request_defaults, active_model_id, json_reliable_model_id, system_prompt, voice_name, voice_speed, summarization_api_url, summarization_model, embedding_model, user_display_name, assistant_display_name, onboarding_completed, ui_theme, voice_pitch_semitones, voice_reverb_amount, voice_compression, voice_formant_shift, trace_history_limit, cockpit_write_enabled, episodic_enabled, episodic_injection_enabled, episodic_compaction_enabled, episodic_injection_limit, episodic_opt_out, memory_claims_enabled, phi_consent, seed_personal_user, lexical_fallback_enabled, memory_half_life_hours, research_budget_per_hour, research_budget_reset_window,
+research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, monologue_retry_timeout_secs, empty_response_retry_max, empty_response_retry_timeout_ms, monologue_max_per_hour, thread_max_depth, allow_shell_tool, shell_command_allowlist, ask_budget_max, calculator_followups_max, loop_similarity_threshold, loop_recent_k, meta_cog_outcome_turns, meta_cog_cycle_window_turns, meta_cog_outcome_timeout_s, meta_cog_cooldown_s, meta_cog_streak_limit, registry_profile_name, controller_enabled, monologue_stabilization_enabled, monologue_surface_enabled, show_monologue_in_chat, enable_introspection, heartbeat_enabled, dream_enabled, binding_enforcement_enabled, pending_prompt_alignment_enabled, pending_prompt_recency_secs, auto_memory_pass_enabled, summary_cohesion_enabled, compact_prompt_enabled, context_hydration_mode, context_budgeter_enabled, context_miss_detector_enabled, world_model_reconcile_mode, goal_loop_enabled, goal_loop_interval_turns, goal_loop_load_threshold_ms, json_only_disabled_models, tool_failure_gate_window_mins, tool_failure_gate_tool_names, gate_default_soft, gate_shadow_mode, gate_rollout_percent, self_report_channel, self_awareness_expression_mode, explicit_feedback_only, weight_user_satisfaction, weight_policy_rigor, weight_latency, weight_evidence_strictness, weight_exploration, monologue_provenance_guard, organism_decay, model_context_limit, introspection_confidence_threshold, introspection_drift_threshold, introspection_ambiguity_threshold, enable_attribution_gate, enable_user_utterance_evidence, enable_attribution_metadata, enable_tool_schema_validation, enable_context_evidence, enable_monologue_validator, enable_memory_evidence_gating, enable_speculative_workspace_containment, stability_prompt_override_guard, stability_monologue_tagged, stability_introspection_structured, stability_disable_working_hypothesis, stability_state_disclosure_expanded, stability_transcript_normalization, stability_memory_hygiene, stability_non_stream_sanitization FROM settings WHERE id = 1"
         )
         .fetch_one(&self.pool)
         .await?;
@@ -2214,6 +2234,7 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
             injection_policy: row.get("injection_policy"),
             request_defaults: row.get::<Option<String>, _>("request_defaults").map(|s| serde_json::from_str(&s).unwrap_or_default()),
             active_model_id: row.get("active_model_id"),
+            json_reliable_model_id: row.get("json_reliable_model_id"),
             system_prompt: row.get("system_prompt"),
             voice_name: row.get("voice_name"),
             voice_speed: row.get("voice_speed"),
@@ -2273,6 +2294,7 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
             dream_enabled: row.try_get::<i32, _>("dream_enabled").ok().map(|v| v != 0),
             binding_enforcement_enabled: row.try_get::<i32, _>("binding_enforcement_enabled").ok().map(|v| v != 0),
             pending_prompt_alignment_enabled: row.try_get::<i32, _>("pending_prompt_alignment_enabled").ok().map(|v| v != 0),
+            pending_prompt_recency_secs: row.try_get::<i64, _>("pending_prompt_recency_secs").ok(),
             auto_memory_pass_enabled: row.try_get::<i32, _>("auto_memory_pass_enabled").ok().map(|v| v != 0),
             summary_cohesion_enabled: row.try_get::<i32, _>("summary_cohesion_enabled").ok().map(|v| v != 0),
             compact_prompt_enabled: row.try_get::<i32, _>("compact_prompt_enabled").ok().map(|v| v != 0),
@@ -2356,6 +2378,9 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
         self.ensure_settings_columns().await?;
         let current = self.get_settings().await?;
         let request_defaults = settings.request_defaults.map(|v| v.to_string());
+        let json_reliable_model_id = settings
+            .json_reliable_model_id
+            .or(current.json_reliable_model_id.clone());
         let ui_theme = settings
             .ui_theme
             .or(current.ui_theme)
@@ -2515,6 +2540,10 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
         let pending_prompt_alignment_enabled = settings
             .pending_prompt_alignment_enabled
             .unwrap_or(current.pending_prompt_alignment_enabled.unwrap_or(true)) as i32;
+        let pending_prompt_recency_secs = settings
+            .pending_prompt_recency_secs
+            .or(current.pending_prompt_recency_secs)
+            .unwrap_or(90);
         let auto_memory_pass_enabled = settings
             .auto_memory_pass_enabled
             .unwrap_or(current.auto_memory_pass_enabled.unwrap_or(true)) as i32;
@@ -2688,9 +2717,9 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
             .or(current.onboarding_completed)
             .unwrap_or(false) as i32;
         if let Err(e) = sqlx::query(
-            "UPDATE settings SET api_base_url = ?, api_key = ?, streaming_enabled = ?, history_window = ?, injection_policy = ?, request_defaults = ?, active_model_id = ?, system_prompt = ?, voice_name = ?, voice_speed = ?, summarization_api_url = ?, summarization_model = ?, embedding_model = ?, user_display_name = ?, assistant_display_name = ?, onboarding_completed = ?, ui_theme = ?, episodic_enabled = ?, episodic_injection_enabled = ?, episodic_compaction_enabled = ?, episodic_injection_limit = ?, episodic_opt_out = ?, memory_claims_enabled = ?, phi_consent = ?, seed_personal_user = ?, lexical_fallback_enabled = ?, memory_half_life_hours = ?, voice_pitch_semitones = ?, voice_reverb_amount = ?, voice_compression = ?, voice_formant_shift = ?, trace_history_limit = ?, cockpit_write_enabled = ?, research_budget_per_hour = ?, 
+            "UPDATE settings SET api_base_url = ?, api_key = ?, streaming_enabled = ?, history_window = ?, injection_policy = ?, request_defaults = ?, active_model_id = ?, json_reliable_model_id = ?, system_prompt = ?, voice_name = ?, voice_speed = ?, summarization_api_url = ?, summarization_model = ?, embedding_model = ?, user_display_name = ?, assistant_display_name = ?, onboarding_completed = ?, ui_theme = ?, episodic_enabled = ?, episodic_injection_enabled = ?, episodic_compaction_enabled = ?, episodic_injection_limit = ?, episodic_opt_out = ?, memory_claims_enabled = ?, phi_consent = ?, seed_personal_user = ?, lexical_fallback_enabled = ?, memory_half_life_hours = ?, voice_pitch_semitones = ?, voice_reverb_amount = ?, voice_compression = ?, voice_formant_shift = ?, trace_history_limit = ?, cockpit_write_enabled = ?, research_budget_per_hour = ?, 
 research_budget_reset_window = ?, research_cost_per_call = ?, monologue_interval_seconds = ?, monologue_timeout_secs = ?, monologue_retry_timeout_secs = ?, empty_response_retry_max = ?, empty_response_retry_timeout_ms = ?, monologue_max_per_hour = ?, 
-thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_budget_max = ?, calculator_followups_max = ?, loop_similarity_threshold = ?, loop_recent_k = ?, meta_cog_outcome_turns = ?, meta_cog_cycle_window_turns = ?, meta_cog_outcome_timeout_s = ?, meta_cog_cooldown_s = ?, meta_cog_streak_limit = ?, registry_profile_name = ?, controller_enabled = ?, monologue_stabilization_enabled = ?, monologue_surface_enabled = ?, show_monologue_in_chat = ?, enable_introspection = ?, heartbeat_enabled = ?, dream_enabled = ?, binding_enforcement_enabled = ?, pending_prompt_alignment_enabled = ?, auto_memory_pass_enabled = ?, summary_cohesion_enabled = ?, compact_prompt_enabled = ?, context_hydration_mode = ?, context_budgeter_enabled = ?, context_miss_detector_enabled = ?, world_model_reconcile_mode = ?, goal_loop_enabled = ?, goal_loop_interval_turns = ?, goal_loop_load_threshold_ms = ?, json_only_disabled_models = ?, tool_failure_gate_window_mins = ?, tool_failure_gate_tool_names = ?, gate_default_soft = ?, gate_shadow_mode = ?, gate_rollout_percent = ?, self_report_channel = ?, self_awareness_expression_mode = ?, explicit_feedback_only = ?, weight_user_satisfaction = ?, weight_policy_rigor = ?, weight_latency = ?, weight_evidence_strictness = ?, weight_exploration = ?, monologue_provenance_guard = ?, organism_decay = ?, model_context_limit = ?, introspection_confidence_threshold = ?, introspection_drift_threshold = ?, introspection_ambiguity_threshold = ?, enable_attribution_gate = ?, enable_user_utterance_evidence = ?, enable_attribution_metadata = ?, enable_tool_schema_validation = ?, enable_context_evidence = ?, enable_monologue_validator = ?, enable_memory_evidence_gating = ?, enable_speculative_workspace_containment = ?, stability_prompt_override_guard = ?, stability_monologue_tagged = ?, stability_introspection_structured = ?, stability_disable_working_hypothesis = ?, stability_state_disclosure_expanded = ?, stability_transcript_normalization = ?, stability_memory_hygiene = ?, stability_non_stream_sanitization = ? WHERE id = 1"
+thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_budget_max = ?, calculator_followups_max = ?, loop_similarity_threshold = ?, loop_recent_k = ?, meta_cog_outcome_turns = ?, meta_cog_cycle_window_turns = ?, meta_cog_outcome_timeout_s = ?, meta_cog_cooldown_s = ?, meta_cog_streak_limit = ?, registry_profile_name = ?, controller_enabled = ?, monologue_stabilization_enabled = ?, monologue_surface_enabled = ?, show_monologue_in_chat = ?, enable_introspection = ?, heartbeat_enabled = ?, dream_enabled = ?, binding_enforcement_enabled = ?, pending_prompt_alignment_enabled = ?, pending_prompt_recency_secs = ?, auto_memory_pass_enabled = ?, summary_cohesion_enabled = ?, compact_prompt_enabled = ?, context_hydration_mode = ?, context_budgeter_enabled = ?, context_miss_detector_enabled = ?, world_model_reconcile_mode = ?, goal_loop_enabled = ?, goal_loop_interval_turns = ?, goal_loop_load_threshold_ms = ?, json_only_disabled_models = ?, tool_failure_gate_window_mins = ?, tool_failure_gate_tool_names = ?, gate_default_soft = ?, gate_shadow_mode = ?, gate_rollout_percent = ?, self_report_channel = ?, self_awareness_expression_mode = ?, explicit_feedback_only = ?, weight_user_satisfaction = ?, weight_policy_rigor = ?, weight_latency = ?, weight_evidence_strictness = ?, weight_exploration = ?, monologue_provenance_guard = ?, organism_decay = ?, model_context_limit = ?, introspection_confidence_threshold = ?, introspection_drift_threshold = ?, introspection_ambiguity_threshold = ?, enable_attribution_gate = ?, enable_user_utterance_evidence = ?, enable_attribution_metadata = ?, enable_tool_schema_validation = ?, enable_context_evidence = ?, enable_monologue_validator = ?, enable_memory_evidence_gating = ?, enable_speculative_workspace_containment = ?, stability_prompt_override_guard = ?, stability_monologue_tagged = ?, stability_introspection_structured = ?, stability_disable_working_hypothesis = ?, stability_state_disclosure_expanded = ?, stability_transcript_normalization = ?, stability_memory_hygiene = ?, stability_non_stream_sanitization = ? WHERE id = 1"
         )
         .bind(settings.api_base_url)
         .bind(settings.api_key)
@@ -2699,6 +2728,7 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         .bind(settings.injection_policy)
         .bind(request_defaults)
         .bind(settings.active_model_id)
+        .bind(json_reliable_model_id)
         .bind(settings.system_prompt)
         .bind(settings.voice_name)
         .bind(settings.voice_speed)
@@ -2756,6 +2786,7 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         .bind(dream_enabled)
         .bind(binding_enforcement_enabled)
         .bind(pending_prompt_alignment_enabled)
+        .bind(pending_prompt_recency_secs)
         .bind(auto_memory_pass_enabled)
         .bind(summary_cohesion_enabled)
         .bind(compact_prompt_enabled)
@@ -3036,6 +3067,9 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         if !column_exists(pool, "settings", "user_display_name").await {
             sqlx::query("ALTER TABLE settings ADD COLUMN user_display_name TEXT").execute(pool).await?;
         }
+        if !column_exists(pool, "settings", "json_reliable_model_id").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN json_reliable_model_id TEXT").execute(pool).await?;
+        }
         if !column_exists(pool, "settings", "assistant_display_name").await {
             sqlx::query("ALTER TABLE settings ADD COLUMN assistant_display_name TEXT").execute(pool).await?;
         }
@@ -3271,6 +3305,13 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         if !column_exists(pool, "settings", "pending_prompt_alignment_enabled").await {
             sqlx::query(
                 "ALTER TABLE settings ADD COLUMN pending_prompt_alignment_enabled BOOLEAN NOT NULL DEFAULT 1",
+            )
+            .execute(pool)
+            .await?;
+        }
+        if !column_exists(pool, "settings", "pending_prompt_recency_secs").await {
+            sqlx::query(
+                "ALTER TABLE settings ADD COLUMN pending_prompt_recency_secs INTEGER NOT NULL DEFAULT 90",
             )
             .execute(pool)
             .await?;
@@ -3727,6 +3768,9 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             .execute(pool)
             .await;
         let _ = sqlx::query("UPDATE settings SET pending_prompt_alignment_enabled = 1 WHERE pending_prompt_alignment_enabled IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET pending_prompt_recency_secs = 90 WHERE pending_prompt_recency_secs IS NULL")
             .execute(pool)
             .await;
         let _ = sqlx::query("UPDATE settings SET auto_memory_pass_enabled = 1 WHERE auto_memory_pass_enabled IS NULL")
@@ -5627,6 +5671,27 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         Ok(row.map(|r| r.get::<String, _>("created_at")))
     }
 
+    pub async fn get_latest_user_message(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = sqlx::query(
+            "SELECT message_id, content, created_at FROM messages
+             WHERE conversation_id = ? AND role = 'user'
+             ORDER BY datetime(created_at) DESC
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            let message_id: String = r.get("message_id");
+            let content: String = r.get("content");
+            let created_at: String = r.get("created_at");
+            (message_id, content, created_at)
+        }))
+    }
+
     pub async fn get_rolling_summary(&self, conversation_id: &str) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
         let row = sqlx::query("SELECT summary FROM conversation_summaries WHERE conversation_id = ?")
             .bind(conversation_id)
@@ -6146,14 +6211,18 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         intent_kind: Option<&str>,
         bridge_id: Option<&str>,
         expires_at: Option<&str>,
+        anchor_message_id: Option<&str>,
+        anchor_hash: Option<&str>,
+        anchor_created_at: Option<&str>,
+        anchor_role: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if Self::pending_prompt_looks_jsonish(prompt) {
             return Err("pending_prompt_sanitized".into());
         }
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO pending_user_prompts (id, conversation_id, prompt, source, created_at, auto_surface, intent_kind, bridge_id, expires_at)
-             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)",
+            "INSERT INTO pending_user_prompts (id, conversation_id, prompt, source, created_at, auto_surface, intent_kind, bridge_id, expires_at, anchor_message_id, anchor_hash, anchor_created_at, anchor_role)
+             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(conversation_id)
@@ -6163,6 +6232,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         .bind(intent_kind)
         .bind(bridge_id)
         .bind(expires_at)
+        .bind(anchor_message_id)
+        .bind(anchor_hash)
+        .bind(anchor_created_at)
+        .bind(anchor_role)
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -6171,9 +6244,9 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
     pub async fn pop_pending_prompt(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<(String, String, String, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(String, String, String, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
         let row = sqlx::query(
-            "SELECT id, prompt, source, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at
+            "SELECT id, prompt, source, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at, anchor_message_id, anchor_hash, anchor_created_at, anchor_role
              FROM pending_user_prompts
              WHERE conversation_id = ?
              ORDER BY datetime(created_at) ASC
@@ -6194,6 +6267,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             let attempt_count: i64 = r.try_get("attempt_count").unwrap_or(0);
             let last_asked_at: Option<String> = r.try_get("last_asked_at").ok();
             let expires_at: Option<String> = r.try_get("expires_at").ok();
+            let anchor_message_id: Option<String> = r.try_get("anchor_message_id").ok();
+            let anchor_hash: Option<String> = r.try_get("anchor_hash").ok();
+            let anchor_created_at: Option<String> = r.try_get("anchor_created_at").ok();
+            let anchor_role: Option<String> = r.try_get("anchor_role").ok();
             let _ = sqlx::query("DELETE FROM pending_user_prompts WHERE id = ?")
                 .bind(&id)
                 .execute(&self.pool)
@@ -6208,6 +6285,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
                 attempt_count,
                 last_asked_at,
                 expires_at,
+                anchor_message_id,
+                anchor_hash,
+                anchor_created_at,
+                anchor_role,
             )));
         }
         Ok(None)
@@ -6216,9 +6297,9 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
     pub async fn peek_pending_prompt(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<(String, String, String, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(String, String, String, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
         let row = sqlx::query(
-            "SELECT id, prompt, source, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at
+            "SELECT id, prompt, source, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at, anchor_message_id, anchor_hash, anchor_created_at, anchor_role
              FROM pending_user_prompts
              WHERE conversation_id = ?
              ORDER BY datetime(created_at) ASC
@@ -6239,6 +6320,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             let attempt_count: i64 = r.try_get("attempt_count").unwrap_or(0);
             let last_asked_at: Option<String> = r.try_get("last_asked_at").ok();
             let expires_at: Option<String> = r.try_get("expires_at").ok();
+            let anchor_message_id: Option<String> = r.try_get("anchor_message_id").ok();
+            let anchor_hash: Option<String> = r.try_get("anchor_hash").ok();
+            let anchor_created_at: Option<String> = r.try_get("anchor_created_at").ok();
+            let anchor_role: Option<String> = r.try_get("anchor_role").ok();
             return Ok(Some((
                 id,
                 prompt,
@@ -6249,6 +6334,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
                 attempt_count,
                 last_asked_at,
                 expires_at,
+                anchor_message_id,
+                anchor_hash,
+                anchor_created_at,
+                anchor_role,
             )));
         }
         Ok(None)
@@ -6258,9 +6347,9 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         &self,
         conversation_id: &str,
         limit: i64,
-    ) -> Result<Vec<(String, String, String, String, i64, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<(String, String, String, String, i64, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
         let rows = sqlx::query(
-            "SELECT id, prompt, source, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at
+            "SELECT id, prompt, source, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at, anchor_message_id, anchor_hash, anchor_created_at, anchor_role
              FROM pending_user_prompts
              WHERE conversation_id = ?
              ORDER BY datetime(created_at) DESC
@@ -6284,6 +6373,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             let attempt_count: i64 = row.try_get("attempt_count").unwrap_or(0);
             let last_asked_at: Option<String> = row.try_get("last_asked_at").ok();
             let expires_at: Option<String> = row.try_get("expires_at").ok();
+            let anchor_message_id: Option<String> = row.try_get("anchor_message_id").ok();
+            let anchor_hash: Option<String> = row.try_get("anchor_hash").ok();
+            let anchor_created_at: Option<String> = row.try_get("anchor_created_at").ok();
+            let anchor_role: Option<String> = row.try_get("anchor_role").ok();
             prompts.push((
                 id,
                 prompt,
@@ -6296,6 +6389,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
                 attempt_count,
                 last_asked_at,
                 expires_at,
+                anchor_message_id,
+                anchor_hash,
+                anchor_created_at,
+                anchor_role,
             ));
         }
         Ok(prompts)
@@ -6304,9 +6401,9 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
     pub async fn get_pending_prompt_by_id(
         &self,
         prompt_id: &str,
-    ) -> Result<Option<(String, String, String, String, String, i64, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(String, String, String, String, String, i64, bool, Option<String>, Option<String>, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
         let row = sqlx::query(
-            "SELECT id, prompt, source, conversation_id, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at
+            "SELECT id, prompt, source, conversation_id, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at, anchor_message_id, anchor_hash, anchor_created_at, anchor_role
              FROM pending_user_prompts
              WHERE id = ?
              LIMIT 1",
@@ -6328,6 +6425,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             let attempt_count: i64 = r.try_get("attempt_count").unwrap_or(0);
             let last_asked_at: Option<String> = r.try_get("last_asked_at").ok();
             let expires_at: Option<String> = r.try_get("expires_at").ok();
+            let anchor_message_id: Option<String> = r.try_get("anchor_message_id").ok();
+            let anchor_hash: Option<String> = r.try_get("anchor_hash").ok();
+            let anchor_created_at: Option<String> = r.try_get("anchor_created_at").ok();
+            let anchor_role: Option<String> = r.try_get("anchor_role").ok();
             return Ok(Some((
                 id,
                 prompt,
@@ -6341,6 +6442,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
                 attempt_count,
                 last_asked_at,
                 expires_at,
+                anchor_message_id,
+                anchor_hash,
+                anchor_created_at,
+                anchor_role,
             )));
         }
         Ok(None)

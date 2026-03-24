@@ -102,6 +102,7 @@ pub use types::{
     ToolFailurePenalty,
 };
 pub use gating::sanitize_user_output;
+pub(crate) use gating::is_interrogative_message;
 pub(crate) use gating::validate_evidence_ids_with_pool;
 pub(crate) use utils::json::{parse_json_object_with_repair, repair_json_object};
 pub(crate) use types::ValidationResult;

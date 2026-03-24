@@ -9,8 +9,8 @@ const MONOLOGUE_LATENCY_BUDGET_MS: i64 = 250;
 const MONOLOGUE_LLM_TIMEOUT_SECS: u64 = 90;
 const MONOLOGUE_RETRY_TIMEOUT_SECS: u64 = 25;
 const MONOLOGUE_RETRY_MAX_TOKENS: i64 = 140;
-const MONOLOGUE_MAX_TOKENS_DELIBERATION: i64 = 320;
-const MONOLOGUE_MAX_TOKENS_FREE_THOUGHT: i64 = 200;
+const MONOLOGUE_MAX_TOKENS_DELIBERATION: i64 = 900;
+const MONOLOGUE_MAX_TOKENS_FREE_THOUGHT: i64 = 700;
 const MONOLOGUE_LOCK_BUSY_COOLDOWN_SECS: i64 = 120;
 const SAFE_UNHALT_WINDOW_MINS: i64 = 20;
 const SAFE_UNHALT_MIN_SINCE_HALT_SECS: i64 = 300;
@@ -732,6 +732,13 @@ impl Kernel {
         )
         .await;
         let mut state = self.load_state(conversation_id).await;
+        if let Ok(Some((message_id, content, created_at))) =
+            self.db.get_latest_user_message(conversation_id).await
+        {
+            state.last_user_message_id = Some(message_id);
+            state.last_user_input = Some(content);
+            state.last_user_input_at = Some(created_at);
+        }
         state.last_monologue_tick_id = Some(tick_id.clone());
         self.ensure_monologue_json_support(&settings, &mut state)
             .await;
@@ -2740,7 +2747,7 @@ impl Kernel {
         }
 
         if let Some(selection) = self
-            .select_pending_prompt_for_proactive(conversation_id, &state, &settings, false)
+            .select_pending_prompt_for_proactive(conversation_id, &state, &settings, false, None)
             .await
         {
             let now = Utc::now();
@@ -2845,19 +2852,26 @@ impl Kernel {
                     selection.overlap_user,
                     selection.age_seconds,
                     selection.skip_count,
+                    selection.anchor_age_seconds,
                 )
                 .await;
                 self.persist_monologue_patch(&state).await;
             } else {
-                let disable_working_hypothesis =
-                    settings.stability_disable_working_hypothesis.unwrap_or(true);
-                let mut question = if selection.exact_open_question {
-                    selection.prompt.clone()
-                } else {
-                    working_hypothesis_prefix(&selection.prompt, disable_working_hypothesis)
-                };
+                let allow_speculative_markers = allow_speculative_markers_for_prompt(
+                    state.last_user_input.as_deref().unwrap_or(""),
+                    false,
+                );
+                let mut question =
+                    strip_working_hypothesis_prefix(&selection.prompt, !allow_speculative_markers);
                 if question.trim().is_empty() {
                     question = selection.prompt.clone();
+                }
+                let user_name = settings.user_display_name.as_deref().unwrap_or("User");
+                let last_user_input = state.last_user_input.as_deref().unwrap_or("");
+                if response_has_user_attribution(&question, user_name)
+                    && !user_attribution_grounded_in_last_input(&question, last_user_input)
+                {
+                    question = rewrite_user_attribution_text(&question, user_name);
                 }
                 if !selection.exact_open_question {
                     let _ = system_log::log_event(
@@ -2867,7 +2881,7 @@ impl Kernel {
                         "kernel",
                         None,
                         None,
-                        json!({
+                        json!( {
                             "event": "speculation_marked",
                             "candidate_id": selection.prompt_id,
                             "reason": "pending_prompt",
@@ -3024,6 +3038,7 @@ impl Kernel {
                         selection.overlap_user,
                         selection.age_seconds,
                         selection.skip_count,
+                        selection.anchor_age_seconds,
                     )
                     .await;
                     if let Ok(count) = self.db.count_pending_prompts(conversation_id).await {
@@ -3041,6 +3056,7 @@ impl Kernel {
                         selection.overlap_user,
                         selection.age_seconds,
                         selection.skip_count,
+                        selection.anchor_age_seconds,
                     )
                     .await;
                 }

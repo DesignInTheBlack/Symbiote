@@ -90,8 +90,9 @@ async fn infer_qualia_tag(
         }
     };
     let model_id = settings
-        .active_model_id
+        .json_reliable_model_id
         .clone()
+        .or_else(|| settings.active_model_id.clone())
         .unwrap_or_else(|| "default".to_string());
 
     let allowed = ["curious", "skeptical", "informative", "calm", "urgent", "neutral"];
@@ -102,7 +103,7 @@ async fn infer_qualia_tag(
         allowed.join(", ")
     );
     let request = ChatCompletionRequest {
-        model: model_id,
+        model: model_id.clone(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -144,7 +145,67 @@ async fn infer_qualia_tag(
             return (tag, intensity, reason, true);
         }
     };
-    let (value_opt, _) = parse_json_object_with_repair(&content);
+    let (mut value_opt, _) = parse_json_object_with_repair(&content);
+    if value_opt.is_none() {
+        let fallback_system_prompt =
+            "Return ONLY JSON. Schema: {\"tag\":\"curious|skeptical|informative|calm|urgent|neutral\",\"intensity\":0.0-1.0,\"reason\":\"short\"}.";
+        let fallback_user_prompt = format!(
+            "Assistant message:\n{}",
+            trimmed.chars().take(500).collect::<String>()
+        );
+        let _ = system_log::log_event(
+            &db.pool,
+            None,
+            "warn",
+            "kernel",
+            run_id,
+            None,
+            json!({
+                "event": "qualia_auto_label_retry",
+                "reason": "json_parse_error",
+                "message_id": message_id,
+            }),
+        )
+        .await;
+        let retry_request = ChatCompletionRequest {
+            model: model_id.clone(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: fallback_system_prompt.to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: fallback_user_prompt,
+                },
+            ],
+            stream: false,
+            temperature: Some(0.1),
+            top_p: None,
+            max_tokens: Some(60),
+            response_format: Some(json!({ "type": "json_object" })),
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+            prefill: None,
+            skip_injection: Some(true),
+            skip_memory: Some(true),
+            skip_reminders: Some(true),
+            memory_expand: None,
+            allow_diagnostics: Some(false),
+            json_strict: Some(true),
+            skip_sanitization: None,
+            run_id: run_id.map(|v| v.to_string()),
+            request_label: Some("qualia_auto_label_retry".to_string()),
+        };
+        if let Ok((retry_content, _)) = client
+            .chat(&settings.api_base_url, settings.api_key.as_deref(), &retry_request)
+            .await
+        {
+            let (retry_value_opt, _) = parse_json_object_with_repair(&retry_content);
+            value_opt = retry_value_opt;
+        }
+    }
     let Some(value) = value_opt else {
         let (tag, intensity, reason) = heuristic_qualia_tag(trimmed);
         return (tag, intensity, reason, true);

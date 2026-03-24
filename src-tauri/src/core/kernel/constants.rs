@@ -43,6 +43,7 @@ pub const AUTO_SURFACE_SLA_SECS: i64 = 10;
 pub const AUTO_SURFACE_MAX_AGE_SECS: i64 = 30;
 pub const PENDING_PROMPT_ATTEMPT_LIMIT: i64 = 3;
 pub const PENDING_PROMPT_EXPIRES_SECS: i64 = 3600;
+pub const PENDING_PROMPT_RECENCY_SECS_DEFAULT: i64 = 90;
 pub const OPEN_QUESTION_ATTEMPT_LIMIT: i64 = 3;
 pub const OPEN_QUESTION_EXPIRES_SECS: i64 = 3600;
 pub const REDIRECT_FOCUS_PROMOTE_TURNS: i32 = 2;
@@ -94,6 +95,11 @@ pub static USER_ATTRIBUTION_BASE_SET: Lazy<RegexSet> = Lazy::new(|| {
         r"you told",
         r"you asked",
         r"you explained",
+        r"your assessment",
+        r"your view",
+        r"your take",
+        r"you've mentioned",
+        r"you have mentioned",
         r"as you said",
         r"as you mentioned",
         r"as you noted",
@@ -207,6 +213,11 @@ pub static USER_ATTRIBUTION_REWRITE_PATTERNS: Lazy<Vec<(Regex, &'static str)>> =
         (Regex::new("(?i)\\byou wrote\\b").unwrap(), "I inferred"),
         (Regex::new("(?i)\\byou told\\b").unwrap(), "I inferred"),
         (Regex::new("(?i)\\byou asked\\b").unwrap(), "I inferred"),
+        (Regex::new("(?i)\\byou've mentioned\\b").unwrap(), "I inferred"),
+        (Regex::new("(?i)\\byou have mentioned\\b").unwrap(), "I inferred"),
+        (Regex::new("(?i)\\byour assessment\\b").unwrap(), "the assessment"),
+        (Regex::new("(?i)\\byour view\\b").unwrap(), "the view"),
+        (Regex::new("(?i)\\byour take\\b").unwrap(), "the take"),
         (Regex::new("(?i)\\bas you said\\b").unwrap(), "Based on your last message, I inferred"),
         (Regex::new("(?i)\\bas you mentioned\\b").unwrap(), "Based on your last message, I inferred"),
         (Regex::new("(?i)\\bas you noted\\b").unwrap(), "Based on your last message, I inferred"),

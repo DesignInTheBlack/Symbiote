@@ -77,6 +77,71 @@ fn workspace_before_after_for_payload(
     (before_val, after_val)
 }
 
+struct EvidenceAttachOutcome {
+    payload: Value,
+    has_evidence: bool,
+}
+
+async fn ensure_candidate_evidence(
+    kernel: &Kernel,
+    candidate: &Candidate,
+    conversation_id: &str,
+    run_id: Option<&str>,
+    trace_id: Option<&str>,
+    cached_recent_user_evidence: &mut Option<Vec<i64>>,
+    allow_fallback: bool,
+    category: &str,
+) -> EvidenceAttachOutcome {
+    let mut payload = candidate.payload.clone();
+    let evidence_class = candidate_evidence_class(candidate);
+    let evidence_event_ids = extract_id_list(&payload, "evidence_event_ids");
+    let belief_ids = extract_id_list(&payload, "belief_ids");
+    let mut has_evidence = !evidence_event_ids.is_empty()
+        || !belief_ids.is_empty()
+        || matches!(evidence_class, Some("internal"));
+    if !has_evidence && allow_fallback && !matches!(evidence_class, Some("internal")) {
+        if cached_recent_user_evidence.is_none() {
+            *cached_recent_user_evidence = Some(
+                kernel
+                    .db
+                    .get_recent_user_evidence_ids(conversation_id, 2)
+                    .await,
+            );
+        }
+        if let Some(ids) = cached_recent_user_evidence.as_ref() {
+            if !ids.is_empty() {
+                set_id_list(&mut payload, "evidence_event_ids", ids);
+                has_evidence = true;
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert(
+                        "evidence_provenance".to_string(),
+                        Value::String("recent_user_evidence".to_string()),
+                    );
+                }
+                let _ = system_log::log_event(
+                    &kernel.db.pool,
+                    Some(&kernel.app_handle),
+                    "info",
+                    "memory",
+                    run_id,
+                    trace_id,
+                    json!({
+                        "event": "candidate_evidence_attached",
+                        "candidate_id": candidate.id,
+                        "candidate_kind": format!("{:?}", candidate.kind),
+                        "category": category,
+                        "reason": "recent_user_evidence",
+                        "evidence_event_ids": ids,
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    EvidenceAttachOutcome { payload, has_evidence }
+}
+
 impl Kernel {
     pub(crate) async fn commit_cycle(
         &self,
@@ -130,8 +195,6 @@ impl Kernel {
         let workspace_snapshot = WorkspaceSnapshot::from_state(state);
 
         for candidate in &decision.accepted {
-            let has_evidence = candidate_has_evidence(&candidate.payload)
-                || matches!(candidate_evidence_class(candidate), Some("internal"));
             if is_meta_cog_candidate(candidate) && !matches!(candidate.kind, CandidateKind::NoOp) {
                 let anchor = state
                     .workspace_current_focus
@@ -281,7 +344,18 @@ impl Kernel {
                     }
                 }
                 CandidateKind::UpdateInnerSummary => {
-                    if !has_evidence {
+                    let evidence = ensure_candidate_evidence(
+                        self,
+                        candidate,
+                        conversation_id,
+                        run_id,
+                        trace_id,
+                        &mut cached_recent_user_evidence,
+                        true,
+                        "inner_summary",
+                    )
+                    .await;
+                    if !evidence.has_evidence {
                         let _ = system_log::log_event(
                             &self.db.pool,
                             Some(&self.app_handle),
@@ -295,18 +369,30 @@ impl Kernel {
                                 "category": "inner_summary",
                                 "candidate_id": candidate.id,
                                 "candidate_kind": format!("{:?}", candidate.kind),
+                                "candidate_source": candidate.source,
                                 "evidence_class": candidate_evidence_class(candidate),
                             }),
                         )
                         .await;
                         continue;
                     }
-                    if let Some(summary_json) = candidate.payload.get("summary_json").and_then(|v| v.as_str()) {
+                    if let Some(summary_json) = evidence.payload.get("summary_json").and_then(|v| v.as_str()) {
                         inner_summary_json = Some(summary_json.to_string());
                     }
                 }
                 CandidateKind::WriteEpisodic => {
-                    if !has_evidence {
+                    let evidence = ensure_candidate_evidence(
+                        self,
+                        candidate,
+                        conversation_id,
+                        run_id,
+                        trace_id,
+                        &mut cached_recent_user_evidence,
+                        true,
+                        "episodic",
+                    )
+                    .await;
+                    if !evidence.has_evidence {
                         let _ = system_log::log_event(
                             &self.db.pool,
                             Some(&self.app_handle),
@@ -320,14 +406,15 @@ impl Kernel {
                                 "category": "episodic",
                                 "candidate_id": candidate.id,
                                 "candidate_kind": format!("{:?}", candidate.kind),
+                                "candidate_source": candidate.source,
                                 "evidence_class": candidate_evidence_class(candidate),
                             }),
                         )
                         .await;
                         continue;
                     }
-                    if let Some(event_type) = candidate.payload.get("event_type").and_then(|v| v.as_str()) {
-                        let payload = candidate.payload.get("payload").cloned().unwrap_or_else(|| json!({}));
+                    if let Some(event_type) = evidence.payload.get("event_type").and_then(|v| v.as_str()) {
+                        let payload = evidence.payload.get("payload").cloned().unwrap_or_else(|| json!({}));
                         let source_type = candidate
                             .payload
                             .get("source_type")
@@ -348,7 +435,18 @@ impl Kernel {
                     }
                 }
                 CandidateKind::PromoteSemantic => {
-                    if !has_evidence {
+                    let evidence = ensure_candidate_evidence(
+                        self,
+                        candidate,
+                        conversation_id,
+                        run_id,
+                        trace_id,
+                        &mut cached_recent_user_evidence,
+                        false,
+                        "semantic_core",
+                    )
+                    .await;
+                    if !evidence.has_evidence {
                         let _ = system_log::log_event(
                             &self.db.pool,
                             Some(&self.app_handle),
@@ -362,13 +460,14 @@ impl Kernel {
                                 "category": "semantic_core",
                                 "candidate_id": candidate.id,
                                 "candidate_kind": format!("{:?}", candidate.kind),
+                                "candidate_source": candidate.source,
                                 "evidence_class": candidate_evidence_class(candidate),
                             }),
                         )
                         .await;
                         continue;
                     }
-                    if let Some(summary) = candidate.payload.get("summary").and_then(|v| v.as_str()) {
+                    if let Some(summary) = evidence.payload.get("summary").and_then(|v| v.as_str()) {
                         let (cleaned, removed) = strip_internal_diagnostics_lines(summary);
                         if removed > 0 {
                             let _ = system_log::log_event(
@@ -390,8 +489,8 @@ impl Kernel {
                             semantic_promotions.push(cleaned.to_string());
                             if is_monologue_source(&candidate.source) {
                                 let evidence_event_ids =
-                                    extract_id_list(&candidate.payload, "evidence_event_ids");
-                                let belief_ids = extract_id_list(&candidate.payload, "belief_ids");
+                                    extract_id_list(&evidence.payload, "evidence_event_ids");
+                                let belief_ids = extract_id_list(&evidence.payload, "belief_ids");
                                 let after = Some(json!({ "semantic": cleaned }));
                                 let _ = system_log::log_monologue_state_update(
                                     &self.db.pool,
@@ -526,41 +625,18 @@ impl Kernel {
                 }
                 CandidateKind::UpdateWorkspace => {
                     let mut workspace_candidate = candidate.clone();
-                    let mut workspace_has_evidence = candidate_has_evidence(&workspace_candidate.payload)
-                        || matches!(candidate_evidence_class(&workspace_candidate), Some("internal"));
-                    if !workspace_has_evidence
-                        && !matches!(candidate_evidence_class(&workspace_candidate), Some("internal"))
-                    {
-                        if cached_recent_user_evidence.is_none() {
-                            cached_recent_user_evidence = Some(
-                                self.db
-                                    .get_recent_user_evidence_ids(conversation_id, 2)
-                                    .await,
-                            );
-                        }
-                        if let Some(ids) = cached_recent_user_evidence.as_ref() {
-                            if !ids.is_empty() {
-                                set_id_list(&mut workspace_candidate.payload, "evidence_event_ids", ids);
-                                workspace_has_evidence = true;
-                                let _ = system_log::log_event(
-                                    &self.db.pool,
-                                    Some(&self.app_handle),
-                                    "info",
-                                    "memory",
-                                    run_id,
-                                    trace_id,
-                                    json!({
-                                        "event": "workspace_evidence_attached",
-                                        "candidate_id": workspace_candidate.id,
-                                        "evidence_event_ids": ids,
-                                        "reason": "recent_user_evidence",
-                                    }),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    if !workspace_has_evidence {
+                    let evidence = ensure_candidate_evidence(
+                        self,
+                        candidate,
+                        conversation_id,
+                        run_id,
+                        trace_id,
+                        &mut cached_recent_user_evidence,
+                        true,
+                        "workspace",
+                    )
+                    .await;
+                    if !evidence.has_evidence {
                         let _ = system_log::log_event(
                             &self.db.pool,
                             Some(&self.app_handle),
@@ -574,12 +650,14 @@ impl Kernel {
                                 "category": "workspace",
                                 "candidate_id": workspace_candidate.id,
                                 "candidate_kind": format!("{:?}", workspace_candidate.kind),
+                                "candidate_source": workspace_candidate.source,
                                 "evidence_class": candidate_evidence_class(&workspace_candidate),
                             }),
                         )
                         .await;
                         continue;
                     }
+                    workspace_candidate.payload = evidence.payload;
                     let disable_working_hypothesis =
                         settings.stability_disable_working_hypothesis.unwrap_or(true);
                     let workspace_before = WorkspaceSnapshot::from_state(state);
@@ -885,6 +963,7 @@ impl Kernel {
                                     "category": "self_claim",
                                     "candidate_id": candidate.id,
                                     "candidate_kind": format!("{:?}", candidate.kind),
+                                    "candidate_source": candidate.source,
                                     "evidence_class": candidate_evidence_class(candidate),
                                 }),
                             )
@@ -1009,7 +1088,16 @@ impl Kernel {
                     workspace_updated = true;
                 }
             } else {
-                emit_content = Some(question.clone());
+                if let Some(content) = emit_content.as_mut() {
+                    if content.trim().is_empty() {
+                        *content = question.clone();
+                    } else {
+                        content.push_str("\n\n");
+                        content.push_str(&question);
+                    }
+                } else {
+                    emit_content = Some(question.clone());
+                }
                 state.pending_questions = vec![question.clone()];
                 state.uncertainty_count += 1;
                 state.task_phase = TaskPhase::AwaitingUser;

@@ -121,6 +121,22 @@ MEMORY DECISION FLOW (MANDATORY, stop means write no memory)
 4) FACT values are literal text only (never # or $). Use RELATION syntax for links.
 5) If writing memory, output exactly one <memory> block. Modifiers are end-of-statement tokens.
 
+JSON FALLBACK (only if you cannot produce valid <memory> DSL)
+Return ONLY a JSON object. Do NOT include <memory> tags when using JSON.
+Schema:
+{
+  "facts": [
+    {"subject":"$user|#Label|Name","key":"string","value":"string","certainty":0.0-1.0,"time":"YYYY-MM-DD|today|yesterday","scope":"session|global|project:alpha","source":"url-or-id","polarity":"assert|deny"}
+  ],
+  "relations": [
+    {"rel_type":"string","participants":[{"role":"string","ref":"$user|#Label|Name"}, ...],"direction":"directed|bidirectional","certainty":0.0-1.0,"time":"YYYY-MM-DD|today|yesterday","scope":"session|global|project:alpha","source":"url-or-id","polarity":"assert|deny"}
+  ]
+}
+Rules:
+- Omit keys you cannot ground.
+- Use only user-provided facts and tool evidence.
+- Do not include explanatory text or code fences.
+
 ICS v4.1 MEMORY RULES (strict)
 
 <memory> contains one statement per line. Blank lines and lines starting with // are ignored.

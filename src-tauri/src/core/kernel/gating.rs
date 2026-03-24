@@ -337,7 +337,7 @@ impl Kernel {
                 continue;
             }
 
-            let prefixed = working_hypothesis_prefix(&text, false);
+            let prefixed = working_hypothesis_prefix(&text, disable_working_hypothesis);
             let mut payload = candidate.payload.clone();
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("speculative".to_string(), Value::Bool(true));
@@ -625,6 +625,19 @@ pub(crate) fn user_requested_diagnostics(input: &str) -> bool {
         "symbiote system",
     ];
     triggers.iter().any(|phrase| lower.contains(phrase))
+}
+
+pub(crate) fn allow_speculative_markers_for_prompt(input: &str, allow_diagnostics: bool) -> bool {
+    if allow_diagnostics {
+        return true;
+    }
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    user_requested_diagnostics(trimmed)
+        || is_introspection_request(trimmed)
+        || is_monologue_surface_request(trimmed)
 }
 
 pub(crate) fn strip_telemetry_claim_sentences(response: &str, expanded: bool) -> String {
@@ -2093,8 +2106,47 @@ pub(crate) fn working_hypothesis_prefix(text: &str, disabled: bool) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let _ = disabled;
-    trimmed.to_string()
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("working hypothesis") {
+        return trimmed.to_string();
+    }
+    if disabled {
+        return format_speculative_label(trimmed, true);
+    }
+    format!("Working hypothesis: {}", trimmed)
+}
+
+pub(crate) fn strip_working_hypothesis_prefix(text: &str, strip_speculative_marker: bool) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut cleaned = trimmed.to_string();
+    let lower = cleaned.to_lowercase();
+    if lower.starts_with("working hypothesis:") {
+        cleaned = cleaned["working hypothesis:".len()..].trim().to_string();
+    } else if lower.starts_with("working hypothesis") {
+        if let Some(idx) = cleaned.find(':') {
+            cleaned = cleaned[idx + 1..].trim().to_string();
+        } else {
+            cleaned = cleaned
+                .replacen("Working hypothesis", "", 1)
+                .replacen("working hypothesis", "", 1)
+                .trim()
+                .to_string();
+        }
+    }
+    if strip_speculative_marker {
+        let lower = cleaned.to_lowercase();
+        if lower.contains("speculative=true") {
+            cleaned = cleaned
+                .replace("(speculative=true)", "")
+                .replace("speculative=true", "")
+                .trim()
+                .to_string();
+        }
+    }
+    cleaned
 }
 
 pub(crate) fn format_speculative_label(text: &str, disabled: bool) -> String {
@@ -2102,8 +2154,13 @@ pub(crate) fn format_speculative_label(text: &str, disabled: bool) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
+    let lower = trimmed.to_lowercase();
     if disabled {
-        format!("{} (speculative=true)", trimmed)
+        if lower.contains("speculative=true") {
+            trimmed.to_string()
+        } else {
+            format!("{} (speculative=true)", trimmed)
+        }
     } else {
         trimmed.to_string()
     }

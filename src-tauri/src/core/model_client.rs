@@ -883,7 +883,16 @@ impl ModelClient {
         let allow_side_effects = request.skip_memory != Some(true);
         let mut should_reinforce_on_use = false;
         if request.skip_injection != Some(true) {
-             if let Some(query) = self.extract_user_query(&final_request.messages) {
+            let mut query = self.extract_user_query(&final_request.messages);
+            if query.as_deref().map(|q| q.trim().is_empty()).unwrap_or(true) {
+                let fallback = self
+                    .resolve_user_message_for_memory(request.run_id.as_deref(), &final_request.messages)
+                    .await;
+                if !fallback.trim().is_empty() {
+                    query = Some(fallback);
+                }
+            }
+            if let Some(query) = query {
                 if allow_side_effects && is_confirmation_request(&query) {
                     let client = self.clone();
                     let run_id = final_request.run_id.clone();
@@ -917,7 +926,7 @@ impl ModelClient {
                 );
 
                 let _ = self.append_pending_clarify(&mut final_request.messages).await;
-             }
+            }
         }
 
         self.log_prompt_messages(&final_request, "chat");
@@ -1461,7 +1470,16 @@ impl ModelClient {
         let allow_side_effects = request.skip_memory != Some(true);
         let mut should_reinforce_on_use = false;
         if request.skip_injection != Some(true) {
-            if let Some(query) = self.extract_user_query(&final_request.messages) {
+            let mut query = self.extract_user_query(&final_request.messages);
+            if query.as_deref().map(|q| q.trim().is_empty()).unwrap_or(true) {
+                let fallback = self
+                    .resolve_user_message_for_memory(request.run_id.as_deref(), &final_request.messages)
+                    .await;
+                if !fallback.trim().is_empty() {
+                    query = Some(fallback);
+                }
+            }
+            if let Some(query) = query {
                 if allow_side_effects && is_confirmation_request(&query) {
                     let client = self.clone();
                     let run_id = final_request.run_id.clone();
@@ -1548,7 +1566,16 @@ impl ModelClient {
         let allow_side_effects = request.skip_memory != Some(true);
         let mut should_reinforce_on_use = false;
         if request.skip_injection != Some(true) {
-            if let Some(query) = self.extract_user_query(&final_request.messages) {
+            let mut query = self.extract_user_query(&final_request.messages);
+            if query.as_deref().map(|q| q.trim().is_empty()).unwrap_or(true) {
+                let fallback = self
+                    .resolve_user_message_for_memory(request.run_id.as_deref(), &final_request.messages)
+                    .await;
+                if !fallback.trim().is_empty() {
+                    query = Some(fallback);
+                }
+            }
+            if let Some(query) = query {
                 if allow_side_effects && is_confirmation_request(&query) {
                     let client = self.clone();
                     let run_id = final_request.run_id.clone();
@@ -2008,8 +2035,10 @@ impl ModelClient {
         let base_prompt = prompt_set.memory_control_prompt;
         let strict_prompt = strict_memory_prompt(&base_prompt);
         let mut attempt = "base";
+        let mut memory_raw_for_attempt: Option<String> = None;
 
         let res = loop {
+            let _ = memory_raw_for_attempt.take();
             let candidate_block = loop {
                 let system_prompt = if attempt == "strict" || attempt == "minimal" {
                     strict_prompt.clone()
@@ -2080,6 +2109,7 @@ impl ModelClient {
                     }
                 };
 
+                memory_raw_for_attempt = Some(memory_raw.clone());
                 self
                     .maybe_capture_memory_raw(run_id, &memory_pass_id, &memory_raw)
                     .await;
@@ -2138,6 +2168,28 @@ impl ModelClient {
                             "memory_pass_id": memory_pass_id.clone(),
                             "attempt": attempt,
                             "reason": "lenient_extract",
+                            "request_label": format!("memory_pass_{}", attempt),
+                        }),
+                    )
+                    .await;
+                    break block;
+                }
+                if let Some(block) = crate::core::memory::dsl::memory_json_to_dsl(&memory_raw) {
+                    let _ = system_log::log_event(
+                        &self.db_pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "memory",
+                        Some(run_id),
+                        Some(&memory_pass_id),
+                        serde_json::json!({
+                            "event": "memory_pass_json_fallback",
+                            "memory_pass_id": memory_pass_id.clone(),
+                            "attempt": attempt,
+                            "reason": "missing_memory_block",
+                            "raw_len": memory_raw.len(),
+                            "raw_hash": hash_payload(&memory_raw),
+                            "schema": "memory_json_fallback_v1",
                             "request_label": format!("memory_pass_{}", attempt),
                         }),
                     )
@@ -2246,6 +2298,33 @@ impl ModelClient {
                 }
                 validation = crate::core::memory::dsl::validate_memory_block(&block);
                 if !validation.valid {
+                    if let Some(raw) = memory_raw_for_attempt.as_deref() {
+                        if let Some(json_block) = crate::core::memory::dsl::memory_json_to_dsl(raw) {
+                            let _ = system_log::log_event(
+                                &self.db_pool,
+                                Some(&self.app_handle),
+                                "info",
+                                "memory",
+                                Some(run_id),
+                                Some(&memory_pass_id),
+                                serde_json::json!({
+                                    "event": "memory_pass_json_fallback",
+                                    "memory_pass_id": memory_pass_id.clone(),
+                                    "attempt": attempt,
+                                    "reason": "dsl_validation",
+                                    "raw_len": raw.len(),
+                                    "raw_hash": hash_payload(raw),
+                                    "schema": "memory_json_fallback_v1",
+                                    "request_label": format!("memory_pass_{}", attempt),
+                                }),
+                            )
+                            .await;
+                            block = json_block;
+                            validation = crate::core::memory::dsl::validate_memory_block(&block);
+                        }
+                    }
+                }
+                if !validation.valid {
                     let _ = system_log::log_event(
                         &self.db_pool,
                         Some(&self.app_handle),
@@ -2307,6 +2386,48 @@ impl ModelClient {
                     return result;
                 }
             }
+
+            let (filtered_block, filter_stats) = filter_interrogative_memory_block(&block, user_message);
+            if filter_stats.dropped_total() > 0 {
+                let _ = system_log::log_event(
+                    &self.db_pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "memory",
+                    Some(run_id),
+                    Some(&memory_pass_id),
+                    serde_json::json!({
+                        "event": "memory_pass_interrogative_filter",
+                        "memory_pass_id": memory_pass_id.clone(),
+                        "attempt": attempt,
+                        "user_interrogative": filter_stats.user_interrogative,
+                        "total": filter_stats.total,
+                        "kept": filter_stats.kept,
+                        "dropped_relations": filter_stats.dropped_relations,
+                        "dropped_interrogatives": filter_stats.dropped_interrogatives,
+                    }),
+                )
+                .await;
+            }
+            if filtered_block.trim().is_empty() {
+                let _ = system_log::log_event(
+                    &self.db_pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "memory",
+                    Some(run_id),
+                    Some(&memory_pass_id),
+                    serde_json::json!({
+                        "event": "memory_pass_interrogative_filtered_empty",
+                        "memory_pass_id": memory_pass_id.clone(),
+                        "attempt": attempt,
+                    }),
+                )
+                .await;
+                result.error = Some("interrogative_filtered".to_string());
+                return result;
+            }
+            block = filtered_block;
 
         let payload_hash = hash_text(&block);
         let _ = db
@@ -3606,9 +3727,44 @@ impl ModelClient {
             return Some(msg.content.clone());
         }
         if let Some(sys) = messages.iter().find(|m| m.role == "system") {
+            if let Some(user_input) = extract_section(sys.content.as_str(), "User Input") {
+                return Some(user_input);
+            }
             return extract_section(sys.content.as_str(), "The User Replied");
         }
         None
+    }
+
+    fn normalize_interrogative_token(raw: &str) -> Option<String> {
+        let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim_matches('#').trim_matches('$');
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.to_lowercase())
+    }
+
+    fn ref_is_interrogative(reference: &crate::core::memory::dsl::Ref) -> bool {
+        match reference {
+            crate::core::memory::dsl::Ref::Handle(_) => false,
+            crate::core::memory::dsl::Ref::Label(label) => {
+                Self::normalize_interrogative_token(label)
+                    .map(|v| is_interrogative_token(&v))
+                    .unwrap_or(false)
+            }
+            crate::core::memory::dsl::Ref::Filter(label, filter) => {
+                Self::normalize_interrogative_token(label)
+                    .map(|v| is_interrogative_token(&v))
+                    .unwrap_or(false)
+                    || Self::normalize_interrogative_token(filter)
+                        .map(|v| is_interrogative_token(&v))
+                        .unwrap_or(false)
+            }
+            crate::core::memory::dsl::Ref::Name(name) => {
+                Self::normalize_interrogative_token(name)
+                    .map(|v| is_interrogative_token(&v))
+                    .unwrap_or(false)
+            }
+        }
     }
 
     async fn resolve_user_message_for_memory(
@@ -5295,6 +5451,79 @@ fn empty_response_retry_config_from_settings(
         .unwrap_or(2000)
         .max(0) as u64;
     (max, timeout_ms)
+}
+
+#[derive(Default, Debug)]
+struct InterrogativeFilterStats {
+    total: usize,
+    kept: usize,
+    dropped_relations: usize,
+    dropped_interrogatives: usize,
+    user_interrogative: bool,
+}
+
+impl InterrogativeFilterStats {
+    fn dropped_total(&self) -> usize {
+        self.dropped_relations + self.dropped_interrogatives
+    }
+}
+
+fn is_interrogative_token(raw: &str) -> bool {
+    matches!(
+        raw,
+        "what" | "who" | "where" | "when" | "why" | "how" | "which"
+    )
+}
+
+fn filter_interrogative_memory_block(block: &str, user_message: &str) -> (String, InterrogativeFilterStats) {
+    let mut stats = InterrogativeFilterStats::default();
+    stats.user_interrogative = crate::core::kernel::is_interrogative_message(user_message);
+    let mut lines_out = Vec::new();
+    for raw_line in block.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        stats.total += 1;
+        let parsed = crate::core::memory::dsl::parse_line(trimmed);
+        if let Ok(statement) = parsed {
+            if stats.user_interrogative {
+                if matches!(statement, crate::core::memory::dsl::DslStatement::Rel(_)) {
+                    stats.dropped_relations += 1;
+                    continue;
+                }
+            }
+            let mut has_interrogative = false;
+            match statement {
+                crate::core::memory::dsl::DslStatement::Rel(rel) => {
+                    for (_, reference) in rel.participants {
+                        if ModelClient::ref_is_interrogative(&reference) {
+                            has_interrogative = true;
+                            break;
+                        }
+                    }
+                }
+                crate::core::memory::dsl::DslStatement::Fact(fact) => {
+                    if ModelClient::ref_is_interrogative(&fact.subject) {
+                        has_interrogative = true;
+                    } else if stats.user_interrogative {
+                        if let Some(value_norm) = ModelClient::normalize_interrogative_token(&fact.value) {
+                            if is_interrogative_token(&value_norm) {
+                                has_interrogative = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if has_interrogative {
+                stats.dropped_interrogatives += 1;
+                continue;
+            }
+        }
+        lines_out.push(trimmed.to_string());
+        stats.kept += 1;
+    }
+    (lines_out.join("\n"), stats)
 }
 
 #[cfg(test)]

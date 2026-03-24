@@ -112,20 +112,83 @@ fn is_jsonish_text(raw: &str) -> bool {
     if trimmed.len() < 2 {
         return false;
     }
+    let lower = trimmed.to_lowercase();
+    let starts_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    let has_marker = lower.contains("\"stance\"")
+        || lower.contains("\"candidates\"")
+        || lower.contains("\"decision_packet\"")
+        || lower.contains("\"required_slots\"")
+        || lower.contains("\"done\"")
+        || lower.contains("\"message\"");
+    if starts_json && has_marker {
+        return true;
+    }
     let wrapped = (trimmed.starts_with('{') && trimmed.ends_with('}'))
         || (trimmed.starts_with('[') && trimmed.ends_with(']'));
     if !wrapped {
         return false;
     }
-    let lower = trimmed.to_lowercase();
-    if lower.contains("\"stance\"")
-        || lower.contains("\"candidates\"")
-        || lower.contains("\"done\"")
-        || lower.contains("\"message\"")
-    {
+    if has_marker {
         return true;
     }
     serde_json::from_str::<Value>(trimmed).is_ok()
+}
+
+#[derive(Default)]
+struct PrimaryResponsePacket {
+    message: Option<String>,
+    candidates: Vec<Value>,
+    decision_packet: Option<Value>,
+}
+
+fn extract_primary_json_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = value.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_primary_response_packet(raw: &str) -> Option<PrimaryResponsePacket> {
+    let trimmed = raw.trim();
+    if trimmed.len() < 2 {
+        return None;
+    }
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(trimmed).ok()?;
+    let mut packet = PrimaryResponsePacket::default();
+    match parsed {
+        Value::Object(obj) => {
+            let obj_val = Value::Object(obj.clone());
+            packet.message = extract_primary_json_string(&obj_val, &["message", "text", "content"]);
+            if let Some(items) = obj_val.get("candidates").and_then(|v| v.as_array()) {
+                packet.candidates = items.iter().cloned().collect();
+            }
+            if let Some(packet_val) = obj_val.get("decision_packet") {
+                packet.decision_packet = Some(packet_val.clone());
+            }
+        }
+        Value::Array(items) => {
+            packet.candidates = items;
+        }
+        _ => return None,
+    }
+    if packet.message.is_none() && packet.candidates.is_empty() && packet.decision_packet.is_none() {
+        None
+    } else {
+        Some(packet)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn unwrap_primary_response_message(raw: &str) -> Option<String> {
+    parse_primary_response_packet(raw).and_then(|packet| packet.message)
 }
 
 fn looks_like_question(prompt: &str) -> bool {
@@ -403,8 +466,9 @@ fn format_monologue_surface_content(raw: &str) -> String {
     if trimmed.is_empty() {
         return raw.to_string();
     }
+    let jsonish = is_jsonish_text(trimmed);
     let Some(value) = extract_monologue_surface_json(trimmed) else {
-        return raw.to_string();
+        return if jsonish { String::new() } else { raw.to_string() };
     };
     let message = value
         .get("message")
@@ -1151,6 +1215,30 @@ impl Kernel {
         Ok(())
     }
 
+    async fn attach_contract_violation_metrics(
+        &self,
+        decision: &mut KernelDecision,
+        run_id: Option<&str>,
+    ) {
+        let Some(run_id) = run_id else {
+            return;
+        };
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM system_logs
+             WHERE run_id = ?
+               AND json_extract(payload, '$.event') = 'contract_violation'",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.db.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        let denom = decision.accepted.len().max(1) as f64;
+        decision.report.contract_violation_count = Some(count.max(0) as usize);
+        decision.report.contract_violation_rate = Some(count as f64 / denom);
+    }
+
 
     pub(super) async fn log_decision_report(
         &self,
@@ -1230,6 +1318,8 @@ impl Kernel {
                 "normalized_stop_reasons": report.normalized_stop_reasons,
                 "blocked_candidates_count": report.blocked_candidates_count,
                 "top_3_block_reasons": report.top_3_block_reasons,
+                "contract_violation_count": report.contract_violation_count,
+                "contract_violation_rate": report.contract_violation_rate,
                 "anchor_hits": report.anchor_hits,
                 "prompt_tokens_used": report.prompt_tokens_used,
                 "tier_trim_summary": report.tier_trim_summary,
@@ -2089,7 +2179,7 @@ impl Kernel {
             .await
             .map_err(|e| e.to_string())?;
         let mut removed = 0usize;
-        for (id, prompt, _source, _created_at, _skip, _auto, _intent_kind, _bridge_id, _attempt_count, _last_asked_at, _expires_at) in prompts {
+        for (id, prompt, _source, _created_at, _skip, _auto, _intent_kind, _bridge_id, _attempt_count, _last_asked_at, _expires_at, _anchor_message_id, _anchor_hash, _anchor_created_at, _anchor_role) in prompts {
             let overlap_old = if old_anchor.trim().is_empty() {
                 0.0
             } else {
@@ -2851,6 +2941,11 @@ impl Kernel {
         let self_audit_mode = matches!(input_kind, CoreInputKind::User) && is_self_audit_request(&input);
         let diagnostics_breaker_active = state.diagnostics_disabled_turns_remaining > 0;
         let allow_diagnostics = self_audit_mode && !diagnostics_breaker_active;
+        let allow_speculative_markers = if matches!(input_kind, CoreInputKind::User) {
+            allow_speculative_markers_for_prompt(&input, allow_diagnostics)
+        } else {
+            allow_diagnostics
+        };
         let self_awareness_mode = settings
             .self_awareness_expression_mode
             .as_deref()
@@ -2959,12 +3054,18 @@ impl Kernel {
                     let mut already_pending = false;
                     if should_clarify && state.last_redirect_clarifier_epoch != state.anchor_epoch {
                         if let Ok(existing) = self.db.list_pending_prompts(&conversation_id, 12).await {
-                            already_pending = existing.iter().any(|(_, prompt, source, _, _, _, _, _, _, _, _)| {
+                            already_pending = existing.iter().any(|(_, prompt, source, _, _, _, _, _, _, _, _, _, _, _, _)| {
                                 source == "kernel_redirect" && prompt.trim().eq_ignore_ascii_case(clarifier)
                             });
                         }
                         if !already_pending {
                             let expires_at = compute_expires_at(Utc::now(), PENDING_PROMPT_EXPIRES_SECS);
+                            let anchor_message_id = state.last_user_message_id.as_deref();
+                            let anchor_created_at = state.last_user_input_at.as_deref();
+                            let anchor_hash = state
+                                .last_user_input
+                                .as_deref()
+                                .map(|input| crate::core::kernel::utils::text::hash_payload(&summarize_snippet(input, 160)));
                             if let Ok(prompt_id) = self
                                 .db
                                 .enqueue_pending_prompt(
@@ -2975,6 +3076,10 @@ impl Kernel {
                                     Some("AskUserQuestion"),
                                     None,
                                     Some(&expires_at),
+                                    anchor_message_id,
+                                    anchor_hash.as_deref(),
+                                    anchor_created_at,
+                                    Some("user"),
                                 )
                                 .await
                             {
@@ -3746,12 +3851,14 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         let mut validator_fallback_reason: Option<&'static str> = None;
         let mut validator_regen_attempted = false;
         let mut prompt_build_snapshot: Option<CorePromptBuild> = None;
+        let mut primary_json_packet: Option<PrimaryResponsePacket> = None;
 
         loop {
             let _ = extra_notice.take();
             let _ = ask_override.take();
             let _ = registry_meta.take();
             let _ = prompt_build_snapshot.take();
+            let _ = primary_json_packet.take();
             let _ = std::mem::replace(&mut workspace_required_flag, false);
             let _ = std::mem::replace(&mut workspace_compliant, true);
             let _ = std::mem::replace(&mut workspace_exception, false);
@@ -3837,6 +3944,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                         false,
                     );
                     self
+                        .attach_contract_violation_metrics(&mut decision, Some(&run_id))
+                        .await;
+                    self
                         .log_decision_report(&decision, Some(&run_id), Some(&trace_id))
                         .await;
                     let commit_ms = commit_started.elapsed().as_millis() as i64;
@@ -3880,6 +3990,45 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             response_content.push_str(&response_meta.content);
             response_content_no_tags.clear();
             response_content_no_tags.push_str(&response_meta.content_no_tags);
+
+            if !calculator_mode {
+                primary_json_packet = parse_primary_response_packet(&response_content_no_tags);
+                if let Some(packet) = primary_json_packet.as_ref() {
+                    let mut unwrapped = false;
+                    if let Some(message) = packet.message.as_ref() {
+                        response_content = message.clone();
+                        response_content_no_tags = response_content.clone();
+                        response_meta.content = response_content.clone();
+                        response_meta.content_no_tags = response_content_no_tags.clone();
+                        response_meta.raw_content = response_content.clone();
+                        unwrapped = true;
+                    } else if !packet.candidates.is_empty() || packet.decision_packet.is_some() {
+                        response_content.clear();
+                        response_content_no_tags.clear();
+                        response_meta.content = response_content.clone();
+                        response_meta.content_no_tags = response_content_no_tags.clone();
+                        response_meta.raw_content = response_content.clone();
+                        unwrapped = true;
+                    }
+                    if unwrapped {
+                        let _ = system_log::log_event(
+                            &self.db.pool,
+                            Some(&self.app_handle),
+                            "info",
+                            "kernel",
+                            Some(&run_id),
+                            Some(&trace_id),
+                            json!({
+                                "event": "primary_response_json_unwrapped",
+                                "has_message": packet.message.is_some(),
+                                "candidate_count": packet.candidates.len(),
+                                "has_decision_packet": packet.decision_packet.is_some(),
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
 
             if self_audit_ambiguous && ask_override.is_none() {
                 let suggestion =
@@ -5247,6 +5396,21 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             break;
         }
 
+        if let Some(packet) = primary_json_packet.take() {
+            if let Some(decision_packet) = packet.decision_packet.as_ref() {
+                self.apply_decision_packet(&mut state, decision_packet);
+            }
+            if !packet.candidates.is_empty() {
+                for item in packet.candidates {
+                    if let Some(candidate) =
+                        self.candidate_from_value(&item, "primary_response_json", &mut created_at)
+                    {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+
         if self_audit_mode {
             response_content = self.build_self_audit_response(&state, &settings);
             response_content_no_tags = response_content.clone();
@@ -5862,6 +6026,82 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             }
         };
         let mut decision = arbitration.decision;
+        let mut inline_pending: Option<PendingPromptSelection> = None;
+        if matches!(input_kind, CoreInputKind::User) {
+            let has_emit = decision
+                .accepted
+                .iter()
+                .any(|candidate| matches!(candidate.kind, CandidateKind::EmitMessage));
+            let has_ask = decision
+                .accepted
+                .iter()
+                .any(|candidate| matches!(candidate.kind, CandidateKind::AskUserQuestion));
+            if has_emit && !has_ask {
+                if let Some(selection) = self
+                    .select_pending_prompt_for_proactive(&conversation_id, &state, &settings, true, Some("monologue"))
+                    .await
+                {
+                    let mut question =
+                        strip_working_hypothesis_prefix(&selection.prompt, !allow_speculative_markers);
+                    if question.trim().is_empty() {
+                        question = selection.prompt.clone();
+                    }
+                    if is_jsonish_text(&question) || !looks_like_question(&question) {
+                        let _ = self.db.delete_pending_prompt(&selection.prompt_id).await;
+                        let _ = system_log::log_event(
+                            &self.db.pool,
+                            Some(&self.app_handle),
+                            "warn",
+                            "kernel",
+                            Some(&run_id),
+                            Some(&trace_id),
+                            json!( {
+                                "event": "pending_prompt_sanitized",
+                                "reason": if is_jsonish_text(&question) { "json_like" } else { "non_question" },
+                                "candidate_id": selection.prompt_id,
+                                "source": selection.source,
+                            }),
+                        )
+                        .await;
+                    } else {
+                        let user_name = settings.user_display_name.as_deref().unwrap_or("User");
+                        let last_user_input = state.last_user_input.as_deref().unwrap_or("");
+                        if response_has_user_attribution(&question, user_name)
+                            && !user_attribution_grounded_in_last_input(&question, last_user_input)
+                        {
+                            question = rewrite_user_attribution_text(&question, user_name);
+                        }
+                        let payload = json!({
+                            "question": question,
+                            "content": question,
+                            "pending_prompt_id": selection.prompt_id,
+                            "speculative": !selection.exact_open_question,
+                            "bridge_id": selection.bridge_id,
+                            "intent_kind": selection.intent_kind,
+                        });
+                        let mut candidate = Candidate {
+                            id: selection.prompt_id.clone(),
+                            kind: CandidateKind::AskUserQuestion,
+                            payload,
+                            evidence_event_ids: Vec::new(),
+                            belief_ids: Vec::new(),
+                            target_scope: None,
+                            rationale: None,
+                            expected_outcome: None,
+                            cost: Some(0),
+                            urgency: Some(0),
+                            source: "pending_prompt".to_string(),
+                            priority_class: priority_class_for(&CandidateKind::AskUserQuestion),
+                            priority_rank: 0,
+                            created_at: state.monologue_count,
+                        };
+                        candidate.refresh_meta();
+                        decision.accepted.push(candidate);
+                        inline_pending = Some(selection);
+                    }
+                }
+            }
+        }
         let anchor_hits = arbitration.anchor_hits;
         let gates_ms = arbitration.gates_ms;
         let monologue_state_update_required = decision
@@ -5927,6 +6167,33 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 },
             }
         };
+        if let Some(selection) = inline_pending.take() {
+            let attempt_at = Utc::now().to_rfc3339();
+            let _ = self
+                .db
+                .mark_pending_prompt_attempt(&selection.prompt_id, &attempt_at)
+                .await;
+            let _ = self.db.delete_pending_prompt(&selection.prompt_id).await;
+            if let Ok(count) = self.db.count_pending_prompts(&conversation_id).await {
+                let _ = self.app_handle.emit("pending_prompt_count", count as usize);
+            }
+            let _ = system_log::log_event(
+                &self.db.pool,
+                Some(&self.app_handle),
+                "info",
+                "chat",
+                Some(&run_id),
+                Some(&trace_id),
+                json!( {
+                    "event": "pending_prompt_inline_surface",
+                    "prompt_id": selection.prompt_id,
+                    "source": selection.source,
+                    "anchor_message_id": selection.anchor_message_id,
+                    "pending_prompt_anchor_age_seconds": selection.anchor_age_seconds,
+                }),
+            )
+            .await;
+        }
         let commit_ms = commit_started.elapsed().as_millis() as i64;
         self.mark_candidate_outcomes(&decision, "accepted", "rejected")
             .await;
@@ -7495,6 +7762,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             }
             decision.report.background_jobs_dropped = Some(best_effort_dropped);
         }
+        self
+            .attach_contract_violation_metrics(&mut decision, Some(&run_id))
+            .await;
         self
             .log_decision_report(&decision, Some(&run_id), Some(&trace_id))
             .await;
@@ -9509,6 +9779,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         overlap_user: usize,
         age_seconds: Option<i64>,
         skip_count: i64,
+        anchor_age_seconds: Option<i64>,
     ) {
         if !auto_surface {
             return;
@@ -9531,6 +9802,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 "overlap_user": overlap_user,
                 "prompt_age_seconds": age_seconds,
                 "pending_prompt_starvation_count": skip_count,
+                "pending_prompt_anchor_age_seconds": anchor_age_seconds,
             }),
         )
         .await;
@@ -9542,11 +9814,28 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         state: &KernelState,
         settings: &crate::models::Settings,
         auto_surface_only: bool,
+        source_filter: Option<&str>,
     ) -> Option<PendingPromptSelection> {
         let alignment_enabled = settings.pending_prompt_alignment_enabled.unwrap_or(true);
+        let recency_secs = settings
+            .pending_prompt_recency_secs
+            .unwrap_or(PENDING_PROMPT_RECENCY_SECS_DEFAULT);
         let workspace_tokens = workspace_alignment_tokens(state);
         let last_user_input = state.last_user_input.as_deref().unwrap_or("");
+        let last_user_input_at = state.last_user_input_at.as_deref();
+        let last_user_message_id = state.last_user_message_id.as_deref();
         let user_tokens = token_set(last_user_input);
+        let user_hash = if last_user_input.trim().is_empty() {
+            None
+        } else {
+            Some(crate::core::kernel::utils::text::hash_payload(
+                &summarize_snippet(last_user_input, 160),
+            ))
+        };
+        let last_user_age_secs = last_user_input_at.and_then(prompt_age_seconds);
+        let user_recent = last_user_age_secs
+            .map(|age| age >= 0 && age <= recency_secs)
+            .unwrap_or(false);
         let open_questions = workspace_verified_open_questions(state);
         let pending = self
             .db
@@ -9554,13 +9843,145 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             .await
             .unwrap_or_default();
 
-        for (prompt_id, prompt, source, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at) in pending {
+        for (prompt_id, prompt, source, created_at, skip_count, auto_surface, intent_kind, bridge_id, attempt_count, last_asked_at, expires_at, anchor_message_id, anchor_hash, anchor_created_at, anchor_role) in pending {
             if auto_surface_only && !auto_surface {
                 continue;
+            }
+            if let Some(filter) = source_filter {
+                if source != filter {
+                    continue;
+                }
             }
             let trimmed = prompt.trim();
             let age_seconds = prompt_age_seconds(&created_at);
             let force_reason = pending_prompt_force_reason(skip_count, auto_surface, age_seconds);
+            let anchor_age_seconds = anchor_created_at
+                .as_deref()
+                .and_then(prompt_age_seconds);
+            let is_monologue_prompt = source == "monologue";
+            if is_monologue_prompt {
+                let anchor_role_ok = anchor_role
+                    .as_deref()
+                    .map(|role| role.eq_ignore_ascii_case("user"))
+                    .unwrap_or(false);
+                if !anchor_role_ok {
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "warn",
+                        "chat",
+                        None,
+                        None,
+                        json!( {
+                            "event": "pending_prompt_anchor_role_invalid",
+                            "prompt_id": prompt_id,
+                            "source": source,
+                            "anchor_role": anchor_role,
+                            "anchor_message_id": anchor_message_id,
+                            "anchor_age_seconds": anchor_age_seconds,
+                        }),
+                    )
+                    .await;
+                    continue;
+                }
+                let anchor_match = match (anchor_message_id.as_deref(), last_user_message_id) {
+                    (Some(anchor_id), Some(last_id)) => anchor_id == last_id,
+                    _ => false,
+                };
+                if !anchor_match {
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "chat",
+                        None,
+                        None,
+                        json!( {
+                            "event": "pending_prompt_anchor_mismatch",
+                            "prompt_id": prompt_id,
+                            "source": source,
+                            "anchor_message_id": anchor_message_id,
+                            "last_user_message_id": last_user_message_id,
+                            "anchor_age_seconds": anchor_age_seconds,
+                        }),
+                    )
+                    .await;
+                    continue;
+                }
+                if let (Some(expected), Some(actual)) = (user_hash.as_deref(), anchor_hash.as_deref()) {
+                    if expected != actual {
+                        let _ = system_log::log_event(
+                            &self.db.pool,
+                            Some(&self.app_handle),
+                            "info",
+                            "chat",
+                            None,
+                            None,
+                            json!( {
+                                "event": "pending_prompt_anchor_mismatch",
+                                "prompt_id": prompt_id,
+                                "source": source,
+                                "anchor_message_id": anchor_message_id,
+                                "anchor_hash": anchor_hash,
+                                "anchor_age_seconds": anchor_age_seconds,
+                            }),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
+            if auto_surface {
+                if is_monologue_prompt {
+                    let user_after_enqueue = match (
+                        last_user_input_at.and_then(crate::core::kernel::utils::time::timestamp_from_str),
+                        crate::core::kernel::utils::time::timestamp_from_str(&created_at),
+                    ) {
+                        (Some(user_ts), Some(prompt_ts)) => user_ts > prompt_ts,
+                        _ => false,
+                    };
+                    if !user_after_enqueue {
+                        let _ = system_log::log_event(
+                            &self.db.pool,
+                            Some(&self.app_handle),
+                            "info",
+                            "chat",
+                            None,
+                            None,
+                            json!( {
+                                "event": "pending_prompt_auto_surface_blocked",
+                                "reason": "no_user_turn_after_enqueue",
+                                "prompt_id": prompt_id,
+                                "source": source,
+                                "anchor_age_seconds": anchor_age_seconds,
+                            }),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                if !user_recent {
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "chat",
+                        None,
+                        None,
+                        json!( {
+                            "event": "pending_prompt_auto_surface_blocked",
+                            "reason": "stale_user_input",
+                            "prompt_id": prompt_id,
+                            "source": source,
+                            "last_user_age_seconds": last_user_age_secs,
+                            "recency_secs": recency_secs,
+                            "anchor_age_seconds": anchor_age_seconds,
+                        }),
+                    )
+                    .await;
+                    continue;
+                }
+            }
             if trimmed.is_empty() {
                 match self.db.delete_pending_prompt(&prompt_id).await {
                     Ok(affected) if affected > 0 => {}
@@ -9622,6 +10043,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     0,
                     age_seconds,
                     skip_count,
+                    anchor_age_seconds,
                 )
                 .await;
                 continue;
@@ -9629,17 +10051,78 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             let exact_open_question = open_questions
                 .iter()
                 .any(|q| q.trim().eq_ignore_ascii_case(trimmed));
+            let prompt_tokens = token_set(trimmed);
+            let overlap_workspace = prompt_tokens
+                .intersection(&workspace_tokens)
+                .count();
+            let overlap_user = prompt_tokens
+                .intersection(&user_tokens)
+                .count();
+            if is_monologue_prompt
+                && !exact_open_question
+                && overlap_user < PROACTIVE_OVERLAP_THRESHOLD
+            {
+                let _ = self.db.increment_pending_prompt_skip_count(&prompt_id).await;
+                let next_skip_count = skip_count + 1;
+                if let Some(force_reason) =
+                    pending_prompt_force_reason(next_skip_count, auto_surface, age_seconds)
+                {
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "warn",
+                        "chat",
+                        None,
+                        None,
+                        json!({
+                            "event": "pending_prompt_starvation",
+                            "reason": force_reason,
+                            "source": source,
+                            "prompt_id": prompt_id,
+                            "skip_count": next_skip_count,
+                        }),
+                    )
+                    .await;
+                }
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "chat",
+                    None,
+                    None,
+                    json!({
+                        "event": "pending_prompt_held",
+                        "source": source,
+                        "reason": "anchor_overlap_failed",
+                        "overlap_workspace": overlap_workspace,
+                        "overlap_user": overlap_user,
+                        "prompt_age_seconds": age_seconds,
+                        "pending_prompt_starvation_count": next_skip_count,
+                    }),
+                )
+                .await;
+                self.log_pending_prompt_surface_attempted(
+                    &prompt_id,
+                    &source,
+                    auto_surface,
+                    "held",
+                    "anchor_overlap_failed",
+                    overlap_workspace,
+                    overlap_user,
+                    age_seconds,
+                    next_skip_count,
+                    anchor_age_seconds,
+                )
+                .await;
+                continue;
+            }
             if !alignment_enabled {
-                let overlap_user = if user_tokens.is_empty() {
-                    0
-                } else {
-                    token_set(trimmed).intersection(&user_tokens).count()
-                };
                 return Some(PendingPromptSelection {
                     prompt_id,
                     prompt: trimmed.to_string(),
                     source,
-                    overlap_workspace: 0,
+                    overlap_workspace,
                     overlap_user,
                     skip_count,
                     age_seconds,
@@ -9651,16 +10134,13 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     attempt_count,
                     last_asked_at,
                     expires_at,
+                    anchor_message_id,
+                    anchor_hash,
+                    anchor_created_at,
+                    anchor_role,
+                    anchor_age_seconds,
                 });
             }
-
-            let prompt_tokens = token_set(trimmed);
-            let overlap_workspace = prompt_tokens
-                .intersection(&workspace_tokens)
-                .count();
-            let overlap_user = prompt_tokens
-                .intersection(&user_tokens)
-                .count();
             if let Some(force_reason) = force_reason {
                 let _ = system_log::log_event(
                     &self.db.pool,
@@ -9697,6 +10177,11 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     attempt_count,
                     last_asked_at,
                     expires_at,
+                    anchor_message_id,
+                    anchor_hash,
+                    anchor_created_at,
+                    anchor_role,
+                    anchor_age_seconds,
                 });
             }
             if exact_open_question
@@ -9719,6 +10204,11 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     attempt_count,
                     last_asked_at,
                     expires_at,
+                    anchor_message_id,
+                    anchor_hash,
+                    anchor_created_at,
+                    anchor_role,
+                    anchor_age_seconds,
                 });
             }
 
@@ -9772,6 +10262,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 overlap_user,
                 age_seconds,
                 next_skip_count,
+                anchor_age_seconds,
             )
             .await;
         }
@@ -9788,11 +10279,42 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         let settings = self.db.get_settings().await.map_err(|e| e.to_string())?;
         let mut state = self.load_state(conversation_id).await;
         let Some(selection) = self
-            .select_pending_prompt_for_proactive(conversation_id, &state, &settings, true)
+            .select_pending_prompt_for_proactive(conversation_id, &state, &settings, true, None)
             .await
         else {
             return Ok(());
         };
+        if trigger == "after_response" && selection.source == "monologue" {
+            let _ = system_log::log_event(
+                &self.db.pool,
+                Some(&self.app_handle),
+                "info",
+                "chat",
+                run_id,
+                trace_id,
+                json!( {
+                    "event": "pending_prompt_auto_surface_blocked",
+                    "reason": "inline_only",
+                    "prompt_id": selection.prompt_id,
+                    "source": selection.source,
+                }),
+            )
+            .await;
+            self.log_pending_prompt_surface_attempted(
+                &selection.prompt_id,
+                &selection.source,
+                selection.auto_surface,
+                "held",
+                "inline_only",
+                selection.overlap_workspace,
+                selection.overlap_user,
+                selection.age_seconds,
+                selection.skip_count,
+                selection.anchor_age_seconds,
+            )
+            .await;
+            return Ok(());
+        }
         let jsonish = is_jsonish_text(&selection.prompt);
         let question_like = looks_like_question(&selection.prompt);
         if jsonish || !question_like {
@@ -9823,6 +10345,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 selection.overlap_user,
                 selection.age_seconds,
                 selection.skip_count,
+                selection.anchor_age_seconds,
             )
             .await;
             if let Ok(count) = self.db.count_pending_prompts(conversation_id).await {
@@ -9942,20 +10465,28 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 selection.overlap_user,
                 selection.age_seconds,
                 selection.skip_count,
+                selection.anchor_age_seconds,
             )
             .await;
             self.persist_state(&mut state).await;
             return Ok(());
         }
 
-        let disable_working_hypothesis = settings.stability_disable_working_hypothesis.unwrap_or(true);
-        let mut question = if selection.exact_open_question {
-            selection.prompt.clone()
-        } else {
-            working_hypothesis_prefix(&selection.prompt, disable_working_hypothesis)
-        };
+        let allow_speculative_markers = allow_speculative_markers_for_prompt(
+            state.last_user_input.as_deref().unwrap_or(""),
+            false,
+        );
+        let mut question =
+            strip_working_hypothesis_prefix(&selection.prompt, !allow_speculative_markers);
         if question.trim().is_empty() {
             question = selection.prompt.clone();
+        }
+        let user_name = settings.user_display_name.as_deref().unwrap_or("User");
+        let last_user_input = state.last_user_input.as_deref().unwrap_or("");
+        if response_has_user_attribution(&question, user_name)
+            && !user_attribution_grounded_in_last_input(&question, last_user_input)
+        {
+            question = rewrite_user_attribution_text(&question, user_name);
         }
         let payload = json!({
             "question": question,
@@ -10068,6 +10599,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 selection.overlap_user,
                 selection.age_seconds,
                 selection.skip_count,
+                selection.anchor_age_seconds,
             )
             .await;
             self.persist_state(&mut state).await;
@@ -10090,6 +10622,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 "overlap_user": selection.overlap_user,
                 "prompt_age_seconds": selection.age_seconds,
                 "pending_prompt_starvation_count": selection.skip_count,
+                "pending_prompt_anchor_age_seconds": selection.anchor_age_seconds,
                 "candidate_id": candidate.id,
                 "trigger": trigger,
             }),
@@ -10105,6 +10638,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             selection.overlap_user,
             selection.age_seconds,
             selection.skip_count,
+            selection.anchor_age_seconds,
         )
         .await;
         if let Ok(count) = self.db.count_pending_prompts(conversation_id).await {
@@ -14089,9 +14623,7 @@ Do not mention telemetry, tools, manifests, KV memory, timestamps, run IDs, or l
             .await
             .unwrap_or_default();
         if state.last_monologue_anchor_epoch != state.anchor_epoch {
-            if !is_free_thought {
-                recent_entries.clear();
-            }
+            recent_entries.clear();
             state.last_monologue_anchor_epoch = state.anchor_epoch;
             let _ = system_log::log_event(
                 &self.db.pool,
@@ -14103,7 +14635,8 @@ Do not mention telemetry, tools, manifests, KV memory, timestamps, run IDs, or l
                 json!({
                     "event": "monologue_anchor_epoch_reset",
                     "anchor_epoch": state.anchor_epoch,
-                    "cleared": !is_free_thought,
+                    "cleared": true,
+                    "stream": stream.as_str(),
                 }),
             )
             .await;
@@ -16412,42 +16945,73 @@ Decision packet (optional, internal only):
             }
 
             if reanchor_needed {
-                let reanchor_note = format!("Re-anchor: stay on the current topic: {}.", anchor_label);
-                history_a.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: reanchor_note.clone(),
-                });
-                history_b.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: reanchor_note,
-                });
-                let _ = system_log::log_event(
-                    &self.db.pool,
-                    Some(&self.app_handle),
-                    "info",
-                    "kernel",
-                    None,
-                    None,
-                    json!({
-                        "event": "monologue_reanchor",
-                        "turn": turn_index + 1,
-                        "anchor": anchor_label.clone(),
-                    }),
-                )
-                .await;
-                state.last_meta_cog_loop_break_reason = Some("reanchor_needed".to_string());
-                self.log_meta_cog_event(
-                    state,
-                    None,
-                    None,
-                    json!({
-                        "event": "meta_cog_event",
-                        "reason": "reanchor_needed",
-                        "turn_id": (turn_index + 1) as i64,
-                        "anchor": anchor_label.clone(),
-                    }),
-                )
-                .await;
+                let recency_secs = settings
+                    .pending_prompt_recency_secs
+                    .unwrap_or(PENDING_PROMPT_RECENCY_SECS_DEFAULT);
+                let recent_user = state
+                    .last_user_input_at
+                    .as_deref()
+                    .and_then(crate::core::kernel::utils::time::timestamp_from_str)
+                    .map(|ts| {
+                        let age = Utc::now().signed_duration_since(ts).num_seconds();
+                        age >= 0 && age <= recency_secs
+                    })
+                    .unwrap_or(false);
+                if !recent_user {
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "kernel",
+                        None,
+                        None,
+                        json!( {
+                            "event": "monologue_reanchor_skipped",
+                            "reason": "stale_user_input",
+                            "turn": turn_index + 1,
+                            "anchor": anchor_label.clone(),
+                            "recency_secs": recency_secs,
+                        }),
+                    )
+                    .await;
+                } else {
+                    let reanchor_note = format!("Re-anchor: stay on the current topic: {}.", anchor_label);
+                    history_a.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: reanchor_note.clone(),
+                    });
+                    history_b.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: reanchor_note,
+                    });
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "kernel",
+                        None,
+                        None,
+                        json!({
+                            "event": "monologue_reanchor",
+                            "turn": turn_index + 1,
+                            "anchor": anchor_label.clone(),
+                        }),
+                    )
+                    .await;
+                    state.last_meta_cog_loop_break_reason = Some("reanchor_needed".to_string());
+                    self.log_meta_cog_event(
+                        state,
+                        None,
+                        None,
+                        json!({
+                            "event": "meta_cog_event",
+                            "reason": "reanchor_needed",
+                            "turn_id": (turn_index + 1) as i64,
+                            "anchor": anchor_label.clone(),
+                        }),
+                    )
+                    .await;
+                }
             }
 
             turn_index += 1;
@@ -18133,7 +18697,12 @@ Decision packet (optional, internal only):
         .ok()
         .flatten()
         .unwrap_or(0);
-        let allowlist_limit = if parse_error_count >= 3 { 12 } else { 24 };
+        let json_model_id = settings
+            .json_reliable_model_id
+            .clone()
+            .or_else(|| settings.active_model_id.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let allowlist_limit = if parse_error_count >= 1 { 12 } else { 24 };
         let (allowlist_ids, allowlist_entries) =
             Kernel::load_prediction_allowlist(&db.pool, allowlist_limit, true).await;
         if allowlist_ids.is_empty() {
@@ -18172,7 +18741,7 @@ Decision packet (optional, internal only):
                 })
             })
             .collect();
-        let (temperature, max_tokens) = if parse_error_count >= 3 {
+        let (temperature, max_tokens) = if parse_error_count >= 1 {
             (Some(0.1), Some(300))
         } else {
             (Some(0.2), Some(500))
@@ -18206,7 +18775,7 @@ Decision packet (optional, internal only):
 
         let system_prompt = "You generate falsifiable self-predictions. Output ONLY JSON.\n\nRequired schema:\n{\n  \"predictions\": [\n    {\"metric\": string, \"expected_value\": number, \"expected_variance\": number, \"horizon\": \"next_turn\"|\"next_tool\"|\"next_5m\"|\"next_hour\", \"confidence\": 0..1, \"evidence_event_ids\": [number,...]}\n  ] | null,\n  \"rejection_reason\": string | null\n}\n\nRules:\n- Output 1-3 predictions or null.\n- Use ONLY evidence_event_ids from the allowlist.\n- expected_variance must be >= 0.0.\n- Metrics allowed: tool_success_rate, memory_pass_rate, clarification_rate, refusal_rate, workspace_stability_rate, response_len.\n- If no valid evidence, set rejection_reason and return null predictions.";
 
-        let use_compact_packet = parse_error_count >= 3;
+        let use_compact_packet = parse_error_count >= 1;
         let packet_for_prompt = if use_compact_packet {
             compact_packet.clone()
         } else {
@@ -18219,10 +18788,7 @@ Decision packet (optional, internal only):
         };
 
         let request = ChatCompletionRequest {
-            model: settings
-                .active_model_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string()),
+            model: json_model_id.clone(),
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
@@ -18274,10 +18840,7 @@ Decision packet (optional, internal only):
                 let fallback_system_prompt = "Return ONLY JSON using the required schema. Output 1-2 predictions or null.";
                 let fallback_user_prompt = format!("Prediction packet (compact):\n{}", compact_packet);
                 let retry_request = ChatCompletionRequest {
-                    model: settings
-                        .active_model_id
-                        .clone()
-                        .unwrap_or_else(|| "default".to_string()),
+                    model: json_model_id.clone(),
                     messages: vec![
                         ChatMessage {
                             role: "system".to_string(),
@@ -18317,10 +18880,7 @@ Decision packet (optional, internal only):
                             compact_packet
                         );
                         let fallback_request = ChatCompletionRequest {
-                            model: settings
-                                .active_model_id
-                                .clone()
-                                .unwrap_or_else(|| "default".to_string()),
+                            model: json_model_id.clone(),
                             messages: vec![
                                 ChatMessage {
                                     role: "system".to_string(),
@@ -18407,10 +18967,7 @@ Decision packet (optional, internal only):
                 compact_packet
             );
             let fallback_request = ChatCompletionRequest {
-                model: settings
-                    .active_model_id
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
+                model: json_model_id.clone(),
                 messages: vec![
                     ChatMessage {
                         role: "system".to_string(),
@@ -20078,6 +20635,23 @@ Decision packet (optional, internal only):
             reason = reason
         );
         let expires_at = compute_expires_at(Utc::now(), PENDING_PROMPT_EXPIRES_SECS);
+        let latest_user = self
+            .db
+            .get_latest_user_message(&conversation_id)
+            .await
+            .ok()
+            .flatten();
+        let (anchor_message_id, anchor_hash, anchor_created_at) = if let Some((message_id, content, created_at)) = latest_user {
+            (
+                Some(message_id),
+                Some(crate::core::kernel::utils::text::hash_payload(
+                    &summarize_snippet(&content, 160),
+                )),
+                Some(created_at),
+            )
+        } else {
+            (None, None, None)
+        };
         let _ = self
             .db
             .enqueue_pending_prompt(
@@ -20088,6 +20662,10 @@ Decision packet (optional, internal only):
                 Some("tool_args"),
                 None,
                 Some(&expires_at),
+                anchor_message_id.as_deref(),
+                anchor_hash.as_deref(),
+                anchor_created_at.as_deref(),
+                Some("user"),
             )
             .await;
     }

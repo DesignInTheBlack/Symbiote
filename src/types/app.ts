@@ -219,6 +219,7 @@ export interface Settings {
   history_window: number;
   injection_policy: "include" | "exclude";
   active_model_id: string | null;
+  json_reliable_model_id?: string | null;
   system_prompt: string | null;
   voice_name: string | null;
   voice_speed: number | null;

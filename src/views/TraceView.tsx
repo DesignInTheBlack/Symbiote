@@ -24,8 +24,6 @@ import { SystemControlPanel, SubsystemState } from "../components/SystemControlP
 import { SystemHealthPanel } from "../components/SystemHealthPanel";
 import { SystemControlHistory } from "../components/SystemControlHistory";
 import { SystemHealthTimeline } from "../components/SystemHealthTimeline";
-import { SystemStatePanel } from "../components/SystemStatePanel";
-import { HealthGatePanel } from "../components/HealthGatePanel";
 import { OutcomePanel } from "../components/OutcomePanel";
 import { formatStatusDetail, formatStatusLabel } from "../utils/statusStages";
 
@@ -71,19 +69,166 @@ type TraceEntry = {
   trace_id?: string | null;
   source: "system" | "monologue" | "message";
   payload: unknown;
+  alert_ids?: string[];
+  severity?: "info" | "warn" | "error";
+  evidence_ids?: number[];
 };
 
 type CockpitTabId = "overview" | "controls" | "signals" | "diagnostics" | "logs";
 
-type PinnedPanels = {
-  gate: boolean;
-  organism: boolean;
+
+type AlertItem = {
+  id: string;
+  label: string;
+  value: string;
+  tone: "warn" | "alert";
+  reason: string;
+  relatedEvents: string[];
 };
 
-const formatEventLabel = (value: string) =>
-  value
+type LensPreset = {
+  id: string;
+  label: string;
+  runId: string;
+  category: string;
+  level: string;
+  search: string;
+  alertId?: string | null;
+};
+
+type RunStoryEvent = {
+  id: string;
+  label: string;
+  timestamp: string;
+  event: string;
+  detail?: string;
+  run_id?: string | null;
+  source: "system" | "monologue" | "message";
+};
+
+const EVENT_LABELS: Record<string, string> = {
+  decision_report: "Decision report",
+  gate_decision: "Gate decision",
+  gate_decision_inputs: "Gate inputs",
+  memory_pass_start: "Memory pass started",
+  memory_pass_result: "Memory pass result",
+  memory_pass_invalid_output: "Memory pass invalid output",
+  memory_pass_repair: "Memory pass repaired",
+  memory_write_blocked: "Memory write blocked",
+  contract_violation: "Contract violation",
+  primary_response_json_unwrapped: "Primary response unwrapped",
+  response_reasoning_json_invalid: "JSON invalid",
+  response_reasoning_json_retry: "JSON retry",
+  pending_prompt_sanitized: "Pending prompt sanitized",
+  pending_prompt_surfaced: "Pending prompt surfaced",
+  monologue_parse_failed: "Monologue parse failed",
+  monologue_json_disabled: "Monologue JSON disabled",
+  tool_dispatch: "Tool dispatch",
+  tool_dispatch_failed: "Tool dispatch failed",
+  tool_output_evidence_recorded: "Tool output recorded",
+  outcome_summary_evidence: "Outcome evidence",
+  monologue_tick: "Monologue tick",
+  monologue_tick_result: "Monologue tick result",
+  summary_archive_updated: "Summary archive updated",
+  workspace_snapshot: "Workspace snapshot",
+  run_stage_update: "Run stage update",
+};
+
+const EVENT_SEVERITY: Record<string, "info" | "warn" | "error"> = {
+  memory_pass_invalid_output: "error",
+  memory_pass_error: "error",
+  memory_pass_repair: "warn",
+  memory_write_blocked: "warn",
+  contract_violation: "warn",
+  response_reasoning_json_invalid: "error",
+  response_reasoning_json_retry: "warn",
+  pending_prompt_sanitized: "warn",
+  monologue_parse_failed: "warn",
+  monologue_json_disabled: "warn",
+  tool_dispatch_failed: "error",
+};
+
+const EVENT_DETAIL_KEYS: Record<string, string[]> = {
+  decision_report: ["decision", "selected_action", "selected_kind", "rationale", "anchor_hits"],
+  gate_decision: ["decision", "enforced_decision", "soft_decision", "verify_rate"],
+  gate_decision_inputs: ["enforced_decision", "soft_decision", "legacy_decision", "gate_reasons", "signals"],
+  memory_pass_result: ["write_count", "facts", "relations", "scope"],
+  memory_pass_invalid_output: ["reason", "model", "raw_snippet", "request_label"],
+  memory_write_blocked: ["reason", "candidate_kind", "candidate_id"],
+  contract_violation: ["policy", "reason", "candidate_kind", "snippet"],
+  tool_dispatch: ["tool_name", "action_id", "status"],
+  tool_dispatch_failed: ["tool_name", "action_id", "error"],
+  pending_prompt_sanitized: ["reason", "candidate_kind", "source"],
+  monologue_parse_failed: ["reason", "cooldown_until"],
+  response_reasoning_json_invalid: ["request_label", "reason"],
+};
+
+const DEFAULT_DETAIL_KEYS = [
+  "decision",
+  "reason",
+  "status",
+  "candidate_kind",
+  "candidate_id",
+  "tool_name",
+  "error",
+  "duration_ms",
+  "evidence_event_ids",
+  "run_id",
+  "trace_id",
+];
+
+const RUN_STORY_EVENTS = new Set([
+  "decision_report",
+  "gate_decision",
+  "gate_decision_inputs",
+  "memory_pass_start",
+  "memory_pass_result",
+  "memory_pass_invalid_output",
+  "memory_write_blocked",
+  "tool_dispatch",
+  "tool_dispatch_failed",
+  "pending_prompt_sanitized",
+  "pending_prompt_surfaced",
+  "monologue_tick",
+  "monologue_tick_result",
+  "summary_archive_updated",
+  "workspace_snapshot",
+  "outcome_summary_evidence",
+  "run_stage_update",
+]);
+
+const LENS_STORAGE_KEY = "symbiote_cockpit_lenses";
+
+const loadLenses = (): LensPreset[] => {
+  try {
+    const raw = localStorage.getItem(LENS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item) => item && typeof item.label === "string");
+  } catch {
+    return [];
+  }
+};
+
+const persistLenses = (lenses: LensPreset[]) => {
+  try {
+    localStorage.setItem(LENS_STORAGE_KEY, JSON.stringify(lenses));
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const formatEventLabel = (value: string) => {
+  const labeled = EVENT_LABELS[value];
+  if (labeled) return labeled;
+  return value
     .replace(/_/g, " ")
     .replace(/\b\w/g, (m) => m.toUpperCase());
+};
+
+const isDecisionTarget = (targetType: string) =>
+  targetType.toLowerCase().includes("decision");
 
 const truncate = (text: string, max = 120) => (
   text.length > max ? `${text.slice(0, max)}...` : text
@@ -194,6 +339,13 @@ export const TraceView = ({
   const [activeCategory, setActiveCategory] = useState<string>("all");
   const [activeLevel, setActiveLevel] = useState<string>("all");
   const [search, setSearch] = useState<string>("");
+  const [activeRunId, setActiveRunId] = useState<string>("all");
+  const [runSelectionLocked, setRunSelectionLocked] = useState<boolean>(false);
+  const [activeAlertId, setActiveAlertId] = useState<string | null>(null);
+  const [lensDraft, setLensDraft] = useState<string>("");
+  const [savedLenses, setSavedLenses] = useState<LensPreset[]>(() => loadLenses());
+  const [playbackIndex, setPlaybackIndex] = useState<number>(0);
+  const [decisionFilter, setDecisionFilter] = useState<string>("all");
   const [collapsedRuns, setCollapsedRuns] = useState<Set<string>>(new Set());
   const [intentDraft, setIntentDraft] = useState<string>(intentSummary?.summary ?? "");
   const [intentConfirmed, setIntentConfirmed] = useState<boolean>(intentSummary?.confirmed ?? false);
@@ -201,19 +353,19 @@ export const TraceView = ({
   const [activeTab, setActiveTab] = useState<CockpitTabId>("overview");
   const [overviewExpanded, setOverviewExpanded] = useState<boolean>(false);
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState<boolean>(true);
-  const [pinnedPanels, setPinnedPanels] = useState<PinnedPanels>({ gate: false, organism: false });
   const [healthBannerCollapsed, setHealthBannerCollapsed] = useState(false);
   const [healthBannerDismissed, setHealthBannerDismissed] = useState(false);
   const allowEdits = cockpitWriteEnabled && Boolean(onUpdateSettings);
-  const decisionReports = useMemo(
-    () => systemLogs.filter((entry) => (entry.payload as any)?.event === "decision_report").slice(0, 6),
-    [systemLogs]
-  );
 
   useEffect(() => {
     setIntentDraft(intentSummary?.summary ?? "");
     setIntentConfirmed(intentSummary?.confirmed ?? false);
   }, [intentSummary]);
+
+  useEffect(() => {
+    persistLenses(savedLenses);
+  }, [savedLenses]);
+
 
   const healthBanner = useMemo(() => {
     const snapshots: SystemHealthSnapshot[] = [];
@@ -316,7 +468,7 @@ export const TraceView = ({
     setHealthBannerDismissed(false);
   }, [healthBanner]);
 
-  const combinedEntries = useMemo(() => {
+  const allEntries = useMemo(() => {
     const entries = [
       ...buildSystemEntries(systemLogs),
       ...buildMonologueEntries(monologueEntries),
@@ -325,15 +477,93 @@ export const TraceView = ({
     return entries.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   }, [systemLogs, monologueEntries, messages]);
 
+  const runOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const entry of allEntries) {
+      if (!entry.run_id) continue;
+      counts.set(entry.run_id, (counts.get(entry.run_id) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([id, count]) => ({
+        id,
+        label: `${id.slice(0, 8)}...`,
+        count,
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [allEntries]);
+
+  useEffect(() => {
+    if (runSelectionLocked) return;
+    const activeRun = (systemHealthSnapshot?.metrics as any)?.run?.active_run_id;
+    if (activeRun && activeRun !== activeRunId) {
+      setActiveRunId(activeRun);
+      return;
+    }
+    if (activeRunId === "all" && runOptions.length > 0) {
+      setActiveRunId(runOptions[0].id);
+    }
+  }, [systemHealthSnapshot, runOptions, runSelectionLocked, activeRunId]);
+
+  const runFilter = activeRunId !== "all" ? activeRunId : null;
+
+  const filteredSystemLogs = useMemo(() => {
+    if (!runFilter) return systemLogs;
+    return systemLogs.filter((entry) => entry.run_id === runFilter || entry.trace_id === runFilter);
+  }, [systemLogs, runFilter]);
+
+  const filteredMonologueEntries = useMemo(() => {
+    if (!runFilter) return monologueEntries;
+    return monologueEntries.filter((entry) => entry.run_id === runFilter);
+  }, [monologueEntries, runFilter]);
+
+  const filteredMessages = useMemo(() => {
+    if (!runFilter) return messages;
+    return messages.filter((msg) => msg.run_id === runFilter || msg.trace_id === runFilter);
+  }, [messages, runFilter]);
+
+  const filteredSubjectSnapshots = useMemo(() => {
+    if (!runFilter) return subjectSnapshots;
+    return subjectSnapshots.filter((snap) => snap.run_id === runFilter);
+  }, [subjectSnapshots, runFilter]);
+
+  const runScopedSnapshotHashes = useMemo(() => {
+    return new Set(filteredSubjectSnapshots.map((snap) => snap.snapshot_hash));
+  }, [filteredSubjectSnapshots]);
+
+  const filteredGateDecisions = useMemo(() => {
+    if (!runFilter) return gateDecisions;
+    if (runScopedSnapshotHashes.size === 0) return [];
+    return gateDecisions.filter((decision) => runScopedSnapshotHashes.has(decision.snapshot_hash));
+  }, [gateDecisions, runFilter, runScopedSnapshotHashes]);
+
+  const filteredGateInputEvents = useMemo(() => {
+    if (!runFilter) return gateInputEvents;
+    return gateInputEvents.filter((entry) => entry.run_id === runFilter || entry.trace_id === runFilter);
+  }, [gateInputEvents, runFilter]);
+
+  const combinedEntries = useMemo(() => {
+    const entries = [
+      ...buildSystemEntries(filteredSystemLogs),
+      ...buildMonologueEntries(filteredMonologueEntries),
+      ...buildMessageEntries(filteredMessages),
+    ];
+    return entries.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  }, [filteredSystemLogs, filteredMonologueEntries, filteredMessages]);
+
+  const decisionReports = useMemo(
+    () => filteredSystemLogs.filter((entry) => (entry.payload as any)?.event === "decision_report").slice(0, 6),
+    [filteredSystemLogs]
+  );
+
   const feedbackBundlePayload = useMemo(() => {
-    for (const entry of systemLogs) {
+    for (const entry of filteredSystemLogs) {
       const payload = entry.payload as any;
       if (payload && typeof payload === "object" && payload.event === "feedback_bundle_built") {
         return payload.bundle ?? payload.feedback_bundle ?? null;
       }
     }
     return null;
-  }, [systemLogs]);
+  }, [filteredSystemLogs]);
 
   const feedbackBundleLines = useMemo(() => {
     if (!feedbackBundlePayload || typeof feedbackBundlePayload !== "object") return [];
@@ -354,7 +584,7 @@ export const TraceView = ({
       "self_claim_stale_evidence",
     ]);
     const counts: Record<string, number> = {};
-    for (const entry of systemLogs) {
+    for (const entry of filteredSystemLogs) {
       const payload = entry.payload as any;
       const event = payload?.event;
       if (event && tracked.has(event)) {
@@ -362,10 +592,10 @@ export const TraceView = ({
       }
     }
     return counts;
-  }, [systemLogs]);
+  }, [filteredSystemLogs]);
 
   const latestAttentionSchema = useMemo(() => {
-    const latest = subjectSnapshots[0];
+    const latest = filteredSubjectSnapshots[0];
     if (!latest) return null;
     try {
       const parsed = JSON.parse(latest.subject_state_json) as any;
@@ -373,57 +603,43 @@ export const TraceView = ({
     } catch {
       return null;
     }
-  }, [subjectSnapshots]);
+  }, [filteredSubjectSnapshots]);
 
   const latestWorkspaceContributors = useMemo(() => {
-    for (const entry of systemLogs) {
+    for (const entry of filteredSystemLogs) {
       const payload = entry.payload as any;
       if (payload && typeof payload === "object" && payload.event === "workspace_snapshot") {
         return payload;
       }
     }
     return null;
-  }, [systemLogs]);
+  }, [filteredSystemLogs]);
 
   const selfReportMessages = useMemo(
-    () => messages.filter((msg) => msg.role === "assistant" && (msg.metadata as any)?.self_report),
-    [messages]
+    () => filteredMessages.filter((msg) => msg.role === "assistant" && (msg.metadata as any)?.self_report),
+    [filteredMessages]
   );
 
-  const categories = useMemo(() => {
-    const unique = new Set<string>(combinedEntries.map((entry) => entry.category));
-    return ["all", ...Array.from(unique).sort()];
-  }, [combinedEntries]);
-
-  const levels = ["all", "info", "warn", "error"];
-
-  const filteredEntries = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return combinedEntries.filter((entry) => {
-      if (activeCategory !== "all" && entry.category !== activeCategory) return false;
-      if (activeLevel !== "all" && entry.level !== activeLevel) return false;
-      if (!query) return true;
-      const payloadText = typeof entry.payload === "string"
-        ? entry.payload
-        : JSON.stringify(entry.payload);
-      return (
-        entry.event.toLowerCase().includes(query)
-        || entry.category.toLowerCase().includes(query)
-        || payloadText.toLowerCase().includes(query)
-      );
-    });
-  }, [combinedEntries, activeCategory, activeLevel, search]);
-
-  const groupedEntries = useMemo(() => {
-    const map = new Map<string, TraceEntry[]>();
-    for (const entry of filteredEntries) {
-      const key = runIdKey(entry.run_id);
-      const list = map.get(key) || [];
-      list.push(entry);
-      map.set(key, list);
+  const decisionTargets = useMemo(() => {
+    const targets = new Map<string, number>();
+    for (const entry of evidenceLineage) {
+      for (const link of entry.links) {
+        if (!isDecisionTarget(link.target_type)) continue;
+        const key = `${link.target_type}:${link.target_id}`;
+        targets.set(key, (targets.get(key) ?? 0) + 1);
+      }
     }
-    return Array.from(map.entries());
-  }, [filteredEntries]);
+    return Array.from(targets.entries())
+      .map(([id, count]) => ({ id, count }))
+      .sort((a, b) => b.count - a.count);
+  }, [evidenceLineage]);
+
+  const filteredEvidenceLineage = useMemo(() => {
+    if (decisionFilter === "all") return evidenceLineage;
+    return evidenceLineage.filter((entry) =>
+      entry.links.some((link) => `${link.target_type}:${link.target_id}` === decisionFilter)
+    );
+  }, [evidenceLineage, decisionFilter]);
 
   const subsystemStates = useMemo(() => {
     const raw = systemHealthSnapshot?.subsystem_states;
@@ -434,7 +650,7 @@ export const TraceView = ({
   }, [systemHealthSnapshot]);
   const suppressionSummary = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const entry of systemLogs) {
+    for (const entry of filteredSystemLogs) {
       const payload = entry.payload as any;
       if (!payload || typeof payload !== "object") continue;
       if (payload.event === "monologue_suppression_summary" && payload.suppression_counts) {
@@ -447,20 +663,119 @@ export const TraceView = ({
       }
     }
     return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);
-  }, [systemLogs]);
+  }, [filteredSystemLogs]);
 
   const keyEvents = useMemo(() => {
-    return [...systemLogs]
+    return [...filteredSystemLogs]
       .filter((entry) => entry.level === "warn" || entry.level === "error")
       .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       .slice(0, 8);
-  }, [systemLogs]);
+  }, [filteredSystemLogs]);
 
   const recentEvents = useMemo(() => {
-    return [...systemLogs]
+    return [...filteredSystemLogs]
       .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       .slice(0, 5);
-  }, [systemLogs]);
+  }, [filteredSystemLogs]);
+
+  const deltaItems = useMemo(() => {
+    if (!systemHealthSnapshot || systemHealthHistory.length < 2) return [];
+    const current = (systemHealthSnapshot.metrics ?? {}) as Record<string, any>;
+    const previous = (systemHealthHistory[1]?.metrics ?? {}) as Record<string, any>;
+    const items: { label: string; current: string; delta: string; tone: "up" | "down" | "flat" }[] = [];
+    const pushDelta = (label: string, currentVal: number, prevVal: number, precision = 0) => {
+      if (!Number.isFinite(currentVal) || !Number.isFinite(prevVal)) return;
+      const delta = currentVal - prevVal;
+      if (Math.abs(delta) < (precision > 0 ? 0.01 : 1)) return;
+      const sign = delta > 0 ? "+" : "";
+      items.push({
+        label,
+        current: precision > 0 ? currentVal.toFixed(precision) : `${Math.round(currentVal)}`,
+        delta: `${sign}${precision > 0 ? delta.toFixed(precision) : Math.round(delta)}`,
+        tone: delta > 0 ? "up" : "down",
+      });
+    };
+    pushDelta("Errors Open", Number(current.errors?.open ?? 0), Number(previous.errors?.open ?? 0));
+    pushDelta("Pending Prompts", Number(current.pending_prompts?.count ?? 0), Number(previous.pending_prompts?.count ?? 0));
+    pushDelta("Gate Verify Rate", Number(current.gate?.verify_rate ?? 0) * 100, Number(previous.gate?.verify_rate ?? 0) * 100, 1);
+    pushDelta("Memory Writes", Number(current.memory?.write_count ?? 0), Number(previous.memory?.write_count ?? 0));
+    pushDelta("JSON Compliance", Number(current.json_compliance?.compliance_rate ?? 0) * 100, Number(previous.json_compliance?.compliance_rate ?? 0) * 100, 1);
+    pushDelta("Monologue No-op", Number(current.monologue?.loop_noop_rate ?? 0) * 100, Number(previous.monologue?.loop_noop_rate ?? 0) * 100, 1);
+    return items.slice(0, 8);
+  }, [systemHealthSnapshot, systemHealthHistory]);
+
+  const runStoryEvents = useMemo(() => {
+    const items: RunStoryEvent[] = [];
+    const runMeta = (systemHealthSnapshot?.metrics as any)?.run ?? {};
+    const runMetaId = runMeta.active_run_id ? String(runMeta.active_run_id) : null;
+    if (runMeta && (runMeta.active_run_id || runMeta.module_stage)) {
+      if (!runFilter || runMetaId === runFilter) {
+        const timestamp = runMeta.module_updated_at
+          || systemHealthSnapshot?.timestamp
+          || new Date().toISOString();
+        const detailParts: string[] = [];
+        if (runMeta.module_stage) {
+          detailParts.push(formatEventLabel(String(runMeta.module_stage)));
+        }
+        if (runMeta.module_detail) {
+          detailParts.push(String(runMeta.module_detail));
+        }
+        if (runMeta.active_run_id) {
+          detailParts.push(`Run ${shortHash(String(runMeta.active_run_id))}`);
+        }
+        items.push({
+          id: `run-stage:${timestamp}`,
+          label: "Run stage update",
+          timestamp,
+          event: "run_stage_update",
+          detail: detailParts.length > 0 ? detailParts.join(" | ") : undefined,
+          run_id: runMetaId,
+          source: "system",
+        });
+      }
+    }
+    for (const entry of filteredSystemLogs) {
+      const payload = entry.payload as any;
+      const eventName = payload && typeof payload === "object" && "event" in payload
+        ? String(payload.event)
+        : entry.category;
+      if (!RUN_STORY_EVENTS.has(eventName)) continue;
+      const detailKeys = ["decision", "reason", "status", "outcome", "tool_name", "candidate_kind", "error"];
+      const detail = detailKeys
+        .map((key) => payload?.[key])
+        .find((value) => typeof value === "string" && value.trim().length > 0) as string | undefined;
+      items.push({
+        id: entry.id,
+        label: formatEventLabel(eventName),
+        timestamp: entry.timestamp,
+        event: eventName,
+        detail: detail ? truncate(detail, 140) : undefined,
+        run_id: entry.run_id,
+        source: "system",
+      });
+    }
+    for (const msg of filteredMessages) {
+      if (msg.role === "internal") continue;
+      items.push({
+        id: `message:${msg.message_id}`,
+        label: msg.role === "user" ? "User message" : "Assistant response",
+        timestamp: msg.created_at || new Date().toISOString(),
+        event: `message_${msg.role}`,
+        detail: truncate(String(msg.content ?? ""), 140),
+        run_id: msg.run_id ?? null,
+        source: "message",
+      });
+    }
+    return items.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  }, [filteredSystemLogs, filteredMessages, systemHealthSnapshot, runFilter]);
+
+  useEffect(() => {
+    if (runStoryEvents.length === 0) {
+      setPlaybackIndex(0);
+      return;
+    }
+    setPlaybackIndex((prev) => Math.min(prev, runStoryEvents.length - 1));
+  }, [runStoryEvents]);
 
   const rawHealth = useMemo(() => {
     if (!systemHealthSnapshot) return "{}";
@@ -491,36 +806,43 @@ export const TraceView = ({
         label: "Active Run",
         value: run.active_run_id ? shortHash(String(run.active_run_id)) : "Idle",
         meta: run.module_stage ? formatEventLabel(String(run.module_stage)) : "No active stage",
+        tooltip: "Single end-to-end execution thread for the current request.",
       },
       {
         label: "Gate Decisions",
         value: `${gate.total ?? 0}`,
         meta: `Verify ${(Number(gate.verify_rate ?? 0) * 100).toFixed(0)}%`,
+        tooltip: "Policy gate decisions and verification rate for the run.",
       },
       {
         label: "Tool Dispatch",
         value: `${tools.dispatches ?? 0}`,
         meta: `${tools.failures ?? 0} failures`,
+        tooltip: "Tool calls issued by the system and their failure count.",
       },
       {
         label: "Memory",
         value: `${memory.memory_pass_count ?? 0} passes`,
         meta: `${memory.write_count ?? 0} writes`,
+        tooltip: "Memory passes and writes in the current window.",
       },
       {
         label: "Summaries",
         value: `${summaryTotal} updates`,
         meta: summaryFailures ? `${summaryFailures} failures` : "No failures",
+        tooltip: "Rolling and inner summary updates.",
       },
       {
         label: "Errors",
         value: `${errors.total ?? 0}`,
         meta: `${errors.open ?? 0} open`,
+        tooltip: "Total and open errors recorded recently.",
       },
       {
         label: "Pending Prompts",
         value: `${pending.count ?? 0}`,
         meta: pendingAgeMin !== null ? `Oldest ${pendingAgeMin}m` : "--",
+        tooltip: "Queued prompts waiting to be processed.",
       },
     ];
   }, [systemHealthSnapshot]);
@@ -560,7 +882,7 @@ export const TraceView = ({
     };
   }, [systemHealthSnapshot]);
 
-  const latestGateInput = gateInputEvents[0];
+  const latestGateInput = filteredGateInputEvents[0];
   const latestGatePayload = (latestGateInput?.payload ?? {}) as any;
   const gateDecision =
     latestGatePayload.enforced_decision
@@ -574,23 +896,232 @@ export const TraceView = ({
   const errorOpen = Number(statusMetrics.errors?.open ?? 0);
   const pendingCount = Number(statusMetrics.pending?.count ?? 0);
 
-  const alertItems = useMemo(() => {
-    const items: { label: string; value: string; tone: "warn" | "alert" }[] = [];
-    if (errorOpen > 0) items.push({ label: "Errors", value: `${errorOpen}`, tone: "alert" });
-    if (pendingCount > 0) items.push({ label: "Pending", value: `${pendingCount}`, tone: "warn" });
-    if (gateVerifyRate > 0.4) items.push({ label: "Gate Verify", value: `${Math.round(gateVerifyRate * 100)}%`, tone: "warn" });
-    if (organismStress > 0.7) items.push({ label: "Stress", value: organismStress.toFixed(2), tone: "warn" });
-    if (controllerConfidence < 0.4) items.push({ label: "Confidence", value: `${Math.round(controllerConfidence * 100)}%`, tone: "warn" });
-    return items.slice(0, 4);
-  }, [errorOpen, pendingCount, gateVerifyRate, organismStress, controllerConfidence]);
+  const eventCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const entry of filteredSystemLogs) {
+      const payload = entry.payload as any;
+      const eventName = payload && typeof payload === "object" && "event" in payload
+        ? String(payload.event)
+        : entry.category;
+      counts.set(eventName, (counts.get(eventName) ?? 0) + 1);
+    }
+    return counts;
+  }, [filteredSystemLogs]);
+
+  const jsonCompliance = (systemHealthSnapshot?.metrics ?? {}) as Record<string, any>;
+  const jsonMetrics = jsonCompliance.json_compliance ?? {};
+  const memoryMetrics = jsonCompliance.memory ?? {};
+  const monologueMetrics = jsonCompliance.monologue ?? {};
+  const contractViolationCount = eventCounts.get("contract_violation") ?? 0;
+  const memoryWriteBlockedCount = eventCounts.get("memory_write_blocked") ?? 0;
+  const jsonComplianceRate = Number(jsonMetrics.compliance_rate ?? 1);
+  const jsonInvalid = Number(jsonMetrics.invalid ?? 0);
+  const loopNoopStreak = Number(monologueMetrics.loop_noop_streak ?? 0);
+
+  const activeAlerts = useMemo(() => {
+    const items: AlertItem[] = [];
+    if (errorOpen > 0) {
+      items.push({
+        id: "errors_open",
+        label: "Errors Open",
+        value: `${errorOpen}`,
+        tone: "alert",
+        reason: "Open errors in the last health snapshot.",
+        relatedEvents: ["tool_dispatch_failed", "memory_pass_error", "contract_violation"],
+      });
+    }
+    if (pendingCount > 0) {
+      items.push({
+        id: "pending_prompts",
+        label: "Pending Prompts",
+        value: `${pendingCount}`,
+        tone: "warn",
+        reason: "Pending prompts are waiting to surface.",
+        relatedEvents: ["pending_prompt_surfaced", "pending_prompt_held", "pending_prompt_starvation"],
+      });
+    }
+    if (gateVerifyRate > 0.4) {
+      items.push({
+        id: "gate_verify",
+        label: "Gate Verify",
+        value: `${Math.round(gateVerifyRate * 100)}%`,
+        tone: "warn",
+        reason: "Verification rate is elevated.",
+        relatedEvents: ["gate_decision"],
+      });
+    }
+    if (organismStress > 0.7) {
+      items.push({
+        id: "organism_stress",
+        label: "Organism Stress",
+        value: organismStress.toFixed(2),
+        tone: "warn",
+        reason: "Stress signal is above the comfort band.",
+        relatedEvents: ["organism_state", "controller_state"],
+      });
+    }
+    if (controllerConfidence < 0.4) {
+      items.push({
+        id: "controller_confidence",
+        label: "Low Confidence",
+        value: `${Math.round(controllerConfidence * 100)}%`,
+        tone: "warn",
+        reason: "Controller confidence is low.",
+        relatedEvents: ["decision_report", "gate_decision"],
+      });
+    }
+    if (jsonInvalid > 0 || jsonComplianceRate < 0.85) {
+      items.push({
+        id: "json_compliance",
+        label: "JSON Compliance",
+        value: `${Math.round(jsonComplianceRate * 100)}%`,
+        tone: "warn",
+        reason: "Strict JSON tasks are failing or retrying.",
+        relatedEvents: ["response_reasoning_json_invalid", "prediction_generation_retry", "qualia_auto_label_retry"],
+      });
+    }
+    if (memoryWriteBlockedCount > 0 || Number(memoryMetrics.phi_write_blocked ?? 0) > 0) {
+      items.push({
+        id: "memory_blocked",
+        label: "Memory Writes Blocked",
+        value: `${memoryWriteBlockedCount || memoryMetrics.phi_write_blocked || 0}`,
+        tone: "alert",
+        reason: "Evidence gating blocked memory writes.",
+        relatedEvents: ["memory_write_blocked", "memory_pass_invalid_output"],
+      });
+    }
+    if (contractViolationCount > 0) {
+      items.push({
+        id: "contract_violation",
+        label: "Contract Violations",
+        value: `${contractViolationCount}`,
+        tone: "warn",
+        reason: "Ungrounded assertions were detected.",
+        relatedEvents: ["contract_violation"],
+      });
+    }
+    if (loopNoopStreak >= 3) {
+      items.push({
+        id: "monologue_loop",
+        label: "Monologue Loop",
+        value: `${loopNoopStreak}`,
+        tone: "warn",
+        reason: "Monologue loop/no-op streak detected.",
+        relatedEvents: ["monologue_loop_detected", "monologue_loop_circuit_breaker"],
+      });
+    }
+    return items
+      .sort((a, b) => (a.tone === b.tone ? 0 : a.tone === "alert" ? -1 : 1))
+      .slice(0, 5);
+  }, [
+    errorOpen,
+    pendingCount,
+    gateVerifyRate,
+    organismStress,
+    controllerConfidence,
+    jsonComplianceRate,
+    jsonInvalid,
+    memoryMetrics,
+    memoryWriteBlockedCount,
+    contractViolationCount,
+    loopNoopStreak,
+  ]);
+
+  useEffect(() => {
+    if (activeAlertId && !activeAlerts.some((alert) => alert.id === activeAlertId)) {
+      setActiveAlertId(null);
+    }
+  }, [activeAlertId, activeAlerts]);
+
+  const alertEventMap = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const alert of activeAlerts) {
+      for (const event of alert.relatedEvents) {
+        const list = map.get(event) ?? [];
+        list.push(alert.id);
+        map.set(event, list);
+      }
+    }
+    return map;
+  }, [activeAlerts]);
+
+  const entriesWithMeta = useMemo(() => {
+    return combinedEntries.map((entry) => {
+      const severity = EVENT_SEVERITY[entry.event] ?? (entry.level as "info" | "warn" | "error");
+      const alertSet = new Set(alertEventMap.get(entry.event) ?? []);
+      const evidence_ids: number[] = [];
+      if (entry.payload && typeof entry.payload === "object") {
+        const payload = entry.payload as any;
+        if (typeof payload.alert_id === "string") {
+          alertSet.add(payload.alert_id);
+        }
+        if (Array.isArray(payload.alert_ids)) {
+          for (const id of payload.alert_ids) {
+            if (typeof id === "string") alertSet.add(id);
+          }
+        }
+        const list = payload.evidence_event_ids;
+        if (Array.isArray(list)) {
+          for (const id of list) {
+            if (typeof id === "number") evidence_ids.push(id);
+          }
+        }
+        if (typeof payload.evidence_event_id === "number") {
+          evidence_ids.push(payload.evidence_event_id);
+        }
+        if (typeof payload.evidence_id === "number") {
+          evidence_ids.push(payload.evidence_id);
+        }
+      }
+      const deduped = Array.from(new Set(evidence_ids));
+      return { ...entry, severity, alert_ids: Array.from(alertSet), evidence_ids: deduped };
+    });
+  }, [combinedEntries, alertEventMap]);
+
+  const categories = useMemo(() => {
+    const unique = new Set<string>(entriesWithMeta.map((entry) => entry.category));
+    return ["all", ...Array.from(unique).sort()];
+  }, [entriesWithMeta]);
+
+  const levels = ["all", "info", "warn", "error"];
+
+  const filteredEntries = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return entriesWithMeta.filter((entry) => {
+      const level = entry.severity ?? entry.level;
+      if (activeCategory !== "all" && entry.category !== activeCategory) return false;
+      if (activeLevel !== "all" && level !== activeLevel) return false;
+      if (activeAlertId && !(entry.alert_ids ?? []).includes(activeAlertId)) return false;
+      if (!query) return true;
+      const payloadText = typeof entry.payload === "string"
+        ? entry.payload
+        : JSON.stringify(entry.payload);
+      return (
+        entry.event.toLowerCase().includes(query)
+        || entry.category.toLowerCase().includes(query)
+        || payloadText.toLowerCase().includes(query)
+      );
+    });
+  }, [entriesWithMeta, activeCategory, activeLevel, search, activeAlertId]);
+
+  const groupedEntries = useMemo(() => {
+    const map = new Map<string, TraceEntry[]>();
+    for (const entry of filteredEntries) {
+      const key = runIdKey(entry.run_id);
+      const list = map.get(key) || [];
+      list.push(entry);
+      map.set(key, list);
+    }
+    return Array.from(map.entries());
+  }, [filteredEntries]);
 
   const tabs = useMemo(() => ([
-    { id: "overview" as const, label: "Overview", badge: alertItems.length },
+    { id: "overview" as const, label: "Overview", badge: activeAlerts.length },
     { id: "controls" as const, label: "Controls", badge: 0 },
     { id: "signals" as const, label: "Signals", badge: pendingCount },
     { id: "diagnostics" as const, label: "Diagnostics", badge: keyEvents.length },
     { id: "logs" as const, label: "Logs", badge: errorOpen },
-  ]), [alertItems.length, pendingCount, keyEvents.length, errorOpen]);
+  ]), [activeAlerts.length, pendingCount, keyEvents.length, errorOpen]);
 
   const toggleRun = (key: string) => {
     setCollapsedRuns((prev) => {
@@ -640,8 +1171,70 @@ export const TraceView = ({
     onUpdateSettings(next);
   };
 
-  const togglePin = (key: keyof PinnedPanels) => {
-    setPinnedPanels((prev) => ({ ...prev, [key]: !prev[key] }));
+  const handleRunChange = (nextRunId: string) => {
+    setActiveRunId(nextRunId);
+    setRunSelectionLocked(true);
+    setActiveAlertId(null);
+  };
+
+  const releaseRunLock = () => {
+    setRunSelectionLocked(false);
+    setActiveRunId("all");
+  };
+
+  const handleSaveLens = () => {
+    const label = lensDraft.trim();
+    if (!label) return;
+    const id = typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `lens_${Date.now()}`;
+    const lens: LensPreset = {
+      id,
+      label,
+      runId: activeRunId,
+      category: activeCategory,
+      level: activeLevel,
+      search,
+      alertId: activeAlertId,
+    };
+    setSavedLenses((prev) => [lens, ...prev].slice(0, 12));
+    setLensDraft("");
+  };
+
+  const handleApplyLens = (lens: LensPreset) => {
+    setActiveRunId(lens.runId || "all");
+    setRunSelectionLocked(true);
+    setActiveCategory(lens.category || "all");
+    setActiveLevel(lens.level || "all");
+    setSearch(lens.search || "");
+    setActiveAlertId(lens.alertId ?? null);
+    setActiveTab("logs");
+  };
+
+  const handleDeleteLens = (lensId: string) => {
+    setSavedLenses((prev) => prev.filter((lens) => lens.id !== lensId));
+  };
+
+  const clearFilters = () => {
+    setActiveCategory("all");
+    setActiveLevel("all");
+    setSearch("");
+    setActiveAlertId(null);
+  };
+
+  const handleAlertTrace = (alert: AlertItem) => {
+    setActiveAlertId(alert.id);
+    setActiveCategory("all");
+    setActiveLevel("all");
+    setSearch(alert.relatedEvents[0] ?? "");
+    setActiveTab("logs");
+  };
+
+  const handleJumpToLogEvent = (eventName: string) => {
+    setActiveCategory("all");
+    setActiveLevel("all");
+    setSearch(eventName);
+    setActiveTab("logs");
   };
 
   const renderActivityFlow = () => (
@@ -655,7 +1248,7 @@ export const TraceView = ({
       <div className="flow-metrics">
         {flowStats.map((stat) => (
           <div key={stat.label} className="flow-card">
-            <div className="flow-card-label">{stat.label}</div>
+            <div className="flow-card-label" title={stat.tooltip}>{stat.label}</div>
             <div className="flow-card-value">{stat.value}</div>
             <div className="flow-card-meta">{stat.meta}</div>
           </div>
@@ -680,6 +1273,176 @@ export const TraceView = ({
       </div>
     </section>
   );
+
+  const renderSystemStatus = () => (
+    <section className="cockpit-panel status-panel">
+      <div className="panel-header">
+        <div>
+          <h2>System Status</h2>
+          <p>Critical posture signals and run-level posture.</p>
+        </div>
+      </div>
+      <div className="status-grid">
+        {flowStats.map((stat) => (
+          <div key={stat.label} className="status-card">
+            <div className="status-label" title={stat.tooltip}>{stat.label}</div>
+            <div className="status-value">{stat.value}</div>
+            <div className="status-meta">{stat.meta}</div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+
+  const renderActiveAlerts = () => (
+    <section className="cockpit-panel alert-panel">
+      <div className="panel-header">
+        <div>
+          <h2>Active Alerts</h2>
+          <p>Top issues that need attention right now.</p>
+        </div>
+      </div>
+      {activeAlerts.length === 0 ? (
+        <div className="panel-empty">No active alerts.</div>
+      ) : (
+        <div className="alert-list">
+          {activeAlerts.map((alert) => (
+            <div key={alert.id} className={`alert-row alert-${alert.tone}`}>
+              <div>
+                <strong>{alert.label}</strong>
+                <div className="alert-reason">{alert.reason}</div>
+              </div>
+              <div className="alert-actions">
+                <span className="alert-value">{alert.value}</span>
+                <button className="btn btn-secondary btn-compact" onClick={() => handleAlertTrace(alert)}>
+                  Why
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+
+  const renderDeltaPanel = () => (
+    <section className="cockpit-panel delta-panel">
+      <div className="panel-header">
+        <div>
+          <h2>What Changed</h2>
+          <p>Delta from the previous health snapshot.</p>
+        </div>
+      </div>
+      {deltaItems.length === 0 ? (
+        <div className="panel-empty">No material changes since the last snapshot.</div>
+      ) : (
+        <div className="delta-list">
+          {deltaItems.map((item) => (
+            <div key={item.label} className={`delta-row delta-${item.tone}`}>
+              <span className="delta-label">{item.label}</span>
+              <span className="delta-current">{item.current}</span>
+              <span className="delta-change">{item.delta}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+
+  const renderRunStory = () => (
+    <section className="cockpit-panel run-story-panel">
+      <div className="panel-header">
+        <div>
+          <h2>Run Story</h2>
+          <p>Chronological narrative for the focused run.</p>
+        </div>
+      </div>
+      {runStoryEvents.length === 0 ? (
+        <div className="panel-empty">No run events available yet.</div>
+      ) : (
+        <div className="run-story-list">
+          {runStoryEvents.slice(-14).map((event) => (
+            <div key={event.id} className="run-story-row">
+              <div className="run-story-time">
+                {new Date(event.timestamp).toLocaleTimeString()}
+              </div>
+              <div className="run-story-body">
+                <div className="run-story-title">{event.label}</div>
+                {event.detail && (
+                  <div className="run-story-detail">{event.detail}</div>
+                )}
+              </div>
+              <button
+                className="btn btn-secondary btn-compact"
+                onClick={() => handleJumpToLogEvent(event.event)}
+              >
+                Trace
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+
+  const renderPlayback = () => {
+    if (runStoryEvents.length === 0) {
+      return (
+        <section className="cockpit-panel playback-panel">
+          <div className="panel-header">
+            <div>
+              <h2>Playback</h2>
+              <p>Step through the run timeline.</p>
+            </div>
+          </div>
+          <div className="panel-empty">No run events to play yet.</div>
+        </section>
+      );
+    }
+    const current = runStoryEvents[Math.min(playbackIndex, runStoryEvents.length - 1)];
+    return (
+      <section className="cockpit-panel playback-panel">
+        <div className="panel-header">
+          <div>
+            <h2>Playback</h2>
+            <p>Step through the focused run.</p>
+          </div>
+        </div>
+        <div className="playback-controls">
+          <button
+            className="btn btn-secondary btn-compact"
+            onClick={() => setPlaybackIndex((prev) => Math.max(0, prev - 1))}
+          >
+            Prev
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, runStoryEvents.length - 1)}
+            value={Math.min(playbackIndex, runStoryEvents.length - 1)}
+            onChange={(e) => setPlaybackIndex(Number(e.target.value))}
+          />
+          <button
+            className="btn btn-secondary btn-compact"
+            onClick={() => setPlaybackIndex((prev) => Math.min(runStoryEvents.length - 1, prev + 1))}
+          >
+            Next
+          </button>
+        </div>
+        <div className="playback-card">
+          <div className="playback-title">{current.label}</div>
+          <div className="playback-time">{new Date(current.timestamp).toLocaleTimeString()}</div>
+          <div className="playback-detail">{current.detail || "No detail captured."}</div>
+          <button
+            className="btn btn-secondary btn-compact"
+            onClick={() => handleJumpToLogEvent(current.event)}
+          >
+            Open Logs
+          </button>
+        </div>
+      </section>
+    );
+  };
 
   const renderSkipSummary = () => {
     const items = Object.entries(skipSummary);
@@ -873,13 +1636,37 @@ export const TraceView = ({
           <p>Recent evidence sources and where they are linked.</p>
         </div>
       </div>
+      {decisionTargets.length > 0 && (
+        <div className="evidence-lineage-filters">
+          <label>
+            Decision filter
+            <select
+              className="input evidence-filter-select"
+              value={decisionFilter}
+              onChange={(e) => setDecisionFilter(e.target.value)}
+            >
+              <option value="all">All decisions</option>
+              {decisionTargets.map((target) => (
+                <option key={target.id} value={target.id}>
+                  {target.id} ({target.count})
+                </option>
+              ))}
+            </select>
+          </label>
+          {decisionFilter !== "all" && (
+            <button className="btn btn-secondary btn-compact" onClick={() => setDecisionFilter("all")}>
+              Clear
+            </button>
+          )}
+        </div>
+      )}
       {evidenceLineageError ? (
         <div className="panel-empty">Failed to load evidence lineage.</div>
-      ) : evidenceLineage.length === 0 ? (
+      ) : filteredEvidenceLineage.length === 0 ? (
         <div className="panel-empty">No evidence lineage entries yet.</div>
       ) : (
         <div className="evidence-lineage-list">
-          {evidenceLineage.slice(0, 12).map((entry) => (
+          {filteredEvidenceLineage.slice(0, 12).map((entry) => (
             <div key={entry.source.evidence_id} className="evidence-lineage-row">
               <div className="evidence-lineage-meta">
                 <div className="evidence-lineage-title">
@@ -924,7 +1711,7 @@ export const TraceView = ({
       <div className="snapshot-grid">
         <div className="snapshot-block">
           <h3>Subject Snapshots</h3>
-          {subjectSnapshots.slice(0, 3).map((snap) => {
+          {filteredSubjectSnapshots.slice(0, 3).map((snap) => {
             let ignition = "unknown";
             try {
               const parsed = JSON.parse(snap.subject_state_json) as any;
@@ -940,7 +1727,7 @@ export const TraceView = ({
               </div>
             );
           })}
-          {subjectSnapshots.length === 0 && <div className="snapshot-empty">No snapshots</div>}
+          {filteredSubjectSnapshots.length === 0 && <div className="snapshot-empty">No snapshots</div>}
         </div>
         <div className="snapshot-block">
           <h3>Attention Schema</h3>
@@ -996,14 +1783,14 @@ export const TraceView = ({
         </div>
         <div className="snapshot-block">
           <h3>Gate Decisions</h3>
-          {gateDecisions.slice(0, 3).map((gate) => (
+          {filteredGateDecisions.slice(0, 3).map((gate) => (
             <div key={gate.decision_id} className="snapshot-row">
               <span>{shortHash(gate.decision_id)}</span>
               <span>{gate.decision}</span>
               <span>{gate.created_at}</span>
             </div>
           ))}
-          {gateDecisions.length === 0 && <div className="snapshot-empty">No gate decisions</div>}
+          {filteredGateDecisions.length === 0 && <div className="snapshot-empty">No gate decisions</div>}
         </div>
         <div className="snapshot-block">
           <h3>Introspection</h3>
@@ -1076,6 +1863,178 @@ export const TraceView = ({
     </section>
   );
 
+  const formatPayloadValue = (value: unknown) => {
+    if (value === null || value === undefined) return "--";
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const formatPreviewValue = (value: unknown) => {
+    if (typeof value === "string") return truncate(value, 180);
+    if (Array.isArray(value)) {
+      return value.length === 0 ? "0 items" : `${value.length} items`;
+    }
+    return formatPayloadValue(value);
+  };
+
+  const buildRows = (rows: Array<[string, unknown]>) =>
+    rows
+      .filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .map(([key, value]) => ({ key, value }));
+
+  const renderRows = (rows: { key: string; value: unknown }[]) => (
+    <div className="trace-payload-grid trace-payload-typed">
+      {rows.map((row) => (
+        <div key={row.key} className="trace-payload-row">
+          <span className="trace-payload-key">{row.key}</span>
+          <span className="trace-payload-value">{formatPreviewValue(row.value)}</span>
+        </div>
+      ))}
+    </div>
+  );
+
+  const renderTypedPayload = (entry: TraceEntry) => {
+    if (typeof entry.payload !== "object" || entry.payload === null) return null;
+    const payload = entry.payload as Record<string, any>;
+    switch (entry.event) {
+      case "decision_report": {
+        const anchorHits = Array.isArray(payload.anchor_hits) ? payload.anchor_hits.length : payload.anchor_hits;
+        const rows = buildRows([
+          ["Decision", payload.decision],
+          ["Selected action", payload.selected_action],
+          ["Selected kind", payload.selected_kind],
+          ["Gate decision", payload.gate_decision],
+          ["Rationale", typeof payload.rationale === "string" ? truncate(payload.rationale, 180) : payload.rationale],
+          ["Anchor hits", anchorHits],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "gate_decision": {
+        const reasonList = Array.isArray(payload.gate_reasons)
+          ? payload.gate_reasons.slice(0, 3).join(", ")
+          : payload.gate_reasons;
+        const rows = buildRows([
+          ["Enforced decision", payload.enforced_decision ?? payload.decision],
+          ["Soft decision", payload.soft_decision],
+          ["Verify rate", typeof payload.verify_rate === "number" ? `${Math.round(payload.verify_rate * 100)}%` : payload.verify_rate],
+          ["Gate reasons", reasonList],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "gate_decision_inputs": {
+        const reasonList = Array.isArray(payload.gate_reasons)
+          ? payload.gate_reasons.slice(0, 3).join(", ")
+          : payload.gate_reasons;
+        const signalList = payload.signals && typeof payload.signals === "object" && !Array.isArray(payload.signals)
+          ? Object.keys(payload.signals).slice(0, 4).join(", ")
+          : Array.isArray(payload.signals)
+            ? payload.signals.slice(0, 4).join(", ")
+            : payload.signals;
+        const rows = buildRows([
+          ["Enforced decision", payload.enforced_decision],
+          ["Soft decision", payload.soft_decision],
+          ["Legacy decision", payload.legacy_decision],
+          ["Gate reasons", reasonList],
+          ["Signals", signalList],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "tool_dispatch": {
+        const rows = buildRows([
+          ["Tool", payload.tool_name],
+          ["Action ID", payload.action_id],
+          ["Status", payload.status],
+          ["Duration ms", payload.duration_ms],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "tool_dispatch_failed": {
+        const rows = buildRows([
+          ["Tool", payload.tool_name],
+          ["Action ID", payload.action_id],
+          ["Error", payload.error],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "memory_pass_result": {
+        const factsCount = Array.isArray(payload.facts) ? payload.facts.length : payload.facts;
+        const relationsCount = Array.isArray(payload.relations) ? payload.relations.length : payload.relations;
+        const rows = buildRows([
+          ["Write count", payload.write_count],
+          ["Facts", factsCount],
+          ["Relations", relationsCount],
+          ["Scope", payload.scope],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "memory_pass_invalid_output": {
+        const rows = buildRows([
+          ["Reason", payload.reason],
+          ["Model", payload.model],
+          ["Request label", payload.request_label],
+          ["Raw snippet", payload.raw_snippet ? truncate(String(payload.raw_snippet), 160) : payload.raw_snippet],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "memory_write_blocked": {
+        const rows = buildRows([
+          ["Reason", payload.reason],
+          ["Candidate kind", payload.candidate_kind],
+          ["Candidate id", payload.candidate_id],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "response_reasoning_json_invalid": {
+        const rows = buildRows([
+          ["Request label", payload.request_label],
+          ["Reason", payload.reason],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      case "monologue_parse_failed": {
+        const rows = buildRows([
+          ["Reason", payload.reason],
+          ["Cooldown until", payload.cooldown_until],
+        ]);
+        return rows.length > 0 ? renderRows(rows) : null;
+      }
+      default:
+        return null;
+    }
+  };
+
+  const renderPayloadPreview = (entry: TraceEntry) => {
+    const typed = renderTypedPayload(entry);
+    if (typed) return typed;
+    if (typeof entry.payload !== "object" || entry.payload === null) {
+      return <pre className="trace-payload-raw">{formatPayloadValue(entry.payload)}</pre>;
+    }
+    const payload = entry.payload as Record<string, unknown>;
+    const keys = EVENT_DETAIL_KEYS[entry.event] ?? DEFAULT_DETAIL_KEYS;
+    const rows = keys
+      .filter((key) => payload[key] !== undefined)
+      .map((key) => ({ key, value: payload[key] }));
+    if (rows.length === 0) {
+      return <pre className="trace-payload-raw">{JSON.stringify(payload, null, 2)}</pre>;
+    }
+    return (
+      <div className="trace-payload-grid">
+        {rows.map((row) => (
+          <div key={row.key} className="trace-payload-row">
+            <span className="trace-payload-key">{row.key}</span>
+            <span className="trace-payload-value">{formatPayloadValue(row.value)}</span>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   const renderLogsPanel = () => (
     <section className="cockpit-panel log-panel">
       <div className="panel-header">
@@ -1087,6 +2046,22 @@ export const TraceView = ({
 
       {error && <div className="trace-error-banner">{error}</div>}
       {healthError && <div className="trace-error-banner">{healthError}</div>}
+
+      <div className="trace-meta-bar">
+        <div className="trace-meta-item">
+          Focus run:
+          <strong>{runFilter ? ` ${activeRunId.slice(0, 8)}...` : " All"}</strong>
+        </div>
+        <div className="trace-meta-item">Entries: {filteredEntries.length}</div>
+        {activeAlertId && (
+          <div className="trace-meta-item trace-alert-filter">
+            Alert filter: {activeAlertId}
+            <button className="btn btn-secondary btn-compact" onClick={() => setActiveAlertId(null)}>
+              Clear
+            </button>
+          </div>
+        )}
+      </div>
 
       <div className="trace-controls">
         <div className="trace-filters">
@@ -1119,6 +2094,45 @@ export const TraceView = ({
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
+        <button className="btn btn-secondary btn-compact" onClick={clearFilters}>
+          Clear Filters
+        </button>
+      </div>
+
+      <div className="trace-lenses">
+        <div className="lens-save">
+          <input
+            className="input lens-input"
+            placeholder="Save lens name..."
+            value={lensDraft}
+            onChange={(e) => setLensDraft(e.target.value)}
+          />
+          <button className="btn btn-secondary btn-compact" onClick={handleSaveLens}>
+            Save Lens
+          </button>
+        </div>
+        {savedLenses.length > 0 && (
+          <div className="lens-list">
+            {savedLenses.map((lens) => (
+              <div key={lens.id} className="lens-chip">
+                <button
+                  className="lens-apply"
+                  onClick={() => handleApplyLens(lens)}
+                  title={`Run ${lens.runId || "all"} | ${lens.category}/${lens.level}`}
+                >
+                  {lens.label}
+                </button>
+                <button
+                  className="lens-remove"
+                  onClick={() => handleDeleteLens(lens.id)}
+                  aria-label={`Remove ${lens.label}`}
+                >
+                  x
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="trace-list">
@@ -1137,18 +2151,21 @@ export const TraceView = ({
                 {!collapsed && (
                   <div className="trace-group-entries">
                     {entries.map((entry) => (
-                      <div key={entry.id} className={`trace-entry trace-level-${entry.level}`}>
+                      <div key={entry.id} className={`trace-entry trace-level-${entry.severity ?? entry.level}`}>
                         <div className="trace-entry-meta">
-                          <span className="trace-entry-level">{entry.level}</span>
+                          <span className="trace-entry-level">{entry.severity ?? entry.level}</span>
                           <span className="trace-entry-category">{entry.category}</span>
                           <span className="trace-entry-source">{entry.source}</span>
                           <span className="trace-entry-event">{formatEventLabel(entry.event)}</span>
                           <span className="trace-entry-time">{new Date(entry.timestamp).toLocaleTimeString()}</span>
                         </div>
-                        <details className="trace-entry-payload" open>
-                          <summary>Payload</summary>
-                          <pre>{typeof entry.payload === "string" ? entry.payload : JSON.stringify(entry.payload, null, 2)}</pre>
-                        </details>
+                        <div className="trace-entry-payload">
+                          {renderPayloadPreview(entry)}
+                          <details className="trace-entry-raw">
+                            <summary>Raw JSON</summary>
+                            <pre>{typeof entry.payload === "string" ? entry.payload : JSON.stringify(entry.payload, null, 2)}</pre>
+                          </details>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1215,6 +2232,37 @@ export const TraceView = ({
         </div>
       </div>
 
+      <div className="cockpit-focus">
+        <div className="focus-group">
+          <span className="focus-label">Focus Run</span>
+          <select
+            className="input focus-select"
+            value={activeRunId}
+            onChange={(e) => handleRunChange(e.target.value)}
+          >
+            <option value="all">All runs</option>
+            {runOptions.map((opt) => (
+              <option key={opt.id} value={opt.id}>
+                {opt.label} ({opt.count})
+              </option>
+            ))}
+          </select>
+          {runSelectionLocked && (
+            <button className="btn btn-secondary btn-compact" onClick={releaseRunLock}>
+              Auto
+            </button>
+          )}
+        </div>
+        <div className="focus-group">
+          <span className="focus-label">Run Events</span>
+          <span className="focus-value">{runStoryEvents.length}</span>
+        </div>
+        <div className="focus-group">
+          <span className="focus-label">Alerts</span>
+          <span className="focus-value">{activeAlerts.length}</span>
+        </div>
+      </div>
+
       {healthBanner && !healthBannerDismissed && (
         <div className={`health-banner cockpit-health-banner ${healthBannerCollapsed ? "collapsed" : ""}`}>
           <div className="health-banner-title">
@@ -1272,23 +2320,23 @@ export const TraceView = ({
       <div className="cockpit-rail">
         <div className="cockpit-status-rail">
           <div className="cockpit-rail-card">
-            <div className="rail-label">System Phase</div>
+            <div className="rail-label" title="Current module stage in the active run pipeline.">System Phase</div>
             <div className="rail-value">{statusLabel}</div>
             <div className="rail-meta">{statusDetail}</div>
           </div>
           <div className="cockpit-rail-card">
-            <div className="rail-label">Gate Posture</div>
+            <div className="rail-label" title="Latest gate enforcement decision plus verify rate.">Gate Posture</div>
             <div className="rail-value">{gateDecision}</div>
             <div className="rail-meta">Verify {Math.round(gateVerifyRate * 100)}%</div>
           </div>
           <div className="cockpit-rail-card">
-            <div className="rail-label">Active Alerts</div>
-            {alertItems.length === 0 ? (
+            <div className="rail-label" title="Highest priority issues flagged by health metrics.">Active Alerts</div>
+            {activeAlerts.length === 0 ? (
               <div className="rail-value">None</div>
             ) : (
               <div className="rail-alerts">
-                {alertItems.map((item) => (
-                  <span key={item.label} className={`rail-pill ${item.tone}`}>
+                {activeAlerts.map((item) => (
+                  <span key={item.id} className={`rail-pill ${item.tone}`}>
                     {item.label} {item.value}
                   </span>
                 ))}
@@ -1299,7 +2347,7 @@ export const TraceView = ({
         </div>
 
         <div className="cockpit-recent-rail">
-          <div className="rail-label">Recent Events</div>
+          <div className="rail-label" title="Most recent system log events for this run.">Recent Events</div>
           <div className="recent-events">
             {recentEvents.length === 0 ? (
               <div className="rail-meta">No recent events.</div>
@@ -1333,87 +2381,19 @@ export const TraceView = ({
                 >
                   {overviewExpanded ? "Collapse" : "Expand All"}
                 </button>
-                <button
-                  className={`cockpit-pin-toggle${pinnedPanels.gate ? " active" : ""}`}
-                  onClick={() => togglePin("gate")}
-                  type="button"
-                >
-                  Pin Gate
-                </button>
-                <button
-                  className={`cockpit-pin-toggle${pinnedPanels.organism ? " active" : ""}`}
-                  onClick={() => togglePin("organism")}
-                  type="button"
-                >
-                  Pin Organism
-                </button>
               </div>
             </div>
 
-            <div className="cockpit-hero-grid">
-              <div className="cockpit-panel cockpit-hero-panel">
-                <SystemStatePanel
-                  chatState="idle"
-                  moduleStatus={moduleStatus}
-                  healthSnapshot={systemHealthSnapshot}
-                  healthHistory={systemHealthHistory}
-                />
-              </div>
-              <HealthGatePanel
-                snapshot={systemHealthSnapshot}
-                history={systemHealthHistory}
-                gateInputs={gateInputEvents}
-              />
+            <div className="cockpit-overview-stack">
+              {renderSystemStatus()}
+              {renderActiveAlerts()}
+              {renderDeltaPanel()}
             </div>
 
-            {(pinnedPanels.gate || pinnedPanels.organism) && (
-              <div className="cockpit-pin-grid">
-                {pinnedPanels.gate && (
-                  <section className="cockpit-panel cockpit-pin-card">
-                    <div className="panel-header">
-                      <div>
-                        <h2>Gate Snapshot</h2>
-                        <p>Decision posture and verification trend.</p>
-                      </div>
-                    </div>
-                    <div className="pin-metric">
-                      <span>Decision</span>
-                      <strong>{gateDecision}</strong>
-                    </div>
-                    <div className="pin-metric">
-                      <span>Verify rate</span>
-                      <strong>{Math.round(gateVerifyRate * 100)}%</strong>
-                    </div>
-                    <div className="pin-metric">
-                      <span>Last gate</span>
-                      <strong>{latestGateInput?.timestamp ? new Date(latestGateInput.timestamp).toLocaleTimeString() : "--"}</strong>
-                    </div>
-                  </section>
-                )}
-                {pinnedPanels.organism && (
-                  <section className="cockpit-panel cockpit-pin-card">
-                    <div className="panel-header">
-                      <div>
-                        <h2>Organism Snapshot</h2>
-                        <p>Stress, fatigue, and alignment in focus.</p>
-                      </div>
-                    </div>
-                    <div className="pin-metric">
-                      <span>Stress</span>
-                      <strong>{organismStress.toFixed(2)}</strong>
-                    </div>
-                    <div className="pin-metric">
-                      <span>Confidence</span>
-                      <strong>{Math.round(controllerConfidence * 100)}%</strong>
-                    </div>
-                    <div className="pin-metric">
-                      <span>Pending</span>
-                      <strong>{pendingCount}</strong>
-                    </div>
-                  </section>
-                )}
-              </div>
-            )}
+            <div className="cockpit-overview-grid">
+              {renderRunStory()}
+              {renderPlayback()}
+            </div>
 
             {overviewExpanded && (
               <div className="cockpit-overview-expanded">
@@ -1574,8 +2554,8 @@ export const TraceView = ({
                 {renderSelfReport()}
                 {renderDecisionReports()}
                 <OutcomePanel
-                  messages={messages}
-                  systemLogs={systemLogs}
+                  messages={filteredMessages}
+                  systemLogs={filteredSystemLogs}
                   allowWrites={allowControlWrites}
                 />
                 {renderEvidenceLineage()}
@@ -1589,13 +2569,12 @@ export const TraceView = ({
         {activeTab === "logs" && (
           <section className="cockpit-tab-content">
             <div className="cockpit-section-title">Logs</div>
-            <div className="cockpit-tab-grid">
-              <div className="cockpit-stack">
-                {renderLogsPanel()}
-              </div>
-              <div className="cockpit-stack">
+            <div className="cockpit-stack">
+              {renderLogsPanel()}
+              <details className="deep-inspect">
+                <summary>Deep Inspect</summary>
                 {renderRawPanel()}
-              </div>
+              </details>
             </div>
           </section>
         )}

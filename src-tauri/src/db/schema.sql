@@ -488,6 +488,7 @@ CREATE TABLE IF NOT EXISTS settings (
     injection_policy TEXT NOT NULL DEFAULT 'include',
     request_defaults TEXT, -- JSON
     active_model_id TEXT,
+    json_reliable_model_id TEXT,
     system_prompt TEXT,
     user_display_name TEXT,
     assistant_display_name TEXT,
@@ -551,6 +552,7 @@ CREATE TABLE IF NOT EXISTS settings (
     dream_enabled BOOLEAN NOT NULL DEFAULT 1,
     binding_enforcement_enabled BOOLEAN NOT NULL DEFAULT 1,
     pending_prompt_alignment_enabled BOOLEAN NOT NULL DEFAULT 1,
+    pending_prompt_recency_secs INTEGER NOT NULL DEFAULT 90,
     auto_memory_pass_enabled BOOLEAN NOT NULL DEFAULT 1,
     summary_cohesion_enabled BOOLEAN NOT NULL DEFAULT 1,
     compact_prompt_enabled BOOLEAN NOT NULL DEFAULT 0,
@@ -1446,7 +1448,11 @@ CREATE TABLE IF NOT EXISTS pending_user_prompts (
     expires_at DATETIME,
     auto_surface INTEGER NOT NULL DEFAULT 0,
     intent_kind TEXT,
-    bridge_id TEXT
+    bridge_id TEXT,
+    anchor_message_id TEXT,
+    anchor_hash TEXT,
+    anchor_created_at DATETIME,
+    anchor_role TEXT
 );
 
 CREATE TABLE IF NOT EXISTS deferred_queue (

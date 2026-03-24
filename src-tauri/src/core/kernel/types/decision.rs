@@ -127,6 +127,10 @@ pub struct DecisionReport {
     #[serde(alias = "top_block_reasons")]
     pub top_3_block_reasons: Vec<String>,
     #[serde(default)]
+    pub contract_violation_count: Option<usize>,
+    #[serde(default)]
+    pub contract_violation_rate: Option<f64>,
+    #[serde(default)]
     pub anchor_hits: Option<usize>,
     #[serde(default)]
     pub prompt_tokens_used: Option<usize>,
@@ -191,6 +195,8 @@ impl Default for DecisionReport {
             normalized_stop_reasons: Vec::new(),
             blocked_candidates_count: 0,
             top_3_block_reasons: Vec::new(),
+            contract_violation_count: None,
+            contract_violation_rate: None,
             anchor_hits: None,
             prompt_tokens_used: None,
             tier_trim_summary: None,

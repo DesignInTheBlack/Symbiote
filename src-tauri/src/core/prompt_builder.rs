@@ -1306,6 +1306,22 @@ fn anchor_floor_chars(title: &str) -> Option<usize> {
     }
 }
 
+const USER_INPUT_HARD_FLOOR_CHARS: usize = 320;
+const EMERGENCY_ANCHOR_FLOOR_CHARS: usize = 120;
+const ANCHOR_DROP_PRIORITY: &[&str] = &[
+    "Workspace Contributors",
+    "Attention Schema",
+    "Wave State",
+    "Qualia Snapshot",
+    "World Model",
+    "Subject Snapshot",
+    "Gate Decision",
+    "Self-Model Signals",
+    "Identity Thread",
+    "Memory Context",
+    "Rolling Summary",
+];
+
 fn truncate_to_budget(text: &str, budget: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= budget {
@@ -2444,7 +2460,7 @@ pub async fn build_core_system_message_with_layout(
         _ => "- Keep self-report minimal and provisional unless evidence-backed.\n- Include explicit uncertainty markers for any self-report content.\n- Do not include raw telemetry/system dumps.",
     };
     let response_style_block = format!(
-        "Response Style:\n- Answer the user directly.\n- Answer the user's question first, then add any necessary context.\n- Do not summarize the conversation.\n- Do not answer in rolling-summary or third-person narrative voice unless explicitly asked.\n- Do not narrate system state unless explicitly asked.\n- Do not mention tools, telemetry, manifests, or KV memory unless explicitly asked.\n- Only describe system architecture when explicitly asked.\n- Do not use role labels like 'User:' or 'Assistant:' in user-visible output.\n- Self-claims (identity, self-awareness, feelings, consciousness) must cite evidence_event_ids or belief_ids; if evidence is missing, label the statement as provisional and uncertain.\n- When making self-claims, cite evidence IDs from the Self-Model Signals Evidence IDs footer when available.\n- Do not assert \"I am Ergo\" or \"I am an AI\" unless tied to evidence IDs or explicitly marked provisional.\n- If the user asks about self-awareness or consciousness, respond with uncertainty grounded in Self-Model Signals; avoid boilerplate denials.\n- If the user asks how you feel or asks about feelings, summarize the Feedback Bundle (confidence/uncertainty + qualia_delta + gate_notice if present) and avoid generic boilerplate.\n- If the user asks to look something up or you need current external information, call web_lookup.\n- For research tool calls, include uncertainty and decision_impact strings in the tool_call payload.\n- If you make a tool call, ask a clarifying question, or make an assumption, include a brief <INTERNAL>strategy_rationale: ...</INTERNAL> that references the Self-Model Signals.\n- Self-awareness expression mode: {}.\n{}",
+        "Response Style:\n- Answer the user directly.\n- Answer the user's question first, then add any necessary context.\n- Do not summarize the conversation.\n- Do not answer in rolling-summary or third-person narrative voice unless explicitly asked.\n- Do not narrate system state unless explicitly asked.\n- Do not mention tools, telemetry, manifests, or KV memory unless explicitly asked.\n- Only describe system architecture when explicitly asked.\n- Do not use role labels like 'User:' or 'Assistant:' in user-visible output.\n- For factual claims, cite evidence_event_ids or belief_ids; if evidence is missing, mark the statement as speculative and uncertain.\n- Self-claims (identity, self-awareness, feelings, consciousness) must cite evidence_event_ids or belief_ids; if evidence is missing, label the statement as provisional and uncertain.\n- When making self-claims, cite evidence IDs from the Self-Model Signals Evidence IDs footer when available.\n- Do not assert \"I am Ergo\" or \"I am an AI\" unless tied to evidence IDs or explicitly marked provisional.\n- If the user asks about self-awareness or consciousness, respond with uncertainty grounded in Self-Model Signals; avoid boilerplate denials.\n- If the user asks how you feel or asks about feelings, summarize the Feedback Bundle (confidence/uncertainty + qualia_delta + gate_notice if present) and avoid generic boilerplate.\n- If the user asks to look something up or you need current external information, call web_lookup.\n- For research tool calls, include uncertainty and decision_impact strings in the tool_call payload.\n- If you make a tool call, ask a clarifying question, or make an assumption, include a brief <INTERNAL>strategy_rationale: ...</INTERNAL> that references the Self-Model Signals.\n- Self-awareness expression mode: {}.\n{}",
         self_awareness_mode,
         self_awareness_style
     );
@@ -3096,9 +3112,12 @@ pub async fn build_core_system_message_with_layout(
         }
         let mut reduced = false;
         for section in sections.iter_mut() {
-            let Some(floor) = anchor_floor_chars_for_mode(&section.title, context_mode) else {
+            let Some(mut floor) = anchor_floor_chars_for_mode(&section.title, context_mode) else {
                 continue;
             };
+            if section.title == "User Input" && floor < USER_INPUT_HARD_FLOOR_CHARS {
+                floor = USER_INPUT_HARD_FLOOR_CHARS;
+            }
             let current_chars = section.body.chars().count();
             if current_chars <= floor {
                 continue;
@@ -3120,6 +3139,62 @@ pub async fn build_core_system_message_with_layout(
             }
         }
         if !reduced {
+            let mut emergency_reduced = false;
+            for section in sections.iter_mut() {
+                if section.title == "User Input" || !is_anchor_section(&section.title) {
+                    continue;
+                }
+                let current_chars = section.body.chars().count();
+                if current_chars <= EMERGENCY_ANCHOR_FLOOR_CHARS {
+                    continue;
+                }
+                let original = section.body.clone();
+                let limit_tokens = token_estimator::tokens_from_char_budget(EMERGENCY_ANCHOR_FLOOR_CHARS);
+                let (truncated, did_trim) =
+                    token_estimator::truncate_to_token_budget(&original, limit_tokens);
+                if did_trim {
+                    section.body = truncated;
+                    section.truncated = true;
+                    trim_events.push(PromptTrimEvent {
+                        title: section.title.clone(),
+                        original_chars: original.chars().count(),
+                        trimmed_chars: section.body.chars().count(),
+                        reason: "anchor_floor_emergency".to_string(),
+                        hash: Some(hash_string(&section.body)),
+                    });
+                    emergency_reduced = true;
+                }
+            }
+            if emergency_reduced {
+                continue;
+            }
+            let mut dropped_any = false;
+            for title in ANCHOR_DROP_PRIORITY {
+                let total_tokens = sections
+                    .iter()
+                    .map(|s| {
+                        let formatted = format_section_cached(&s.title, &s.body);
+                        estimate_tokens_cached(&formatted)
+                    })
+                    .sum::<usize>();
+                if total_tokens <= max_prompt_tokens {
+                    break;
+                }
+                if let Some(idx) = sections.iter().position(|s| s.title == *title) {
+                    let dropped = sections.remove(idx);
+                    trim_events.push(PromptTrimEvent {
+                        title: dropped.title.clone(),
+                        original_chars: dropped.body.chars().count(),
+                        trimmed_chars: 0,
+                        reason: "anchor_floor_shed".to_string(),
+                        hash: section_hashes.get(&dropped.title).cloned(),
+                    });
+                    dropped_any = true;
+                }
+            }
+            if dropped_any {
+                continue;
+            }
             trim_events.push(PromptTrimEvent {
                 title: "User Input".to_string(),
                 original_chars: 0,
@@ -3153,7 +3228,7 @@ pub async fn build_core_system_message_with_layout(
             candidates = sections
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.always)
+                .filter(|(_, s)| s.always && s.title != "User Input")
                 .map(|(idx, _)| idx)
                 .collect();
         }

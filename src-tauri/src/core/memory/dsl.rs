@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use regex::Regex;
 use once_cell::sync::Lazy;
 use chrono::{DateTime, Duration, Utc};
@@ -89,7 +90,7 @@ pub fn is_dsl_line(line: &str) -> bool {
     parse_line(trimmed).is_ok()
 }
 
-fn parse_line(line: &str) -> Result<DslStatement, String> {
+pub(crate) fn parse_line(line: &str) -> Result<DslStatement, String> {
     let line = normalize_relation_prefix(line);
     // 1. Check for Relation: explicit "name(" pattern
     if let Some(caps) = REL_PATTERN.captures(line.as_str()) {
@@ -683,6 +684,418 @@ fn strip_quotes_with_flag(s: &str) -> (String, bool) {
     }
 }
 
+fn strip_code_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+    let mut lines = trimmed.lines();
+    let _first = lines.next();
+    let rest = lines.collect::<Vec<_>>().join("\n");
+    if let Some(end_idx) = rest.rfind("```") {
+        return rest[..end_idx].trim().to_string();
+    }
+    rest.trim().to_string()
+}
+
+fn extract_first_json_value(raw: &str) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escape = false;
+    for (idx, ch) in raw.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => {
+                if stack.is_empty() {
+                    start = Some(idx);
+                }
+                stack.push(ch);
+            }
+            '}' | ']' => {
+                if let Some(open) = stack.pop() {
+                    if (open == '{' && ch != '}') || (open == '[' && ch != ']') {
+                        continue;
+                    }
+                    if stack.is_empty() {
+                        let s = start?;
+                        return Some(raw[s..=idx].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_json_value(raw: &str) -> Option<Value> {
+    let cleaned = strip_code_fence(raw);
+    if cleaned.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(&cleaned) {
+        return Some(value);
+    }
+    let snippet = extract_first_json_value(&cleaned)?;
+    serde_json::from_str::<Value>(&snippet).ok()
+}
+
+fn escape_quotes(raw: &str) -> String {
+    raw.replace('"', "\\\"")
+}
+
+fn needs_quotes(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed.chars().any(|ch| {
+        ch.is_whitespace()
+            || matches!(ch, '~' | '^' | '@' | '<' | '!' | ',' | '(' | ')' | ':')
+    })
+}
+
+fn format_ref(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('$') || trimmed.starts_with('#') {
+        return trimmed.to_string();
+    }
+    if needs_quotes(trimmed) {
+        format!("\"{}\"", escape_quotes(trimmed))
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn format_fact_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if needs_quotes(trimmed) {
+        format!("\"{}\"", escape_quotes(trimmed))
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn format_confidence(val: f64) -> String {
+    let mut normalized = val;
+    if normalized > 1.0 && normalized <= 100.0 {
+        normalized /= 100.0;
+    }
+    let clamped = normalized.clamp(0.0, 1.0);
+    let mut out = format!("{:.2}", clamped);
+    while out.contains('.') && out.ends_with('0') {
+        out.pop();
+    }
+    if out.ends_with('.') {
+        out.pop();
+    }
+    out
+}
+
+fn format_modifier_tokens(
+    certainty: Option<f64>,
+    time_expr: Option<String>,
+    scope_expr: Option<String>,
+    source_ref: Option<String>,
+    polarity: Option<String>,
+    polarity_bool: Option<bool>,
+) -> String {
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(certainty) = certainty {
+        if certainty.is_finite() {
+            tokens.push(format!("~{}", format_confidence(certainty)));
+        }
+    }
+    if let Some(time) = time_expr {
+        let t = time.trim();
+        if !t.is_empty() {
+            if t.starts_with('^') {
+                tokens.push(t.to_string());
+            } else {
+                tokens.push(format!("^{}", t));
+            }
+        }
+    }
+    if let Some(scope) = scope_expr {
+        let s = scope.trim();
+        if !s.is_empty() {
+            if s.starts_with('@') {
+                tokens.push(s.to_string());
+            } else {
+                tokens.push(format!("@{}", s));
+            }
+        }
+    }
+    if let Some(source) = source_ref {
+        let s = source.trim();
+        if !s.is_empty() {
+            if s.starts_with('<') && s.ends_with('>') {
+                tokens.push(s.to_string());
+            } else {
+                tokens.push(format!("<{}>", s));
+            }
+        }
+    }
+    let mut deny = false;
+    if let Some(polarity) = polarity {
+        let lower = polarity.trim().to_lowercase();
+        if lower == "deny" || lower == "false" || lower == "negate" || lower == "negative" {
+            deny = true;
+        }
+    }
+    if let Some(polarity_bool) = polarity_bool {
+        if !polarity_bool {
+            deny = true;
+        }
+    }
+    if deny {
+        tokens.push("!".to_string());
+    }
+    if tokens.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", tokens.join(" "))
+    }
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn participants_from_value(value: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Value::Object(obj) = item {
+                    let role = obj
+                        .get("role")
+                        .or_else(|| obj.get("slot"))
+                        .and_then(value_as_string)
+                        .unwrap_or_default();
+                    let reference = obj
+                        .get("ref")
+                        .or_else(|| obj.get("value"))
+                        .or_else(|| obj.get("entity"))
+                        .and_then(value_as_string)
+                        .unwrap_or_default();
+                    if !role.trim().is_empty() && !reference.trim().is_empty() {
+                        out.push((role.trim().to_string(), reference.trim().to_string()));
+                    }
+                }
+            }
+        }
+        Value::Object(obj) => {
+            for (role, value) in obj {
+                if let Some(reference) = value_as_string(value) {
+                    let role_trimmed = role.trim();
+                    let reference_trimmed = reference.trim();
+                    if !role_trimmed.is_empty() && !reference_trimmed.is_empty() {
+                        out.push((role_trimmed.to_string(), reference_trimmed.to_string()));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn build_fact_line(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let subject = obj
+        .get("subject")
+        .or_else(|| obj.get("entity"))
+        .or_else(|| obj.get("ref"))
+        .and_then(value_as_string)?;
+    let key = obj.get("key").and_then(value_as_string)?;
+    let value = obj.get("value").and_then(value_as_string)?;
+    if subject.trim().is_empty() || key.trim().is_empty() || value.trim().is_empty() {
+        return None;
+    }
+    let certainty = obj
+        .get("certainty")
+        .or_else(|| obj.get("confidence"))
+        .and_then(|v| v.as_f64());
+    let time_expr = obj.get("time").and_then(value_as_string);
+    let scope_expr = obj.get("scope").and_then(value_as_string);
+    let source_ref = obj.get("source").and_then(value_as_string);
+    let polarity = obj.get("polarity").and_then(value_as_string);
+    let polarity_bool = obj.get("assert").and_then(|v| v.as_bool());
+    let modifiers = format_modifier_tokens(certainty, time_expr, scope_expr, source_ref, polarity, polarity_bool);
+    Some(format!(
+        "{}:{} = {}{}",
+        format_ref(&subject),
+        key.trim(),
+        format_fact_value(&value),
+        modifiers
+    ))
+}
+
+fn build_rel_line(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let rel_type = obj
+        .get("rel_type")
+        .or_else(|| obj.get("relation"))
+        .or_else(|| obj.get("type"))
+        .or_else(|| obj.get("kind"))
+        .and_then(value_as_string)?;
+    let participants_val = obj
+        .get("participants")
+        .or_else(|| obj.get("args"))
+        .or_else(|| obj.get("roles"))?;
+    let participants = participants_from_value(participants_val);
+    if participants.len() < 2 {
+        return None;
+    }
+    let certainty = obj
+        .get("certainty")
+        .or_else(|| obj.get("confidence"))
+        .and_then(|v| v.as_f64());
+    let time_expr = obj.get("time").and_then(value_as_string);
+    let scope_expr = obj.get("scope").and_then(value_as_string);
+    let source_ref = obj.get("source").and_then(value_as_string);
+    let polarity = obj.get("polarity").and_then(value_as_string);
+    let polarity_bool = obj.get("assert").and_then(|v| v.as_bool());
+    let direction = obj
+        .get("direction")
+        .and_then(value_as_string)
+        .map(|s| s.to_lowercase());
+    let modifiers = format_modifier_tokens(certainty, time_expr, scope_expr, source_ref, polarity, polarity_bool);
+    let rendered = if participants.len() == 2 && direction.as_deref().is_some() {
+        let token = match direction.as_deref().unwrap_or("") {
+            "bidirectional" | "<->" | "both" => "<->",
+            "directed" | "->" | "forward" => "->",
+            _ => "",
+        };
+        if !token.is_empty() {
+            format!(
+                "{}({}: {} {} {}: {}){}",
+                rel_type.trim(),
+                participants[0].0,
+                format_ref(&participants[0].1),
+                token,
+                participants[1].0,
+                format_ref(&participants[1].1),
+                modifiers
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        let args = participants
+            .iter()
+            .map(|(role, reference)| format!("{}: {}", role, format_ref(reference)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}({}){}", rel_type.trim(), args, modifiers)
+    };
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+fn statements_from_value(value: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let handle_statement_obj = |obj: &serde_json::Map<String, Value>, lines: &mut Vec<String>| {
+        let kind = obj
+            .get("type")
+            .or_else(|| obj.get("kind"))
+            .and_then(value_as_string)
+            .unwrap_or_default()
+            .to_lowercase();
+        if kind == "relation" || kind == "rel" {
+            if let Some(line) = build_rel_line(obj) {
+                lines.push(line);
+                return;
+            }
+        }
+        if kind == "fact" {
+            if let Some(line) = build_fact_line(obj) {
+                lines.push(line);
+                return;
+            }
+        }
+        if obj.get("rel_type").is_some() || obj.get("participants").is_some() {
+            if let Some(line) = build_rel_line(obj) {
+                lines.push(line);
+                return;
+            }
+        }
+        if obj.get("key").is_some() && obj.get("value").is_some() {
+            if let Some(line) = build_fact_line(obj) {
+                lines.push(line);
+            }
+        }
+    };
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Value::Object(obj) = item {
+                    handle_statement_obj(obj, &mut lines);
+                }
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(statements) = obj.get("statements").and_then(|v| v.as_array()) {
+                for item in statements {
+                    if let Value::Object(obj) = item {
+                        handle_statement_obj(obj, &mut lines);
+                    }
+                }
+            }
+            if let Some(facts) = obj.get("facts").and_then(|v| v.as_array()) {
+                for item in facts {
+                    if let Value::Object(obj) = item {
+                        if let Some(line) = build_fact_line(obj) {
+                            lines.push(line);
+                        }
+                    }
+                }
+            }
+            if let Some(rels) = obj.get("relations").and_then(|v| v.as_array()) {
+                for item in rels {
+                    if let Value::Object(obj) = item {
+                        if let Some(line) = build_rel_line(obj) {
+                            lines.push(line);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    lines
+}
+
+pub(crate) fn memory_json_to_dsl(raw: &str) -> Option<String> {
+    let value = parse_json_value(raw)?;
+    let lines = statements_from_value(&value);
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +1261,34 @@ mod tests {
         } else {
             panic!("Expected Rel");
         }
+    }
+
+    #[test]
+    fn test_parse_rel_directed_with_modifiers() {
+        let input = "owns(owner: #Jane Doe -> item: #Acme Rocket) ~0.9 ^2025-01-01 @global <http://example.com> !deny";
+        let res = parse_line(input).unwrap();
+        if let DslStatement::Rel(r) = res {
+            assert_eq!(r.rel_type, "owns");
+            assert_eq!(r.direction, Some(RelDirection::Directed));
+            assert_eq!(r.certainty, Some(0.9));
+            assert_eq!(r.scope_expr, Some("global".to_string()));
+            assert_eq!(r.source_ref, Some("http://example.com".to_string()));
+            assert_eq!(r.polarity, "deny");
+            let time_expr = r.time_expr.expect("time expr");
+            assert_eq!(time_expr.value, "2025-01-01");
+        } else {
+            panic!("Expected Rel");
+        }
+    }
+
+    #[test]
+    fn test_memory_json_to_dsl_basic() {
+        let raw = r##"{"facts":[{"subject":"$user","key":"father_name","value":"David","certainty":0.9}],"relations":[{"rel_type":"parent_of","participants":[{"role":"parent","ref":"#David"},{"role":"child","ref":"$user"}],"direction":"directed","certainty":0.8}]}"##;
+        let dsl = memory_json_to_dsl(raw).expect("dsl");
+        assert!(dsl.contains("$user:father_name"));
+        assert!(dsl.contains("parent_of"));
+        assert!(dsl.contains("parent: #David"));
+        assert!(dsl.contains("child: $user"));
     }
 
     #[test]

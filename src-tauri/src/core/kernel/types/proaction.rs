@@ -141,6 +141,14 @@ pub struct PendingPromptSelection {
     #[allow(dead_code)]
     pub last_asked_at: Option<String>,
     pub expires_at: Option<String>,
+    pub anchor_message_id: Option<String>,
+    #[allow(dead_code)]
+    pub anchor_hash: Option<String>,
+    #[allow(dead_code)]
+    pub anchor_created_at: Option<String>,
+    #[allow(dead_code)]
+    pub anchor_role: Option<String>,
+    pub anchor_age_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

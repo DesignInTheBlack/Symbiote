@@ -512,7 +512,7 @@ pub(crate) async fn deliver_pending_prompt(
     app_handle: &AppHandle,
     prompt_id: &str,
 ) -> Result<(), String> {
-    let Some((pending_id, prompt, source, conversation_id, _created_at, _skip_count, auto_surface, intent_kind, bridge_id, _attempt_count, _last_asked_at, _expires_at)) = db
+    let Some((pending_id, prompt, source, conversation_id, _created_at, _skip_count, auto_surface, intent_kind, bridge_id, _attempt_count, _last_asked_at, _expires_at, _anchor_message_id, _anchor_hash, _anchor_created_at, _anchor_role)) = db
         .get_pending_prompt_by_id(prompt_id)
         .await
         .map_err(|e| e.to_string())?
