@@ -997,6 +997,9 @@ mod tests {
                 last_reflection_at: None,
                 internal_state_summary: serde_json::json!({}),
                 internal_state_map_version: None,
+                unified_state: serde_json::json!({}),
+                unified_state_evidence: serde_json::json!({}),
+                unified_state_updated_at: None,
                 goals: Vec::new(),
                 calibration: CalibrationKnobs {
                     introspection_verbosity: 0.5,

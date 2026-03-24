@@ -17,6 +17,7 @@ pub(crate) struct AutoMemoryDecision {
     pub trigger: bool,
     pub score: f32,
     pub ambiguity: bool,
+    #[allow(dead_code)]
     pub reasons: Vec<String>,
 }
 

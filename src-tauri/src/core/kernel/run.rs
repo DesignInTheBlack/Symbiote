@@ -191,6 +191,76 @@ pub(crate) fn unwrap_primary_response_message(raw: &str) -> Option<String> {
     parse_primary_response_packet(raw).and_then(|packet| packet.message)
 }
 
+fn strip_internal_leak_tags(content: &str) -> (String, bool) {
+    if content.trim().is_empty() {
+        return (content.to_string(), false);
+    }
+    let mut changed = false;
+    let mut cleaned_lines = Vec::new();
+    for line in content.lines() {
+        let mut current = line.trim_start();
+        let mut modified = false;
+        loop {
+            let lower = current.to_lowercase();
+            if lower.starts_with("unverified") {
+                current = current.get("unverified".len()..).unwrap_or("").trim_start();
+                current = current.trim_start_matches([':', '-', ' ']);
+                modified = true;
+                continue;
+            }
+            if lower.starts_with("working hypothesis") {
+                current = current.get("working hypothesis".len()..).unwrap_or("").trim_start();
+                current = current.trim_start_matches([':', '-', ' ']);
+                modified = true;
+                continue;
+            }
+            if lower.starts_with("user:") {
+                current = current.get("user:".len()..).unwrap_or("").trim_start();
+                modified = true;
+                continue;
+            }
+            if lower.starts_with("assistant:") {
+                current = current.get("assistant:".len()..).unwrap_or("").trim_start();
+                modified = true;
+                continue;
+            }
+            if lower.starts_with("system:") {
+                current = current.get("system:".len()..).unwrap_or("").trim_start();
+                modified = true;
+                continue;
+            }
+            break;
+        }
+        if modified {
+            changed = true;
+        }
+        let final_line = current.trim_end();
+        if final_line.is_empty() {
+            continue;
+        }
+        cleaned_lines.push(final_line.to_string());
+    }
+    let cleaned = cleaned_lines.join("\n");
+    if changed {
+        (cleaned, true)
+    } else {
+        (content.to_string(), false)
+    }
+}
+
+fn has_categorical_consciousness_claim(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    let patterns = [
+        "i am conscious",
+        "i am self-aware",
+        "i am sentient",
+        "i have subjective experience",
+        "i experience consciousness",
+        "i am experiencing consciousness",
+    ];
+    patterns.iter().any(|p| lower.contains(p))
+}
+
 fn looks_like_question(prompt: &str) -> bool {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
@@ -4030,6 +4100,30 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 }
             }
 
+            let (sanitized, stripped) = strip_internal_leak_tags(&response_content);
+            if stripped {
+                let original_len = response_content.len();
+                response_content = sanitized;
+                response_content_no_tags = response_content.clone();
+                response_meta.content = response_content.clone();
+                response_meta.content_no_tags = response_content_no_tags.clone();
+                response_meta.raw_content = response_content.clone();
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "kernel",
+                    Some(&run_id),
+                    Some(&trace_id),
+                    json!({
+                        "event": "internal_leak_stripped",
+                        "original_len": original_len,
+                        "sanitized_len": response_content.len(),
+                    }),
+                )
+                .await;
+            }
+
             if self_audit_ambiguous && ask_override.is_none() {
                 let suggestion =
                     "If you want a self-audit dump, say “run a self-audit.” Otherwise I’ll answer normally.";
@@ -5392,6 +5486,31 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 }),
             )
             .await;
+
+            if self_awareness_query {
+                let mode = settings
+                    .self_awareness_expression_mode
+                    .as_deref()
+                    .unwrap_or("conservative");
+                let self_report_used = response_content.contains("Self-Report Summary:")
+                    || response_content.contains("Operational status:");
+                let categorical_claim = has_categorical_consciousness_claim(&response_content);
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "kernel",
+                    Some(&run_id),
+                    Some(&trace_id),
+                    json!({
+                        "event": "self_awareness_response",
+                        "mode": mode,
+                        "self_report_format_used": self_report_used,
+                        "categorical_consciousness_claim": categorical_claim,
+                    }),
+                )
+                .await;
+            }
 
             break;
         }
@@ -13063,6 +13182,7 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 "primary_prompt_hash": prompt_build.primary_prompt_hash,
                 "memory_prompt_hash": prompt_build.memory_prompt_hash,
                 "canonical_primary_hash": prompt_build.canonical_primary_hash,
+                "policy_canon_hash": prompt_build.policy_canon_hash,
                 "override_active": prompt_build.override_active,
                 "override_mismatch": prompt_build.override_mismatch,
                 "section_hashes": prompt_build.section_hashes,
@@ -14917,7 +15037,7 @@ Rules:
 - If nothing comes to mind, set done=true with empty message.
 - If the Anchor status is weak, keep the message speculative or ask a single clarifying question.
 - If you include descriptors, use the allowed list: [focus, uncertainty, urgency, confidence, curiosity, tension, clarity, calm].
-- Descriptors reflect observable internal state. Do not overclaim subjective experience. Do not deny it either. Report operational state only.
+- Descriptors reflect observable internal state. Do not assert or deny subjective experience. Report operational signals and uncertainty only.
 - Do not include telemetry, tool manifests, KV memory, timestamps, prompt hashes, or diagnostics in your message.
 - Do not include meta-format instructions about JSON or schemas (e.g., "We need to output a JSON object").
 "#
@@ -14955,7 +15075,7 @@ Rules:
 - If you have a concrete suggestion for the user, include an emit_message, ask_user_question, or flag_for_human candidate with the actual text (no meta-permission questions).
 - If you emit_message or flag_for_human with factual claims, include evidence_event_ids or belief_ids. If you cannot, set speculative=true.
 - If you include descriptors, use the allowed list: [focus, uncertainty, urgency, confidence, curiosity, tension, clarity, calm].
-- Descriptors reflect observable internal state. Do not overclaim subjective experience. Do not deny it either. Report operational state only.
+- Descriptors reflect observable internal state. Do not assert or deny subjective experience. Report operational signals and uncertainty only.
 - Do not include telemetry, tool manifests, KV memory, timestamps, prompt hashes, or diagnostics in your message or candidate payloads.
 - Do not include meta-format instructions about JSON or schemas (e.g., "We need to output a JSON object").
 

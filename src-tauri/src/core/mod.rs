@@ -195,6 +195,7 @@ async fn allow_empty_response_fallback(db: &Db, run_id: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn workspace_token_set(workspace: &WorkspaceState) -> HashSet<String> {
     let mut combined = String::new();
     if let Some(focus) = workspace.current_focus.as_deref() {
@@ -213,6 +214,7 @@ fn workspace_token_set(workspace: &WorkspaceState) -> HashSet<String> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn prompt_age_seconds(created_at: &str) -> Option<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(created_at) {
         let now = Utc::now();

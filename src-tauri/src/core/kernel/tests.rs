@@ -1,4 +1,5 @@
     use super::*;
+    use super::run::unwrap_primary_response_message;
     use chrono::{Duration as ChronoDuration, Utc};
     use crate::core::memory::inject_context::{enforce_trailing_system_tags, strip_system_tags};
     use crate::core::memory::dsl::{FactStmt, Ref};
@@ -38,6 +39,7 @@
             embedding_model: None,
             user_display_name: None,
             assistant_display_name: None,
+            onboarding_completed: None,
             ui_theme: None,
             episodic_enabled: None,
             episodic_injection_enabled: None,
@@ -816,7 +818,12 @@
         .await
         .expect("insert active run");
 
-        let candidate = make_candidate("cand_1", CandidateKind::AskUserQuestion, json!({ "question": "Hello?" }));
+        let candidate = make_candidate_with(
+            "cand_1",
+            CandidateKind::AskUserQuestion,
+            json!({ "question": "Hello?" }),
+            1,
+        );
         let decision = KernelDecision {
             accepted: vec![candidate.clone()],
             rejected: Vec::new(),
@@ -976,6 +983,48 @@
     }
 
     #[tokio::test]
+    async fn response_style_includes_self_report_format() {
+        let pool = setup_pool().await;
+        let db = Arc::new(Db { pool });
+        let input = CorePromptInput {
+            content: "How self-aware are you?".to_string(),
+            kind: CoreInputKind::User,
+            source: "test".to_string(),
+            self_awareness: true,
+            self_awareness_hint: false,
+            anchor_hits: 1,
+            original_input: "How self-aware are you?".to_string(),
+            current_time: None,
+            semantic_hint: None,
+            introspection_summary: None,
+            monologue_intent: None,
+            monologue_digest: None,
+            prompt_mode: None,
+            task_phase: None,
+            missing_slots: None,
+            resolution_mode: None,
+            policy_notes: None,
+            redirect_focus: None,
+            allow_diagnostics: false,
+            world_model_snapshot: None,
+            subject_snapshot: None,
+            gate_decision: None,
+            feedback_bundle: None,
+            qualia_snapshot: None,
+            wave_state: None,
+            attention_schema_summary: None,
+            workspace_contributors_summary: None,
+            reflective_narrative: None,
+            reflective_narrative_evidence_ids: Vec::new(),
+            hydrated_context: None,
+        };
+        let build = build_core_system_message_with_layout(&db, "default", &input, PromptLayout::Full)
+            .await
+            .expect("build");
+        assert!(build.system_message.contains("Self-Report Format"));
+    }
+
+    #[tokio::test]
     async fn gate_order_table_driven() {
         let (kernel, base_settings) = setup_kernel_for_gate_tests().await;
 
@@ -998,7 +1047,7 @@
 
         // 1) Policy block
         {
-            let mut state = base_state.clone();
+            let state = base_state.clone();
             let settings = base_settings.clone();
             let candidates = vec![
                 make_candidate_with(
@@ -1070,7 +1119,7 @@
 
         // 3) Budget cap (tool calls)
         {
-            let mut state = base_state.clone();
+            let state = base_state.clone();
             let settings = base_settings.clone();
             let candidates = vec![
                 make_candidate_with(
@@ -1133,7 +1182,7 @@
 
         // 5) Evidence gating
         {
-            let mut state = base_state.clone();
+            let state = base_state.clone();
             let settings = base_settings.clone();
             let candidates = vec![
                 make_candidate_with(

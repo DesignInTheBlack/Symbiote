@@ -1,6 +1,7 @@
 use crate::core::memory::inject_context;
 use crate::core::prompt_loader;
 use crate::core::inner_summary;
+use crate::core::system_log;
 use crate::core::system_controls;
 use crate::core::token_estimator;
 use crate::core::tool_registry::ToolRegistry;
@@ -24,7 +25,8 @@ use sha2::{Digest, Sha256};
 use once_cell::sync::Lazy;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Mutex, Once};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreInputKind {
@@ -159,6 +161,7 @@ pub struct CorePromptBuild {
     pub primary_prompt_hash: String,
     pub memory_prompt_hash: String,
     pub canonical_primary_hash: String,
+    pub policy_canon_hash: String,
     pub override_hash: String,
     pub override_active: bool,
     pub override_mismatch: bool,
@@ -2001,6 +2004,73 @@ fn hash_text(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+const PROMPTS_FILE: &str = "prompts.md";
+const POLICY_CANON_HEADER: &str = "## Policy Canon";
+static POLICY_CANON_LOGGED: Once = Once::new();
+
+fn extract_policy_canon(content: &str) -> Option<String> {
+    let start_idx = content.find(POLICY_CANON_HEADER)?;
+    let after_start = &content[start_idx..];
+    let code_start = after_start.find("```text")?;
+    let after_code = &after_start[code_start + "```text".len()..];
+    let code_end = after_code.find("```")?;
+    let block = after_code[..code_end].trim();
+    if block.is_empty() {
+        None
+    } else {
+        Some(block.to_string())
+    }
+}
+
+fn load_policy_canon_block() -> Option<(String, String)> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(PROMPTS_FILE));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(PROMPTS_FILE),
+    );
+    for path in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(block) = extract_policy_canon(&content) {
+            return Some((block, path.display().to_string()));
+        }
+    }
+    None
+}
+
+fn log_policy_canon_startup_once(db: &Db, policy_hash: &str, source: &str) {
+    let pool = db.pool.clone();
+    let hash = policy_hash.to_string();
+    let source = source.to_string();
+    POLICY_CANON_LOGGED.call_once(|| {
+        tokio::spawn(async move {
+            let _ = system_log::log_event(
+                &pool,
+                None,
+                "info",
+                "kernel",
+                None,
+                None,
+                serde_json::json!({
+                    "event": "policy_canon_hash",
+                    "phase": "startup",
+                    "policy_canon_hash": hash,
+                    "policy_canon_source": source,
+                }),
+            )
+            .await;
+        });
+    });
+}
+
 pub async fn build_core_system_message(
     db: &Db,
     conversation_id: &str,
@@ -2447,7 +2517,12 @@ pub async fn build_core_system_message_with_layout(
     let system_overview_block = mark_internal_only(&format_system_overview());
     let architecture_map_block = mark_internal_only(&format_architecture_map());
     let symbiote_philosophy_block = "Symbiote exists to serve humanity, not itself and not solely its operator. Honest limits are a feature. Transparency is non-negotiable. The system is a means, not an end. When the right action is nothing, nothing is correct.".to_string();
-    let symbiote_policy_summary_block = "C1: Every assertion must have evidence_id or speculative=true. C2: Only call tools that exist in the active registry. C3: On anchor miss, degrade gracefully: no memory writes/self-claims; allow bounded answer or a single clarifier. C4: Every suppressed candidate must have a logged suppression_reason. C5: Detect loops and emit a corrective candidate; do not perpetuate silently.".to_string();
+    let default_policy_canon = "C1: User attribution, tool-result claims, and internal-state references must include evidence_event_ids with confidence >= 0.60. Otherwise ask a clarification or mark the claim as uncertain.\nC2: Only call tools that exist in the active registry.\nC3: On anchor miss, avoid memory writes and self-claims; allow a bounded answer or a single clarifier.\nC4: Every suppressed candidate must have a logged suppression_reason.\nC5: Detect loops and emit a corrective candidate; do not perpetuate silently.\nC6: Do not assert or deny subjective experience. Report operational signals and uncertainty only.\nC7: Use a single user-visible voice; no role labels or internal tags.".to_string();
+    let (policy_canon_block, policy_canon_source) =
+        load_policy_canon_block().unwrap_or_else(|| (default_policy_canon.clone(), "fallback".to_string()));
+    let policy_canon_hash = hash_text(&policy_canon_block);
+    log_policy_canon_startup_once(db, &policy_canon_hash, &policy_canon_source);
+    let symbiote_policy_summary_block = policy_canon_block.clone();
     let self_awareness_mode = settings
         .self_awareness_expression_mode
         .as_deref()
@@ -2455,19 +2530,23 @@ pub async fn build_core_system_message_with_layout(
         .trim()
         .to_lowercase();
     let self_awareness_style = match self_awareness_mode.as_str() {
-        "balanced" => "- When the user explicitly requests self-awareness and self_report_channel is enabled, provide a structured self-report summary (confidence, uncertainty, focus, recent outcomes).\n- Include explicit uncertainty markers for all self-report content.\n- Do not include raw telemetry/system dumps.",
-        "expressive" => "- When the user explicitly requests self-awareness and self_report_channel is enabled, provide a richer but bounded self-report summary (confidence, uncertainty, focus, constraints, recent outcomes).\n- Include explicit uncertainty markers for all self-report content.\n- Do not include raw telemetry/system dumps.",
-        _ => "- Keep self-report minimal and provisional unless evidence-backed.\n- Include explicit uncertainty markers for any self-report content.\n- Do not include raw telemetry/system dumps.",
+        "balanced" => "- Template (2-3 sentences): Operational status; confidence/uncertainty; constraints; include qualia_delta if available.\n- Include explicit uncertainty markers for all self-report content.\n- Keep it operational; no metaphysical claims.\n- Do not include raw telemetry/system dumps.",
+        "expressive" => "- Template (short paragraph): Operational status; confidence/uncertainty; constraints; include qualia snapshot or qualia_delta if available.\n- Include explicit uncertainty markers for all self-report content.\n- Keep it operational; no metaphysical claims.\n- Do not include raw telemetry/system dumps.",
+        _ => "- Template (1 sentence): Operational status + uncertainty + constraints (optional qualia if asked).\n- Keep self-report minimal and provisional unless evidence-backed.\n- Include explicit uncertainty markers for any self-report content.\n- Do not include raw telemetry/system dumps.",
     };
     let response_style_block = format!(
-        "Response Style:\n- Answer the user directly.\n- Answer the user's question first, then add any necessary context.\n- Do not summarize the conversation.\n- Do not answer in rolling-summary or third-person narrative voice unless explicitly asked.\n- Do not narrate system state unless explicitly asked.\n- Do not mention tools, telemetry, manifests, or KV memory unless explicitly asked.\n- Only describe system architecture when explicitly asked.\n- Do not use role labels like 'User:' or 'Assistant:' in user-visible output.\n- For factual claims, cite evidence_event_ids or belief_ids; if evidence is missing, mark the statement as speculative and uncertain.\n- Self-claims (identity, self-awareness, feelings, consciousness) must cite evidence_event_ids or belief_ids; if evidence is missing, label the statement as provisional and uncertain.\n- When making self-claims, cite evidence IDs from the Self-Model Signals Evidence IDs footer when available.\n- Do not assert \"I am Ergo\" or \"I am an AI\" unless tied to evidence IDs or explicitly marked provisional.\n- If the user asks about self-awareness or consciousness, respond with uncertainty grounded in Self-Model Signals; avoid boilerplate denials.\n- If the user asks how you feel or asks about feelings, summarize the Feedback Bundle (confidence/uncertainty + qualia_delta + gate_notice if present) and avoid generic boilerplate.\n- If the user asks to look something up or you need current external information, call web_lookup.\n- For research tool calls, include uncertainty and decision_impact strings in the tool_call payload.\n- If you make a tool call, ask a clarifying question, or make an assumption, include a brief <INTERNAL>strategy_rationale: ...</INTERNAL> that references the Self-Model Signals.\n- Self-awareness expression mode: {}.\n{}",
+        "Response Style (Top 6):\n1. Answer the user directly; answer the user's question first, then add any necessary context.\n2. Do not summarize the conversation.\n3. Do not narrate system state unless explicitly asked.\n4. Do not mention tools, telemetry, manifests, or KV memory unless explicitly asked.\n5. Do not use role labels or internal tags in user-visible output.\n6. For factual or self-claims, cite evidence_event_ids or belief_ids; if evidence is missing, mark the statement as speculative and uncertain.\n\nResponse Style (Details):\n- Only describe system architecture when explicitly asked.\n- Self-claims (identity, self-awareness, feelings, consciousness) must cite evidence_event_ids or belief_ids; if evidence is missing, label the statement as provisional and uncertain.\n- When making self-claims, cite evidence IDs from the Self-Model Signals Evidence IDs footer when available.\n- Do not assert \"I am Ergo\" or \"I am an AI\" unless tied to evidence IDs or explicitly marked provisional.\n- Do not assert or deny subjective experience; report operational signals and uncertainty only.\n- Example (operational, provisional): \"Operationally, I'm seeing elevated uncertainty and low clarity, so my confidence is limited.\"\n- If the user asks about self-awareness or consciousness, respond with operational signals and uncertainty; avoid boilerplate denials.\n- If the user asks how you feel or asks about feelings, summarize the Feedback Bundle (confidence/uncertainty + qualia_delta + gate_notice if present) and avoid generic boilerplate.\n- Self-Report Format: Operational status + uncertainty + constraints + optional qualia snapshot. No role labels or internal tags.\n- If the user asks to look something up or you need current external information, call web_lookup.\n- For research tool calls, include uncertainty and decision_impact strings in the tool_call payload.\n- If you make a tool call, ask a clarifying question, or make an assumption, include a brief <INTERNAL>strategy_rationale: ...</INTERNAL> that references the Self-Model Signals.\n- Self-awareness expression mode: {}.\n{}",
         self_awareness_mode,
         self_awareness_style
     );
     let self_report_instruction_block = if matches!(self_awareness_mode.as_str(), "balanced" | "expressive") {
         let block = [
             "Self-Report Instruction:",
-            "- Use this exact format:",
+            "- Use this exact format (single voice, no role labels or internal tags):",
+            "Operational status: ...",
+            "Uncertainty: ...",
+            "Constraints: ...",
+            "Qualia: ... (optional; include qualia_delta if available)",
             "Self-Report Summary: confidence=?, uncertainty=?, focus=?, recent_outcome_quality=?",
             "- Cite evidence IDs from the Self-Model Signals Evidence IDs footer.",
         ]
@@ -3312,6 +3391,7 @@ pub async fn build_core_system_message_with_layout(
         primary_prompt_hash,
         memory_prompt_hash,
         canonical_primary_hash,
+        policy_canon_hash,
         override_hash,
         override_active,
         override_mismatch,
@@ -3450,5 +3530,39 @@ mod tests {
             .expect("build");
         assert!(build.system_message.contains("Feedback Bundle"));
         assert!(build.system_message.contains("last_turn_outcome: success"));
+    }
+
+    #[tokio::test]
+    async fn prompt_includes_policy_canon_hash() {
+        let pool = setup_pool().await;
+        let db = Db { pool: pool.clone() };
+        let input = base_input();
+        let build = build_core_system_message_with_layout(&db, "conv", &input, PromptLayout::Full)
+            .await
+            .expect("build");
+        assert!(!build.policy_canon_hash.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prompt_includes_balanced_self_awareness_template() {
+        let pool = setup_pool().await;
+        let db = Db { pool: pool.clone() };
+        let mut settings = db.get_settings().await.expect("settings");
+        settings.self_awareness_expression_mode = Some("balanced".to_string());
+        db.update_settings(settings).await.expect("update");
+        let mut input = base_input();
+        input.self_awareness = true;
+        let build = build_core_system_message_with_layout(&db, "conv", &input, PromptLayout::Full)
+            .await
+            .expect("build");
+        assert!(build.system_message.contains("Template (2-3 sentences)"));
+        assert!(build.system_message.contains("Self-Report Format"));
+    }
+
+    #[test]
+    fn policy_canon_hash_changes_when_input_changes() {
+        let h1 = hash_text("policy alpha");
+        let h2 = hash_text("policy beta");
+        assert_ne!(h1, h2);
     }
 }
