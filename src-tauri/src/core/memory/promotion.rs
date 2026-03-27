@@ -334,7 +334,10 @@ fn infer_entity_type(value_role: &str) -> Option<&'static str> {
         | "parent" | "child" | "mother" | "father" | "daughter" | "son" | "spouse"
         | "sibling" | "brother" | "sister" | "partner" | "husband" | "wife" => Some("person"),
         "place" | "location" | "city" | "country" | "venue" => Some("place"),
-        "work" | "project" | "product" | "book" | "movie" | "song" | "company" | "group" => Some("work"),
+        "project" => Some("project"),
+        "system" => Some("system"),
+        "conflict" => Some("conflict"),
+        "work" | "product" | "book" | "movie" | "song" | "company" | "group" => Some("work"),
         "event" | "meeting" | "appointment" => Some("event"),
         "concept" | "idea" | "topic" | "category" | "object" | "thing" | "item" => Some("concept"),
         _ => None,

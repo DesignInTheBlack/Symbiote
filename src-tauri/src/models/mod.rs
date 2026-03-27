@@ -945,9 +945,9 @@ impl Settings {
         );
 
         if let Some(value) = self.model_context_limit {
-            if value < 128 {
-                adjustments.push(format!("model_context_limit: {} -> 128", value));
-                self.model_context_limit = Some(128);
+            if value < 2048 {
+                adjustments.push(format!("model_context_limit: {} -> 2048", value));
+                self.model_context_limit = Some(2048);
             }
         }
 

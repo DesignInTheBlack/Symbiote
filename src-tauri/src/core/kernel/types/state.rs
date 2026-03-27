@@ -262,6 +262,14 @@ pub struct KernelState {
     #[serde(default)]
     pub controller_gate: Option<crate::models::ControllerGate>,
     #[serde(default)]
+    pub self_model_version: i64,
+    #[serde(default)]
+    pub self_model_updated_at: Option<String>,
+    #[serde(default)]
+    pub last_self_report_at: Option<String>,
+    #[serde(default)]
+    pub self_report_snapshot: Option<serde_json::Value>,
+    #[serde(default)]
     pub proaction_throttle_tools_override: Option<bool>,
     #[serde(default)]
     pub proaction_throttle_threads_override: Option<bool>,
@@ -484,6 +492,10 @@ impl KernelState {
             last_persisted_workspace_hash: None,
             controller_state: None,
             controller_gate: None,
+            self_model_version: 0,
+            self_model_updated_at: None,
+            last_self_report_at: None,
+            self_report_snapshot: None,
             proaction_throttle_tools_override: None,
             proaction_throttle_threads_override: None,
             last_controller_snapshot_at: None,

@@ -117,7 +117,19 @@ pub(crate) fn update_workspace_runtime_meta(
     attention_schema: &crate::models::AttentionSchemaState,
     attention_schema_summary: &str,
 ) {
+    let existing_runtime = state.workspace_meta.runtime.clone();
     let mut runtime_meta = core_workspace::workspace_state_to_meta(workspace_state);
+    if let (Some(existing), Some(obj)) = (existing_runtime.as_ref().and_then(|v| v.as_object()), runtime_meta.as_object_mut()) {
+        let carry_keys = [
+            "autobiographical_summary",
+            "self_report_snapshot",
+        ];
+        for key in carry_keys.iter() {
+            if let Some(value) = existing.get(*key) {
+                obj.insert((*key).to_string(), value.clone());
+            }
+        }
+    }
     if let Some(obj) = runtime_meta.as_object_mut() {
         obj.insert("contributors".to_string(), serde_json::json!(contributors));
         obj.insert(

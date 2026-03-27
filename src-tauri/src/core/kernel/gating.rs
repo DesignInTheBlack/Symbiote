@@ -2111,7 +2111,7 @@ pub(crate) fn working_hypothesis_prefix(text: &str, disabled: bool) -> String {
         return trimmed.to_string();
     }
     if disabled {
-        return format_speculative_label(trimmed, true);
+        return trimmed.to_string();
     }
     format!("Working hypothesis: {}", trimmed)
 }
@@ -2154,16 +2154,14 @@ pub(crate) fn format_speculative_label(text: &str, disabled: bool) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let lower = trimmed.to_lowercase();
     if disabled {
-        if lower.contains("speculative=true") {
-            trimmed.to_string()
-        } else {
-            format!("{} (speculative=true)", trimmed)
-        }
-    } else {
-        trimmed.to_string()
+        return trimmed.to_string();
     }
+    let lower = trimmed.to_lowercase();
+    if lower.contains("speculative=true") {
+        return trimmed.to_string();
+    }
+    format!("{} (speculative=true)", trimmed)
 }
 
 pub(crate) fn candidate_introduces_new_terms(text: &str, state: &KernelState) -> bool {

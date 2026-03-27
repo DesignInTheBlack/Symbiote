@@ -87,13 +87,9 @@ struct SelfMemoryWrite {
     reason: String,
 }
 
-const DEFAULT_MODEL_CONTEXT_LIMIT: usize = 16_384;
 
 fn reflection_prompt_cap_tokens(settings: &Settings) -> usize {
-    let limit = settings
-        .model_context_limit
-        .unwrap_or(DEFAULT_MODEL_CONTEXT_LIMIT as i32)
-        .max(1) as usize;
+    let limit = token_estimator::context_limit_tokens(settings);
     let cap = ((limit as f32) * 0.15).floor() as usize;
     cap.min(1500).max(1)
 }

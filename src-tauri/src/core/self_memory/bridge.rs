@@ -30,6 +30,17 @@ fn parse_ts(raw: Option<String>) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+async fn resolve_bridge_conversation_id(pool: &SqlitePool) -> String {
+    let conversation_id: Option<String> = sqlx::query_scalar(
+        "SELECT conversation_id FROM conversations ORDER BY datetime(updated_at) DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    conversation_id.unwrap_or_else(|| "default".to_string())
+}
+
 fn is_internal_state_key(input: &str) -> bool {
     let lowered = input.to_lowercase();
     lowered.starts_with("telemetry.")
@@ -223,7 +234,8 @@ pub async fn bridge_self_event(pool: &SqlitePool, event_id: i64) -> Result<bool,
         .or_else(|| parse_ts(created_at))
         .unwrap_or_else(Utc::now);
 
-    let api = MemoryApi::new(pool.clone(), None, "self_memory_bridge".to_string()).await;
+    let session_id = resolve_bridge_conversation_id(pool).await;
+    let api = MemoryApi::new(pool.clone(), None, session_id).await;
     let result = api
         .parse_and_compile(
             &dsl_line,

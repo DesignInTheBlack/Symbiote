@@ -3,6 +3,16 @@ use sqlx::Row;
 use chrono::{TimeZone, Utc};
 use crate::core::system_log;
 
+const SELF_REPORT_RELIABILITY_WARN: f32 = 0.45;
+
+fn content_has_self_report(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("self-report summary")
+        || lower.contains("self report summary")
+        || lower.contains("operational status:")
+        || lower.contains("self-report")
+}
+
 impl Kernel {
     pub(crate) fn finalize_decision_report(
         &self,
@@ -120,6 +130,7 @@ impl Kernel {
         gate_notice: Option<String>,
         gate_reasons: Option<Vec<String>>,
         extra_notice: Option<String>,
+        self_report_source: Option<&str>,
     ) -> Option<String> {
         let message_row = sqlx::query(
             "SELECT message_id, conversation_id FROM messages
@@ -193,7 +204,7 @@ impl Kernel {
         if let Some(decision) = gate_decision {
             obj.insert("gate_decision".to_string(), json!(decision));
         }
-        let final_content = content.to_string();
+        let mut final_content = content.to_string();
         if let Some(notice) = gate_notice.clone() {
             obj.insert("gate_notice".to_string(), json!(notice.clone()));
         }
@@ -203,15 +214,88 @@ impl Kernel {
         if let Some(reasons) = gate_reasons {
             obj.insert("gate_reasons".to_string(), json!(reasons));
         }
-        let self_report_marker = "provisional self-report";
-        if final_content.to_lowercase().contains(self_report_marker) {
+        if content_has_self_report(&final_content) {
+            let mut self_report_evidence_ids: Vec<i64> = obj
+                .get("evidence_event_ids")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_i64())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Ok(mut ids) =
+                crate::core::self_model_controller::collect_unified_self_evidence_ids(&self.db).await
+            {
+                self_report_evidence_ids.append(&mut ids);
+            }
+            self_report_evidence_ids.sort();
+            self_report_evidence_ids.dedup();
+
+            let controller_state = self.db.get_controller_state().await.ok().flatten().unwrap_or_default();
+            let mut confidence = controller_state.confidence.clamp(0.0, 1.0);
+            let mut uncertainty = controller_state.uncertainty.clamp(0.0, 1.0);
+            let mut reliability = 0.5_f32;
+            if let Ok(model) = self.db.get_self_model().await {
+                if let Some(value) = model
+                    .unified_state
+                    .get("self_model_reliability")
+                    .and_then(|v| v.as_f64())
+                {
+                    reliability = value as f32;
+                }
+            }
+            if reliability < SELF_REPORT_RELIABILITY_WARN {
+                confidence = (confidence * 0.6).clamp(0.0, 1.0);
+                uncertainty = (uncertainty + 0.2).clamp(0.0, 1.0);
+            }
+            let mut constraints: Vec<String> = Vec::new();
+            if controller_state.verification_needed {
+                constraints.push("verification_needed".to_string());
+            }
+            if controller_state.reanchor_needed {
+                constraints.push("reanchor_needed".to_string());
+            }
+            if !controller_state.missing_fields.is_empty() {
+                constraints.push(format!(
+                    "missing_fields: {}",
+                    controller_state.missing_fields.join(", ")
+                ));
+            }
+            if reliability < SELF_REPORT_RELIABILITY_WARN {
+                constraints.push("self_model_reliability_low".to_string());
+            }
+            let status = if reliability < SELF_REPORT_RELIABILITY_WARN || controller_state.drift_score > 0.6 {
+                "degraded"
+            } else {
+                "operational"
+            };
+            let speculative = self_report_evidence_ids.is_empty() || reliability < SELF_REPORT_RELIABILITY_WARN;
+            let source = self_report_source.unwrap_or("implicit");
             obj.insert(
                 "self_report".to_string(),
                 json!({
-                    "status": "unverified",
-                    "notice": self_report_marker,
+                    "status": status,
+                    "confidence": confidence,
+                    "uncertainty": uncertainty,
+                    "constraints": constraints,
+                    "evidence_event_ids": self_report_evidence_ids,
+                    "speculative": speculative,
+                    "self_model_reliability": reliability,
+                    "source": source,
                 }),
             );
+
+            if self_report_evidence_ids.is_empty() {
+                let marker = "provisional self-report";
+                if !final_content.to_lowercase().contains(marker) {
+                    final_content = format!(
+                        "{}\n\nNote: provisional self-report (no evidence).",
+                        final_content.trim_end()
+                    );
+                }
+            }
         }
 
         let metadata = serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());

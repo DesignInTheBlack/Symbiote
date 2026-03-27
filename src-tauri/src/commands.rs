@@ -1648,8 +1648,30 @@ pub async fn send_pending_prompt(
 pub async fn abort_generation(
     chat: State<'_, Arc<ChatManager>>,
     run_id: Option<String>,
+    source: Option<String>,
 ) -> Result<(), String> {
-    chat.abort(run_id.as_deref()).await;
+    let source_label = source.as_deref().unwrap_or("unknown");
+    let active_run_id = if run_id.is_none() {
+        chat.db.get_active_foreground_run("default").await.ok().flatten()
+    } else {
+        None
+    };
+    let _ = system_log::log_event(
+        &chat.db.pool,
+        Some(&chat.app_handle),
+        "info",
+        "chat",
+        None,
+        None,
+        json!({
+            "event": "abort_generation_requested",
+            "source": source_label,
+            "run_id": run_id,
+            "active_run_id": active_run_id,
+        }),
+    )
+    .await;
+    chat.abort(run_id.as_deref(), Some(source_label)).await;
     Ok(())
 }
 
@@ -1696,7 +1718,22 @@ pub async fn reset_conversation_data(
     chat: State<'_, Arc<ChatManager>>,
     app: tauri::AppHandle
 ) -> Result<(), String> {
-    chat.abort(None).await;
+    let _ = system_log::log_event(
+        &db.pool,
+        Some(&app),
+        "info",
+        "chat",
+        None,
+        None,
+        json!({
+            "event": "abort_generation_requested",
+            "source": "reset_conversation_data",
+            "run_id": None::<String>,
+            "active_run_id": chat.db.get_active_foreground_run("default").await.ok().flatten(),
+        }),
+    )
+    .await;
+    chat.abort(None, Some("reset_conversation_data")).await;
     let conversation_ids = db
         .inner()
         .list_conversation_ids(None)
@@ -1737,7 +1774,22 @@ pub async fn reset_all_data(
     app: tauri::AppHandle
 ) -> Result<(), String> {
     use tauri::Emitter;
-    chat.abort(None).await;
+    let _ = system_log::log_event(
+        &db.pool,
+        Some(&app),
+        "info",
+        "chat",
+        None,
+        None,
+        json!({
+            "event": "abort_generation_requested",
+            "source": "reset_all_data",
+            "run_id": None::<String>,
+            "active_run_id": chat.db.get_active_foreground_run("default").await.ok().flatten(),
+        }),
+    )
+    .await;
+    chat.abort(None, Some("reset_all_data")).await;
     db.reset_all_data().await.map_err(|e| e.to_string())?;
     let _ = app.emit("message_updated", ());
     let _ = app.emit("memory_updated", ());

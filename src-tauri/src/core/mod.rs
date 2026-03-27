@@ -816,16 +816,48 @@ async fn run_proactive_event_with_context(
                 .await
         });
 
-        let completion = tokio::select! {
-            res = &mut exec_handle => Some(res),
-            _ = &mut abort_rx => {
-                let _ = cancel_tx.send(true);
-                if tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut exec_handle).await.is_err() {
-                    exec_handle.abort();
+            let completion = tokio::select! {
+                res = &mut exec_handle => Some(res),
+                abort_result = &mut abort_rx => {
+                    if abort_result.is_ok() {
+                        let _ = system_log::log_event(
+                            &db.pool,
+                            Some(&app_handle),
+                            "warn",
+                            "chat",
+                            Some(&run_id_clone),
+                            Some(&trace_id_clone),
+                            json!({
+                                "event": "abort_signal_received",
+                                "reason": "abort_signal",
+                                "source": "proactive",
+                            }),
+                        )
+                        .await;
+                        let _ = cancel_tx.send(true);
+                        if tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut exec_handle).await.is_err() {
+                            exec_handle.abort();
+                        }
+                        None
+                    } else {
+                        let _ = system_log::log_event(
+                            &db.pool,
+                            Some(&app_handle),
+                            "warn",
+                            "chat",
+                            Some(&run_id_clone),
+                            Some(&trace_id_clone),
+                            json!({
+                                "event": "abort_signal_received",
+                                "reason": "abort_sender_dropped",
+                                "source": "proactive",
+                            }),
+                        )
+                        .await;
+                        Some(exec_handle.await)
+                    }
                 }
-                None
-            }
-        };
+            };
 
         if let Some(joined) = completion {
             let result = match joined {
@@ -1271,12 +1303,42 @@ impl ChatManager {
 
             let completion = tokio::select! {
                 res = &mut exec_handle => Some(res),
-                _ = &mut abort_rx => {
-                    let _ = cancel_tx.send(true);
-                    if tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut exec_handle).await.is_err() {
-                        exec_handle.abort();
+                abort_result = &mut abort_rx => {
+                    if abort_result.is_ok() {
+                        let _ = system_log::log_event(
+                            &db.pool,
+                            Some(&app_handle),
+                            "warn",
+                            "chat",
+                            Some(&run_id_clone),
+                            Some(&trace_id_clone),
+                            json!({
+                                "event": "abort_signal_received",
+                                "reason": "abort_signal",
+                            }),
+                        )
+                        .await;
+                        let _ = cancel_tx.send(true);
+                        if tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut exec_handle).await.is_err() {
+                            exec_handle.abort();
+                        }
+                        None
+                    } else {
+                        let _ = system_log::log_event(
+                            &db.pool,
+                            Some(&app_handle),
+                            "warn",
+                            "chat",
+                            Some(&run_id_clone),
+                            Some(&trace_id_clone),
+                            json!({
+                                "event": "abort_signal_received",
+                                "reason": "abort_sender_dropped",
+                            }),
+                        )
+                        .await;
+                        Some(exec_handle.await)
                     }
-                    None
                 }
             };
 
@@ -1473,7 +1535,7 @@ impl ChatManager {
         Ok(())
     }
 
-    pub async fn abort(&self, run_id: Option<&str>) {
+    pub async fn abort(&self, run_id: Option<&str>, source: Option<&str>) {
         let current_run = self.current_run_id.lock().await.clone();
         let should_abort = match run_id {
             Some(target) => current_run.as_deref() == Some(target),
@@ -1482,6 +1544,22 @@ impl ChatManager {
         if !should_abort {
             return;
         }
+        let current_run_id = current_run.clone();
+        let _ = system_log::log_event(
+            &self.db.pool,
+            Some(&self.app_handle),
+            "info",
+            "chat",
+            current_run.as_deref(),
+            current_run.as_deref(),
+            json!({
+                "event": "abort_called",
+                "source": source.unwrap_or("unknown"),
+                "run_id": run_id,
+                "current_run_id": current_run_id,
+            }),
+        )
+        .await;
         if let Some(cancel_tx) = self.current_cancel_tx.lock().await.as_ref() {
             let _ = cancel_tx.send(true);
         }
@@ -1732,12 +1810,44 @@ User's clarification: {}",
 
             let completion = tokio::select! {
                 res = &mut exec_handle => Some(res),
-                _ = &mut abort_rx => {
-                    let _ = cancel_tx.send(true);
-                    if tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut exec_handle).await.is_err() {
-                        exec_handle.abort();
+                abort_result = &mut abort_rx => {
+                    if abort_result.is_ok() {
+                        let _ = system_log::log_event(
+                            &db.pool,
+                            Some(&app_handle),
+                            "warn",
+                            "chat",
+                            Some(&run_id_clone),
+                            Some(&trace_id_clone),
+                            json!({
+                                "event": "abort_signal_received",
+                                "reason": "abort_signal",
+                                "source": "clarification",
+                            }),
+                        )
+                        .await;
+                        let _ = cancel_tx.send(true);
+                        if tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut exec_handle).await.is_err() {
+                            exec_handle.abort();
+                        }
+                        None
+                    } else {
+                        let _ = system_log::log_event(
+                            &db.pool,
+                            Some(&app_handle),
+                            "warn",
+                            "chat",
+                            Some(&run_id_clone),
+                            Some(&trace_id_clone),
+                            json!({
+                                "event": "abort_signal_received",
+                                "reason": "abort_sender_dropped",
+                                "source": "clarification",
+                            }),
+                        )
+                        .await;
+                        Some(exec_handle.await)
                     }
-                    None
                 }
             };
 

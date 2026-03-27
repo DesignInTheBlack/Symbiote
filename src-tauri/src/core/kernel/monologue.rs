@@ -5,7 +5,7 @@ use crate::core::cognitive_wave_projection::WaveStateVector;
 use crate::core::kernel::run::build_qualia_modulation_context;
 
 const MONOLOGUE_FRESHNESS_LOG_MAX_MS: i64 = 60_000;
-const MONOLOGUE_LATENCY_BUDGET_MS: i64 = 250;
+const MONOLOGUE_LATENCY_BUDGET_MS: i64 = 1200;
 const MONOLOGUE_LLM_TIMEOUT_SECS: u64 = 90;
 const MONOLOGUE_RETRY_TIMEOUT_SECS: u64 = 25;
 const MONOLOGUE_RETRY_MAX_TOKENS: i64 = 140;
@@ -573,7 +573,13 @@ impl Kernel {
         }
     }
 
-    pub async fn run_monologue_tick(&self, conversation_id: &str, priority: bool) -> Result<(), String> {
+    pub async fn run_monologue_tick(
+        &self,
+        conversation_id: &str,
+        priority: bool,
+        origin_run_id: Option<String>,
+        origin_trace_id: Option<String>,
+    ) -> Result<(), String> {
         let controls = system_controls::load_control_map(&self.db).await;
         let mode = system_controls::mode_for("monologue_loop", &controls);
         let inner_summary_mode = system_controls::mode_for("inner_summary", &controls);
@@ -597,6 +603,13 @@ impl Kernel {
             return Ok(());
         }
         let tick_id = Uuid::new_v4().to_string();
+        let entry_run_id = origin_run_id
+            .clone()
+            .unwrap_or_else(|| tick_id.clone());
+        let log_run_id = origin_run_id.as_deref();
+        let log_trace_id = origin_trace_id
+            .as_deref()
+            .or_else(|| Some(tick_id.as_str()));
         let tick_started_at = Utc::now();
         let tick_user_snapshot_at = self
             .db
@@ -618,8 +631,8 @@ impl Kernel {
                 Some(&self.app_handle),
                 "info",
                 "kernel",
-                None,
-                Some(&tick_id),
+                log_run_id,
+                log_trace_id,
                 json!({
                     "event": "monologue_timeout_adaptive",
                     "conversation_id": conversation_id,
@@ -651,8 +664,8 @@ impl Kernel {
                     Some(&self.app_handle),
                     "info",
                     "kernel",
-                    None,
-                    Some(&tick_id),
+                    log_run_id,
+                    log_trace_id,
                     json!({
                         "event": "monologue_tick_lock_wait_ms",
                         "conversation_id": conversation_id,
@@ -687,8 +700,8 @@ impl Kernel {
             Some(&self.app_handle),
             "info",
             "kernel",
-            None,
-            Some(&tick_id),
+            log_run_id,
+            log_trace_id,
             json!({
                 "event": "monologue_tick_lock_wait_ms",
                 "conversation_id": conversation_id,
@@ -705,8 +718,8 @@ impl Kernel {
             Some(&self.app_handle),
             "info",
             "kernel",
-            None,
-            Some(&tick_id),
+            log_run_id,
+            log_trace_id,
             json!({
                 "event": "monologue_tick_start",
                 "conversation_id": conversation_id,
@@ -721,8 +734,8 @@ impl Kernel {
             Some(&self.app_handle),
             "info",
             "kernel",
-            None,
-            Some(&tick_id),
+            log_run_id,
+            log_trace_id,
             json!({
                 "event": "monologue_tick_stage",
                 "conversation_id": conversation_id,
@@ -2114,7 +2127,7 @@ impl Kernel {
                         .await;
                     }
                 }
-                entry.run_id = Some(tick_id.clone());
+                entry.run_id = Some(entry_run_id.clone());
                 if let Some(stale_payload) = stale_reason_payload.as_ref() {
                     let mut payload = entry
                         .harvest_payload
@@ -2181,7 +2194,8 @@ impl Kernel {
                         let mut candidate_value =
                             serde_json::to_value(&blocked.candidate).unwrap_or_else(|_| json!({}));
                         if let Some(obj) = candidate_value.as_object_mut() {
-                            obj.insert("run_id".to_string(), Value::String(tick_id.clone()));
+                            obj.insert("run_id".to_string(), Value::String(entry_run_id.clone()));
+                            obj.insert("tick_id".to_string(), Value::String(tick_id.clone()));
                             obj.insert("blocked_reason".to_string(), Value::String(blocked.reason.clone()));
                         }
                         let candidate_json =
@@ -2202,6 +2216,7 @@ impl Kernel {
                 if !candidate_entries.is_empty() {
                     entry.candidates = Some(candidate_entries);
                 }
+                entry.run_id = Some(entry_run_id.clone());
                 emit_entries.push(entry.clone());
                 entry_batch.push(entry);
             }
@@ -2293,7 +2308,7 @@ impl Kernel {
                                 .await;
                             }
                         }
-                        entry.run_id = Some(tick_id.clone());
+                        entry.run_id = Some(entry_run_id.clone());
                         if let Some(stale_payload) = stale_reason_payload.as_ref() {
                             let mut payload = entry
                                 .harvest_payload
@@ -3065,7 +3080,12 @@ impl Kernel {
 
         if let Some(primary_candidate) = decision_internal.accepted.first().cloned() {
             if let Some((subject_state, snapshot)) = self
-                .build_and_persist_subject_snapshot(&mut state, None, None, "monologue_gate")
+                .build_and_persist_subject_snapshot(
+                    &mut state,
+                    log_run_id,
+                    Some(tick_id.as_str()),
+                    "monologue_gate",
+                )
                 .await
             {
                 let proposal = subject_controller::build_action_proposal(&primary_candidate);
@@ -3519,6 +3539,27 @@ impl Kernel {
                 narrative_wave_state.as_ref(),
             )
             .await;
+
+        let self_model_update_needed = emitted_entries || state_change_candidates > 0;
+        if self_model_update_needed {
+            self.sync_unified_self_model(&mut state).await;
+        } else {
+            let _ = system_log::log_event(
+                &self.db.pool,
+                Some(&self.app_handle),
+                "info",
+                "kernel",
+                None,
+                Some(&tick_id),
+                json!({
+                    "event": "self_model_update_skipped",
+                    "reason": "monologue_no_state_change",
+                    "conversation_id": conversation_id,
+                    "tick_id": tick_id,
+                }),
+            )
+            .await;
+        }
 
         let outcome = if emitted_entries {
             "saved"

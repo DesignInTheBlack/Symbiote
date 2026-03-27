@@ -1514,6 +1514,7 @@ function App() {
     try {
       await invokeWithTimeout("abort_generation", {
         run_id: lastRunIdRef.current ?? undefined,
+        source: "ui_stop",
       }, TIMEOUTS.short);
     } catch (e) {
       reportError("Failed to abort generation", e);
@@ -1536,6 +1537,7 @@ function App() {
     try {
       await invokeWithTimeout("abort_generation", {
         run_id: lastRunIdRef.current ?? undefined,
+        source: "ui_recover",
       }, TIMEOUTS.short);
     } catch (e) {
       reportError("Failed to recover generation", e);

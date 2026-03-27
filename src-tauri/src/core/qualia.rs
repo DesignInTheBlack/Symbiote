@@ -89,11 +89,22 @@ async fn infer_qualia_tag(
             return (tag, intensity, reason, true);
         }
     };
-    let model_id = settings
+    let json_reliable = settings
         .json_reliable_model_id
-        .clone()
-        .or_else(|| settings.active_model_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let model_id = if json_reliable {
+        settings
+            .json_reliable_model_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    } else {
+        settings
+            .active_model_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    };
 
     let allowed = ["curious", "skeptical", "informative", "calm", "urgent", "neutral"];
     let system_prompt = "Assign a single qualia tag and intensity for the assistant message. Output ONLY JSON.\n\nSchema:\n{\n  \"tag\": \"curious|skeptical|informative|calm|urgent|neutral\",\n  \"intensity\": 0.0-1.0,\n  \"reason\": \"short reason\"\n}\n\nRules:\n- Pick exactly one tag from the allowed list.\n- Intensity between 0.0 and 1.0.\n- Keep reason under 8 words.\n- Do not include extra keys.";
@@ -118,7 +129,11 @@ async fn infer_qualia_tag(
         temperature: Some(0.2),
         top_p: None,
         max_tokens: Some(80),
-        response_format: Some(json!({ "type": "json_object" })),
+        response_format: if json_reliable {
+            Some(json!({ "type": "json_object" }))
+        } else {
+            None
+        },
         tools: None,
         tool_choice: None,
         enable_thinking: None,
@@ -128,7 +143,7 @@ async fn infer_qualia_tag(
         skip_reminders: Some(true),
         memory_expand: None,
         allow_diagnostics: Some(false),
-        json_strict: Some(true),
+        json_strict: Some(json_reliable),
         skip_sanitization: None,
         run_id: run_id.map(|v| v.to_string()),
         request_label: Some("qualia_auto_label".to_string()),
@@ -147,6 +162,10 @@ async fn infer_qualia_tag(
     };
     let (mut value_opt, _) = parse_json_object_with_repair(&content);
     if value_opt.is_none() {
+        if !json_reliable {
+            let (tag, intensity, reason) = heuristic_qualia_tag(trimmed);
+            return (tag, intensity, reason, true);
+        }
         let fallback_system_prompt =
             "Return ONLY JSON. Schema: {\"tag\":\"curious|skeptical|informative|calm|urgent|neutral\",\"intensity\":0.0-1.0,\"reason\":\"short\"}.";
         let fallback_user_prompt = format!(

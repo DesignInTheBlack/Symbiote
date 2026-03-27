@@ -499,10 +499,7 @@ pub(crate) fn context_hash_for_drop(state: &KernelState, fallback: &str) -> Stri
 }
 
 pub(crate) fn summary_prompt_cap_tokens(settings: &Settings) -> usize {
-    let limit = settings
-        .model_context_limit
-        .unwrap_or(16_384)
-        .max(1) as usize;
+    let limit = token_estimator::context_limit_tokens(settings);
     let cap = ((limit as f32) * 0.2).floor() as usize;
     cap.min(2000).max(1)
 }

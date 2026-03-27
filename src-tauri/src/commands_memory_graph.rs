@@ -72,6 +72,7 @@ pub async fn memory_get_graph(
              FROM ics_entities e
              LEFT JOIN ics_working_set w ON w.item_id = e.id AND w.item_type = 'entity'
              WHERE e.resolution_state NOT IN ('merged', 'deleted')
+               AND e.entity_type IN ('person', 'place', 'work', 'concept', 'event', 'project', 'system', 'conflict')
              ORDER BY activation DESC, e.last_accessed_at DESC
              LIMIT ?"
         )
@@ -86,6 +87,7 @@ pub async fn memory_get_graph(
              FROM ics_entities e
              LEFT JOIN ics_working_set w ON w.item_id = e.id AND w.item_type = 'entity'
              WHERE e.resolution_state NOT IN ('merged', 'deleted')
+               AND e.entity_type IN ('person', 'place', 'work', 'concept', 'event', 'project', 'system', 'conflict')
              ORDER BY activation DESC, e.last_accessed_at DESC"
         )
         .fetch_all(&*pool)
@@ -132,6 +134,8 @@ pub async fn memory_get_graph(
              FROM ics_beliefs b
              JOIN ics_fact_beliefs fb ON fb.belief_id = b.id
              WHERE fb.subject_entity_id IN ({})
+               AND fb.key != 'utterance'
+               AND fb.key NOT LIKE 'tool_output:%'
                AND b.status = 'active'
                AND EXISTS (
                    SELECT 1 FROM ics_evidence_events e
@@ -231,9 +235,16 @@ pub async fn memory_get_graph(
                         None
                     })
                     .collect();
-                
+
+                let participants_filtered: Vec<(String, i64)> = participants
+                    .iter()
+                    .filter(|(_, eid)| entity_ids.contains(eid))
+                    .map(|(role, eid)| (role.clone(), *eid))
+                    .collect();
+                let participants_len = participants_filtered.len();
+
                 // Build participant list with names (resolve entity_id -> label)
-                let participant_names: Vec<(String, String)> = participants
+                let participant_names: Vec<(String, String)> = participants_filtered
                     .iter()
                     .map(|(role, eid)| {
                         let name = entity_labels.get(eid).cloned().unwrap_or_else(|| format!("Entity #{}", eid));
@@ -251,7 +262,7 @@ pub async fn memory_get_graph(
                     access_count: 0,
                     activation: None,
                     last_accessed: None,
-                    key: Some(format!("{} participants", participants.len())),
+                    key: Some(format!("{} participants", participants_len)),
                     value: None,
                     // Relations can have scope from the belief
                     scope: row.try_get("scope").ok(),
@@ -262,16 +273,14 @@ pub async fn memory_get_graph(
                 });
                 
                 // Create links from relationship node to each participant
-                for (role, entity_id) in participants {
-                    if entity_ids.contains(&entity_id) {
-                        links.push(GraphLink {
-                            source: format!("rel_{}", belief_id),
-                            target: format!("entity_{}", entity_id),
-                            link_type: "has_participant".to_string(),
-                            label: Some(role),
-                            strength: 0.8,
-                        });
-                    }
+                for (role, entity_id) in participants_filtered {
+                    links.push(GraphLink {
+                        source: format!("rel_{}", belief_id),
+                        target: format!("entity_{}", entity_id),
+                        link_type: "has_participant".to_string(),
+                        label: Some(role),
+                        strength: 0.8,
+                    });
                 }
             }
         }

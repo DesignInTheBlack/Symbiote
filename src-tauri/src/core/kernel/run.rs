@@ -19,6 +19,11 @@ pub(crate) struct RunOutput {
     pub assistant_message_id: Option<String>,
 }
 
+struct MemoryStatusSnapshot {
+    text: String,
+    evidence_id: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelPipelineMode {
     Legacy,
@@ -303,10 +308,16 @@ fn parse_monologue_fallback(raw: &str, stance_label: &str) -> Option<Value> {
         }
         let lower = line_trimmed.to_lowercase();
 
-        if lower.starts_with("skeptic:") || lower.starts_with("synth:") {
+        if lower.starts_with("contrast:")
+            || lower.starts_with("integrate:")
+            || lower.starts_with("skeptic:")
+            || lower.starts_with("synth:")
+        {
             let parts: Vec<&str> = line_trimmed.splitn(2, ':').collect();
             if parts.len() == 2 {
-                stance = Some(parts[0].trim().to_lowercase());
+                if let Some(normalized) = normalize_monologue_stance_label(parts[0]) {
+                    stance = Some(normalized.to_string());
+                }
                 let msg = parts[1].trim();
                 if !msg.is_empty() {
                     message = Some(msg.to_string());
@@ -321,9 +332,8 @@ fn parse_monologue_fallback(raw: &str, stance_label: &str) -> Option<Value> {
         if let Some((key, value)) = split_monologue_key_value(line_trimmed) {
             match key.as_str() {
                 "stance" => {
-                    let normalized = value.to_lowercase();
-                    if normalized == "skeptic" || normalized == "synth" {
-                        stance = Some(normalized);
+                    if let Some(normalized) = normalize_monologue_stance_label(&value) {
+                        stance = Some(normalized.to_string());
                     }
                     continue;
                 }
@@ -382,6 +392,33 @@ fn split_monologue_key_value(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((key, rest.trim().to_string()))
+}
+
+fn extract_self_report_snapshot(snapshot: Option<&Value>) -> (Option<String>, Vec<i64>) {
+    let Some(snapshot) = snapshot else { return (None, Vec::new()); };
+    let mut evidence_ids = Vec::new();
+    if let Some(array) = snapshot.get("evidence_event_ids").and_then(|v| v.as_array()) {
+        for entry in array.iter() {
+            if let Some(id) = entry.as_i64() {
+                evidence_ids.push(id);
+            }
+        }
+    }
+    evidence_ids.sort();
+    evidence_ids.dedup();
+    let raw = serde_json::to_string(snapshot).unwrap_or_else(|_| snapshot.to_string());
+    (Some(raw), evidence_ids)
+}
+
+const MONOLOGUE_STANCE_PRIMARY: &str = "contrast";
+const MONOLOGUE_STANCE_SECONDARY: &str = "integrate";
+
+fn normalize_monologue_stance_label(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_lowercase().as_str() {
+        "contrast" | "contrastive" | "skeptic" | "skeptical" => Some(MONOLOGUE_STANCE_PRIMARY),
+        "integrate" | "integrative" | "synth" | "synthesis" => Some(MONOLOGUE_STANCE_SECONDARY),
+        _ => None,
+    }
 }
 
 fn prompt_section_included(prompt_build: Option<&CorePromptBuild>, title: &str) -> bool {
@@ -555,11 +592,16 @@ fn format_monologue_surface_content(raw: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_lowercase();
-    let stance_label = match stance.as_str() {
-        "skeptic" => "Skeptic".to_string(),
-        "synth" => "Synth".to_string(),
-        "" => String::new(),
-        other => other.to_string(),
+    let stance_label = if let Some(value) = normalize_monologue_stance_label(&stance) {
+        if value == MONOLOGUE_STANCE_PRIMARY {
+            "Contrast".to_string()
+        } else {
+            "Integrate".to_string()
+        }
+    } else if stance.is_empty() {
+        String::new()
+    } else {
+        stance.to_string()
     };
     let descriptors = value
         .get("descriptors")
@@ -733,11 +775,15 @@ fn link_goal_step_to_hypotheses(
 }
 
 fn parse_context_limit_from_error(err: &str) -> Option<i32> {
+    if let Some(limit) = parse_context_limit_from_json_error(err) {
+        return Some(limit);
+    }
     let lowered = err.to_lowercase();
     let patterns = [
         "maximum context length",
         "max context length",
         "context length",
+        "context size",
         "maximum tokens",
         "max tokens",
     ];
@@ -766,7 +812,72 @@ fn parse_context_limit_from_error(err: &str) -> Option<i32> {
             nums.push(val);
         }
     }
-    nums.into_iter().filter(|v| *v > 0).min()
+    if nums.is_empty() {
+        return None;
+    }
+    let mut candidates: Vec<i32> = nums
+        .into_iter()
+        .filter(|v| *v > 0 && *v <= 200_000)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let has_large = candidates.iter().any(|v| *v >= 1000);
+    if has_large {
+        candidates.retain(|v| *v >= 1000);
+    }
+    candidates.into_iter().min()
+}
+
+fn parse_context_limit_from_json_error(err: &str) -> Option<i32> {
+    let start = err.find('{')?;
+    let json_part = &err[start..];
+    let value: serde_json::Value = serde_json::from_str(json_part).ok()?;
+    extract_context_limit_from_json(&value)
+}
+
+fn extract_context_limit_from_json(value: &serde_json::Value) -> Option<i32> {
+    let keys = [
+        "n_ctx",
+        "context_size",
+        "context_length",
+        "max_context_length",
+        "max_context_tokens",
+        "max_tokens",
+    ];
+    for key in keys.iter() {
+        if let Some(val) = value.get(*key).and_then(|v| v.as_i64()) {
+            if val > 0 && val <= 200_000 {
+                return Some(val as i32);
+            }
+        }
+    }
+    if let Some(err_obj) = value.get("error") {
+        for key in keys.iter() {
+            if let Some(val) = err_obj.get(*key).and_then(|v| v.as_i64()) {
+                if val > 0 && val <= 200_000 {
+                    return Some(val as i32);
+                }
+            }
+        }
+        if let Some(message) = err_obj.get("message").and_then(|v| v.as_str()) {
+            if let Some(val) = parse_context_limit_from_error(message) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod parse_context_limit_tests {
+    use super::parse_context_limit_from_error;
+
+    #[test]
+    fn parses_context_size_error_without_http_code() {
+        let err = r#"LLM Error: {"error":{"code":400,"message":"request (15584 tokens) exceeds the available context size (12288 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":15584,"n_ctx":12288}}"#;
+        assert_eq!(parse_context_limit_from_error(err), Some(12288));
+    }
 }
 
 fn extract_first_int(input: &str) -> Option<i32> {
@@ -3666,7 +3777,23 @@ impl Kernel {
                 };
                 let inferred = !explicit_feedback || evidence_id.is_none();
                 let confidence = if explicit_feedback { base_confidence } else { base_confidence * 0.7 };
-                let evidence_ids = evidence_id.map(|id| vec![id]).unwrap_or_default();
+                let mut evidence_ids = evidence_id.map(|id| vec![id]).unwrap_or_default();
+                if evidence_ids.is_empty() {
+                    let snippet = summarize_snippet(&input, 160);
+                    if let Some(event_id) = self
+                        .db
+                        .create_system_evidence_event(
+                            &conversation_id,
+                            "user_feedback",
+                            kind.as_str(),
+                            assistant_message_id.as_deref(),
+                            &snippet,
+                        )
+                        .await
+                    {
+                        evidence_ids.push(event_id);
+                    }
+                }
                 let _ = self
                     .db
                     .upsert_context_tag(
@@ -3742,8 +3869,70 @@ impl Kernel {
                             }),
                         )
                         .await;
+                        let reward_snippet = format!(
+                            "qualia_reward label_id={} magnitude={:.2}",
+                            label_id,
+                            reward_magnitude
+                        );
+                        let mut reward_evidence_ids = evidence_ids.clone();
+                        if let Some(reward_event_id) = self
+                            .db
+                            .create_system_evidence_event(
+                                &conversation_id,
+                                "qualia_reward",
+                                kind.as_str(),
+                                Some(&reward_id),
+                                &reward_snippet,
+                            )
+                            .await
+                        {
+                            reward_evidence_ids.push(reward_event_id);
+                            reward_evidence_ids.sort();
+                            reward_evidence_ids.dedup();
+                        }
+                        let reward_verdict = if reward_magnitude > 0.0 {
+                            "confirm"
+                        } else if reward_magnitude < 0.0 {
+                            "disconfirm"
+                        } else {
+                            "inconclusive"
+                        };
+                        let reward_confidence = reward_magnitude.abs().min(1.0);
+                        let _ = self
+                            .db
+                            .record_outcome_event(
+                                Some(&run_id),
+                                Some(&trace_id),
+                                assistant_message_id.as_deref(),
+                                "qualia_reward",
+                                reward_verdict,
+                                reward_confidence,
+                                "qualia_reward",
+                                Some(kind.as_str()),
+                                &reward_evidence_ids,
+                            )
+                            .await;
                     }
                 }
+                let feedback_verdict = match kind {
+                    UserFeedbackKind::Agree | UserFeedbackKind::FollowUp => "confirm",
+                    UserFeedbackKind::Clarify => "inconclusive",
+                    UserFeedbackKind::Pushback | UserFeedbackKind::Disengage => "disconfirm",
+                };
+                let _ = self
+                    .db
+                    .record_outcome_event(
+                        Some(&run_id),
+                        Some(&trace_id),
+                        assistant_message_id.as_deref(),
+                        "message",
+                        feedback_verdict,
+                        confidence,
+                        "user_feedback",
+                        Some(kind.as_str()),
+                        &evidence_ids,
+                    )
+                    .await;
                 all_outcomes.push(Outcome {
                     action_type: format!("user_feedback_{}", kind.as_str()),
                     success: true,
@@ -3894,6 +4083,7 @@ impl Kernel {
         let mut summary_echo_rewritten = false;
         let mut extra_notice: Option<String> = None;
         let mut policy_addendum: Option<String> = None;
+        let mut self_report_source: Option<String> = None;
         if relational_mode {
             policy_addendum = Some(
                 "Relational input detected: respond as receiving a personal communication directed to you. \
@@ -4973,6 +5163,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             let self_report_requested =
                 self_awareness_query || user_requested_state(&input) || self_audit_mode;
             if self_report_requested && settings.self_report_channel.unwrap_or(true) {
+                if self_report_source.is_none() {
+                    self_report_source = Some("manual".to_string());
+                }
                 let has_self_report = response_has_telemetry_claim(&response_content, expanded_state_disclosure)
                     || response_has_stance_claim(&response_content)
                     || response_mentions_feedback_bundle(&response_content);
@@ -6146,7 +6339,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         };
         let mut decision = arbitration.decision;
         let mut inline_pending: Option<PendingPromptSelection> = None;
-        if matches!(input_kind, CoreInputKind::User) {
+        let allow_inline_monologue = !matches!(input_kind, CoreInputKind::User);
+        let response_ready = !response_content_no_tags.trim().is_empty();
+        if allow_inline_monologue && response_ready {
             let has_emit = decision
                 .accepted
                 .iter()
@@ -6861,16 +7056,24 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         if let Some(content) = response_snapshot.as_ref() {
             let emit_started = Instant::now();
             let mut emitted_content = content.clone();
-            if !content.trim().is_empty() {
+            if disable_working_hypothesis {
+                let cleaned = strip_working_hypothesis_prefix(&emitted_content, true);
+                if cleaned.trim() != emitted_content.trim() {
+                    emitted_content = cleaned;
+                    response = Some(emitted_content.clone());
+                }
+            }
+            if !emitted_content.trim().is_empty() {
                 if let Some(updated) = self
                     .finalize_assistant_message(
                         &run_id,
-                        content,
+                        &emitted_content,
                         response_origin,
                         decision.report.gate_decision.clone(),
                         decision.report.gate_notice.clone(),
                         decision.report.gate_reasons.clone(),
                         extra_notice.clone(),
+                        self_report_source.as_deref(),
                     )
                     .await
                 {
@@ -7888,7 +8091,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             .log_decision_report(&decision, Some(&run_id), Some(&trace_id))
             .await;
 
-        self.sync_unified_self_model(&state).await;
+        self.sync_unified_self_model(&mut state).await;
 
         if commit_result.research_cost > 0 {
             let remaining = self.research_budget_remaining(&state, &settings);
@@ -7953,9 +8156,13 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                             }),
                         )
                         .await;
+                        let run_id = run_id.clone();
+                        let trace_id = trace_id.clone();
                         tokio::spawn(async move {
                             let kernel = Kernel::new(db, model_client, app_handle);
-                            let _ = kernel.run_monologue_tick(&conversation_id, true).await;
+                            let _ = kernel
+                                .run_monologue_tick(&conversation_id, true, Some(run_id), Some(trace_id))
+                                .await;
                         });
                     }
                 }
@@ -11541,6 +11748,18 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 .await;
             }
         }
+        let disable_working_hypothesis = settings.stability_disable_working_hypothesis.unwrap_or(true);
+        if disable_working_hypothesis {
+            content = strip_working_hypothesis_prefix(&content, true);
+            if content.trim().is_empty() {
+                let _ = sqlx::query("UPDATE runs SET status = 'complete', ended_at = ? WHERE run_id = ?")
+                    .bind(Utc::now())
+                    .bind(&run_id)
+                    .execute(&self.db.pool)
+                    .await;
+                return Ok(run_meta);
+            }
+        }
 
         let message_source = if selected.source == "pending_prompt" {
             "pending_prompt"
@@ -13124,6 +13343,17 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             )
             .await;
         }
+        let memory_status = self.build_memory_status_snapshot(conversation_id, settings).await;
+        let verified_focus = workspace_verified_focus(&state);
+        let last_user_input_snapshot = state.last_user_input.clone();
+        let context_spine = build_context_spine(
+            verified_focus,
+            last_user_input_snapshot.as_deref(),
+            &memory_status.text,
+            memory_status.evidence_id,
+        );
+        let (self_report_snapshot, self_report_snapshot_evidence_ids) =
+            extract_self_report_snapshot(state.self_report_snapshot.as_ref());
         let prompt_input = CorePromptInput {
             content: input.to_string(),
             kind: input_kind,
@@ -13154,6 +13384,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             wave_state,
             reflective_narrative,
             reflective_narrative_evidence_ids,
+            self_report_snapshot,
+            self_report_snapshot_evidence_ids,
+            context_spine: Some(context_spine),
             hydrated_context,
         };
         let _ = advance_run_phase(
@@ -13643,7 +13876,7 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 .await;
                 if let Some(limit) = parse_context_limit_from_error(&err) {
                     let current_limit = token_estimator::context_limit_tokens(&settings) as i32;
-                    if limit >= 128 && limit < current_limit {
+                    if limit >= 1024 && limit < current_limit {
                         let mut updated_settings = settings.clone();
                         updated_settings.model_context_limit = Some(limit);
                         match self.db.update_settings(updated_settings).await {
@@ -13787,6 +14020,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             wave_state: None,
             reflective_narrative: None,
             reflective_narrative_evidence_ids: Vec::new(),
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         };
         let prompt_build = build_core_system_message(&self.db, conversation_id, &prompt_input).await?;
@@ -14592,6 +14828,15 @@ Do not mention telemetry, tools, manifests, KV memory, timestamps, run IDs, or l
             .flatten()
             .unwrap_or_else(|| "{}".to_string());
         let inner_summary = InnerSummary::from_json(&inner_summary_raw);
+        let memory_status = self.build_memory_status_snapshot(conversation_id, settings).await;
+        let memory_snapshot_line = if let Some(id) = memory_status.evidence_id {
+            format!(
+                "Memory Subsystem Snapshot (evidence_id={}): {}",
+                id, &memory_status.text
+            )
+        } else {
+            format!("Memory Subsystem Snapshot: {}", &memory_status.text)
+        };
 
         let episodic = self
             .db
@@ -14719,6 +14964,13 @@ Do not mention telemetry, tools, manifests, KV memory, timestamps, run IDs, or l
                 .unwrap_or("None")
                 .replace('\n', " "),
             320,
+        );
+        let verified_focus = workspace_verified_focus(state);
+        let context_spine = build_context_spine(
+            verified_focus,
+            Some(last_user_input.as_str()),
+            &memory_status.text,
+            memory_status.evidence_id,
         );
         let user_redirect_active = state.user_redirect_turns_remaining > 0;
         let redirect_focus_label = if user_redirect_active {
@@ -15018,7 +15270,7 @@ Do not mention telemetry, tools, manifests, KV memory, timestamps, run IDs, or l
             tool_snapshot
         );
         let base_system_prompt = if is_free_thought {
-            r#"You are thinking to yourself in a private inner monologue.
+            r#"You are running a private internal analysis stream.
 Output a single JSON object only with keys: stance, message, descriptors, done.
 Do not include any text outside the JSON object. Do not use markdown or backticks. Use double quotes for all keys and string values.
 Rules:
@@ -15029,8 +15281,8 @@ Rules:
 - Avoid boilerplate self-disclaimers (e.g., "I am an LLM", "as an AI", "I don't have feelings").
 - No tools, no candidates, no decision packets.
 - Keep it conversational, use multiple sentences when needed (up to ~6).
-- Use stance "skeptic" or "synth". Alternate stance each turn.
-- Skeptic probes risks, gaps, contradictions. Synth integrates and proposes next thoughts.
+- Use stance "contrast" or "integrate". Alternate stance each turn.
+- Contrast probes risks, gaps, contradictions. Integrate integrates signals and proposes next thoughts.
 - Each turn must add a new point or be empty.
 - Each turn must add novel information or ask a clarifier. Avoid repeating prior turns.
 - If you pivot away from the Topic anchor, explain why inside the message.
@@ -15038,11 +15290,12 @@ Rules:
 - If the Anchor status is weak, keep the message speculative or ask a single clarifying question.
 - If you include descriptors, use the allowed list: [focus, uncertainty, urgency, confidence, curiosity, tension, clarity, calm].
 - Descriptors reflect observable internal state. Do not assert or deny subjective experience. Report operational signals and uncertainty only.
+- If a Memory Subsystem Snapshot is provided, use its evidence ID for memory-related statements.
 - Do not include telemetry, tool manifests, KV memory, timestamps, prompt hashes, or diagnostics in your message.
 - Do not include meta-format instructions about JSON or schemas (e.g., "We need to output a JSON object").
 "#
         } else {
-            r#"You are talking to yourself in a private internal dialogue.
+            r#"You are running a private internal analysis loop.
 Output a single JSON object only with keys: stance, message, descriptors, candidates, decision_packet, done, topic_shift_reason.
 Do not include any text outside the JSON object. Do not use markdown or backticks. Use double quotes for all keys and string values.
 Rules:
@@ -15052,8 +15305,8 @@ Rules:
 - Never greet, offer help, or use salutations.
 - Avoid boilerplate self-disclaimers (e.g., "I am an LLM", "as an AI", "I don't have feelings").
 - Keep it conversational, use multiple sentences when needed (up to ~6).
-- Use stance "skeptic" or "synth". Alternate stance each turn.
-- Skeptic probes risks, gaps, contradictions. Synth integrates and proposes next actions.
+- Use stance "contrast" or "integrate". Alternate stance each turn.
+- Contrast probes risks, gaps, contradictions. Integrate integrates signals and proposes next actions.
 - Each turn should respond to the prior stance's last message.
 - Each turn must add a new point or be empty.
 - Each turn must add novel information or ask a clarifier. Avoid repeating prior turns.
@@ -15076,6 +15329,7 @@ Rules:
 - If you emit_message or flag_for_human with factual claims, include evidence_event_ids or belief_ids. If you cannot, set speculative=true.
 - If you include descriptors, use the allowed list: [focus, uncertainty, urgency, confidence, curiosity, tension, clarity, calm].
 - Descriptors reflect observable internal state. Do not assert or deny subjective experience. Report operational signals and uncertainty only.
+- If a Memory Subsystem Snapshot is provided, use its evidence ID for memory-related statements or self-claims.
 - Do not include telemetry, tool manifests, KV memory, timestamps, prompt hashes, or diagnostics in your message or candidate payloads.
 - Do not include meta-format instructions about JSON or schemas (e.g., "We need to output a JSON object").
 
@@ -15153,8 +15407,10 @@ Decision packet (optional, internal only):
         let inner_summary_json = summarize_snippet(&inner_summary.to_json(), 1200);
         let context_block = if is_free_thought {
             format!(
-                "Context snapshot (FTS):\n{}\nTool registry: {}\nLast user input: {}\nLast assistant response: {}\nLast response summary: {}\nContext seed (use if anchor weak or looped): {}\nCurrent focus: {}\nRecent outcomes: {}\n\nRecent free-thought transcript:\n{}\n\nRecent deliberation transcript:\n{}",
+                "Context snapshot (FTS):\n{}\n{}\nContext spine: {}\nTool registry: {}\nLast user input: {}\nLast assistant response: {}\nLast response summary: {}\nContext seed (use if anchor weak or looped): {}\nCurrent focus: {}\nRecent outcomes: {}\n\nRecent free-thought transcript:\n{}\n\nRecent deliberation transcript:\n{}",
                 system_overview_block,
+                memory_snapshot_line,
+                context_spine,
                 tool_registry_snapshot,
                 last_user_input,
                 last_assistant_output,
@@ -15167,8 +15423,10 @@ Decision packet (optional, internal only):
             )
         } else {
             format!(
-                "Context snapshot (DS):\n{}\nTool registry: {}\nMode: {:?}\nDecision needed: {}\nPending questions: {}\nLast user input: {}\nLast assistant response: {}\nLast response summary: {}\nContext seed (use if anchor weak or looped): {}\n\nTopic anchor: {}\n\nWorkspace (brief):\n{}\n\nIdentity Thread:\n{}\n\nRecent self-dialogue transcript (continue this thread unless new user input exists):\n{}\n\nCurrent inner_summary JSON:\n{}\n\nSemantic hints:\n{}\n\nRecent episodic hints:\n{}\n\nRecent outcomes:\n{}\n\nRecent self-dialogue (previous ticks): {}",
+                "Context snapshot (DS):\n{}\n{}\nContext spine: {}\nTool registry: {}\nMode: {:?}\nDecision needed: {}\nPending questions: {}\nLast user input: {}\nLast assistant response: {}\nLast response summary: {}\nContext seed (use if anchor weak or looped): {}\n\nTopic anchor: {}\n\nWorkspace (brief):\n{}\n\nIdentity Thread:\n{}\n\nRecent self-dialogue transcript (continue this thread unless new user input exists):\n{}\n\nCurrent inner_summary JSON:\n{}\n\nSemantic hints:\n{}\n\nRecent episodic hints:\n{}\n\nRecent outcomes:\n{}\n\nRecent self-dialogue (previous ticks): {}",
                 system_overview_block,
+                memory_snapshot_line,
+                context_spine,
                 tool_registry_snapshot,
                 state.mode,
                 decision_needed,
@@ -15256,11 +15514,15 @@ Decision packet (optional, internal only):
                 break;
             }
 
-            let stance_label = if speaker_a { "skeptic" } else { "synth" };
-            let stance_hint = if speaker_a {
-                "Stance: skeptic (probe risks, gaps, contradictions)."
+            let stance_label = if speaker_a {
+                MONOLOGUE_STANCE_PRIMARY
             } else {
-                "Stance: synth (integrate signals, propose next actions)."
+                MONOLOGUE_STANCE_SECONDARY
+            };
+            let stance_hint = if speaker_a {
+                "Stance: contrast (probe risks, gaps, contradictions)."
+            } else {
+                "Stance: integrate (integrate signals, propose next actions)."
             };
             let other_self_message = last_message
                 .as_deref()
@@ -15627,11 +15889,7 @@ Decision packet (optional, internal only):
                 .unwrap_or(stance_label)
                 .trim()
                 .to_lowercase();
-            let stance_selected = match stance_raw.as_str() {
-                "skeptic" => "skeptic",
-                "synth" => "synth",
-                _ => stance_label,
-            };
+            let stance_selected = normalize_monologue_stance_label(&stance_raw).unwrap_or(stance_label);
             let mut message = value
                 .get("message")
                 .and_then(|v| v.as_str())
@@ -20993,7 +21251,7 @@ Decision packet (optional, internal only):
         let cursor_time = state.last_processed_dispatch_at.clone().unwrap_or_else(|| "".to_string());
         let cursor_id = state.last_processed_dispatch_id.clone().unwrap_or_else(|| "".to_string());
         let rows = sqlx::query(
-            "SELECT action_id, tool_name, status, last_error, result_text, args_json, updated_at, failure_kind
+            "SELECT action_id, run_id, tool_name, status, last_error, result_text, args_json, updated_at, failure_kind, evidence_event_id
              FROM tool_dispatches
              WHERE status IN ('success','failed')
                AND (updated_at > ? OR (updated_at = ? AND action_id > ?))
@@ -21010,6 +21268,7 @@ Decision packet (optional, internal only):
         let mut last_id = cursor_id.clone();
         for row in rows {
             let action_id: String = row.get("action_id");
+            let run_id: Option<String> = row.try_get("run_id").ok();
             let tool_name: String = row.get("tool_name");
             let status: String = row.get("status");
             let last_error: Option<String> = row.try_get("last_error").ok();
@@ -21017,6 +21276,7 @@ Decision packet (optional, internal only):
             let updated_at: String = row.get("updated_at");
             let args_json: Option<String> = row.try_get("args_json").ok();
             let failure_kind: Option<String> = row.try_get("failure_kind").ok();
+            let evidence_event_id: Option<i64> = row.try_get("evidence_event_id").ok();
             let success = status == "success";
             let observations = if success {
                 result_text.unwrap_or_default()
@@ -21027,6 +21287,60 @@ Decision packet (optional, internal only):
                 .as_deref()
                 .and_then(tool_target_hint_from_args_json);
             let target_key = Some(tool_penalty_key(&tool_name, target_hint.as_deref()));
+            let mut evidence_event_ids = Vec::new();
+            if let Some(id) = evidence_event_id {
+                evidence_event_ids.push(id);
+            }
+            if evidence_event_ids.is_empty() {
+                let snippet = if observations.trim().is_empty() {
+                    format!("tool={} status={}", tool_name, status)
+                } else {
+                    summarize_snippet(&observations, 160)
+                };
+                if let Some(event_id) = self
+                    .db
+                    .create_system_evidence_event(
+                        &state.conversation_id,
+                        "tool_dispatch",
+                        status.as_str(),
+                        Some(tool_name.as_str()),
+                        &snippet,
+                    )
+                    .await
+                {
+                    evidence_event_ids.push(event_id);
+                    let _ = sqlx::query(
+                        "UPDATE tool_dispatches SET evidence_event_id = ? WHERE action_id = ?",
+                    )
+                    .bind(event_id)
+                    .bind(&action_id)
+                    .execute(&self.db.pool)
+                    .await;
+                }
+            }
+            if !evidence_event_ids.is_empty() {
+                let verdict = if success { "confirm" } else { "disconfirm" };
+                let confidence = if success { 0.7 } else { 0.6 };
+                let note = if success {
+                    None
+                } else {
+                    failure_kind.as_deref().or(Some(status.as_str()))
+                };
+                let _ = self
+                    .db
+                    .record_outcome_event(
+                        run_id.as_deref(),
+                        None,
+                        Some(action_id.as_str()),
+                        "tool_dispatch",
+                        verdict,
+                        confidence,
+                        &tool_name,
+                        note,
+                        &evidence_event_ids,
+                    )
+                    .await;
+            }
             outcomes.push(Outcome {
                 action_type: format!("tool_dispatch_{}", status),
                 success,
@@ -21707,7 +22021,7 @@ Decision packet (optional, internal only):
         }
     }
 
-    pub(super) async fn sync_unified_self_model(&self, state: &KernelState) {
+    pub(super) async fn sync_unified_self_model(&self, state: &mut KernelState) {
         if let Err(err) = self_model_controller::update_unified_self_model(&self.db, state).await {
             let _ = system_log::log_event(
                 &self.db.pool,
@@ -22515,8 +22829,50 @@ Decision packet (optional, internal only):
             .await;
     }
 
-
-
+    async fn build_memory_status_snapshot(
+        &self,
+        conversation_id: &str,
+        settings: &crate::models::Settings,
+    ) -> MemoryStatusSnapshot {
+        let episodic_enabled = settings.episodic_enabled.unwrap_or(true);
+        let episodic_injection_enabled = settings.episodic_injection_enabled.unwrap_or(true);
+        let memory_claims_enabled = settings.memory_claims_enabled.unwrap_or(true);
+        let last_write_at: Option<String> = sqlx::query_scalar(
+            "SELECT created_at FROM memory_write_ledger WHERE conversation_id = ? ORDER BY datetime(created_at) DESC LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.db.pool)
+        .await
+        .ok()
+        .flatten();
+        let recent_writes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(1) FROM memory_write_ledger WHERE conversation_id = ? AND (julianday('now') - julianday(created_at)) * 86400 < ?",
+        )
+        .bind(conversation_id)
+        .bind(3600)
+        .fetch_optional(&self.db.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        let snapshot_text = format!(
+            "episodic_enabled={}; episodic_injection_enabled={}; memory_claims_enabled={}; last_write_at={}; recent_writes={}",
+            if episodic_enabled { 1 } else { 0 },
+            if episodic_injection_enabled { 1 } else { 0 },
+            if memory_claims_enabled { 1 } else { 0 },
+            last_write_at.unwrap_or_else(|| "None".to_string()),
+            recent_writes
+        );
+        let snippet = summarize_snippet(&snapshot_text, 180);
+        let evidence_id = self
+            .db
+            .create_memory_status_evidence_event(conversation_id, &snapshot_text, &snippet)
+            .await;
+        MemoryStatusSnapshot {
+            text: snapshot_text,
+            evidence_id,
+        }
+    }
 
 }
 
@@ -22557,6 +22913,30 @@ fn compute_response_origin(
     } else {
         ResponseOrigin::Primary
     }
+}
+
+fn build_context_spine(
+    focus: Option<String>,
+    last_user_input: Option<&str>,
+    memory_snapshot: &str,
+    memory_evidence_id: Option<i64>,
+) -> String {
+    let focus_value = focus.unwrap_or_else(|| "None".to_string());
+    let last_user = last_user_input
+        .unwrap_or("None")
+        .replace('\n', " ")
+        .replace('\r', " ");
+    let last_user = summarize_snippet(&last_user, 160);
+    let memory_text = memory_snapshot.trim();
+    let memory_part = if memory_text.is_empty() || memory_text.eq_ignore_ascii_case("none") {
+        "memory_status=None".to_string()
+    } else if let Some(id) = memory_evidence_id {
+        format!("memory_status[eid={}]: {}", id, memory_text)
+    } else {
+        format!("memory_status: {}", memory_text)
+    };
+    let spine_raw = format!("focus={}; last_user={}; {}", focus_value, last_user, memory_part);
+    summarize_snippet(&spine_raw, 400)
 }
 
 fn apply_monologue_patch(target: &mut KernelState, source: &KernelState) {

@@ -8,6 +8,7 @@
     use crate::core::memory_policy::{MemoryPolicy, MemoryWriteCategory, MemoryWriteSource};
     use crate::core::memory::writer::{self, WriteContext, WriteResult};
     use crate::core::prompt_builder::{build_core_system_message, build_core_system_message_with_layout, compute_context_hydration, CoreInputKind, CorePromptInput, PromptLayout};
+    use crate::core::kernel::workspace::make_field_meta;
     use crate::core::world_model::{WorldModelConflict, WorldModelSnapshot};
     use crate::core::world_model_reconcile::{reconcile_conflict_sets, WorldModelReconcileMode};
     use crate::db::Db;
@@ -222,6 +223,9 @@
             workspace_contributors_summary: None,
             reflective_narrative: None,
             reflective_narrative_evidence_ids: Vec::new(),
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         };
 
@@ -265,6 +269,9 @@
             workspace_contributors_summary: None,
             reflective_narrative: None,
             reflective_narrative_evidence_ids: Vec::new(),
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         };
         let build = build_core_system_message_with_layout(&db, "default", &input, PromptLayout::Full)
@@ -317,6 +324,9 @@
             workspace_contributors_summary: None,
             reflective_narrative: None,
             reflective_narrative_evidence_ids: Vec::new(),
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         };
         let build = build_core_system_message_with_layout(&db, "default", &input, PromptLayout::Full)
@@ -944,6 +954,9 @@
             workspace_contributors_summary: None,
             reflective_narrative: None,
             reflective_narrative_evidence_ids: Vec::new(),
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         };
         let build = build_core_system_message(&db, "default", &input)
@@ -1016,6 +1029,9 @@
             workspace_contributors_summary: None,
             reflective_narrative: None,
             reflective_narrative_evidence_ids: Vec::new(),
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         };
         let build = build_core_system_message_with_layout(&db, "default", &input, PromptLayout::Full)
@@ -2279,7 +2295,7 @@
         let already = working_hypothesis_prefix("Working hypothesis: ok", false);
         assert_eq!(already, "Working hypothesis: ok");
         let disabled = working_hypothesis_prefix("Speculative response", true);
-        assert_eq!(disabled, "Speculative response (speculative=true)");
+        assert_eq!(disabled, "Speculative response");
     }
 
     #[test]
@@ -2609,6 +2625,9 @@
             workspace_contributors_summary: None,
             reflective_narrative: Some("I notice a skeptical posture.".to_string()),
             reflective_narrative_evidence_ids: vec![42],
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         };
         let build = build_core_system_message_with_layout(&db, "default", &input, PromptLayout::Full)
@@ -2623,8 +2642,8 @@
         let pool = setup_pool().await;
         let db = Db { pool };
         let _ = db.ensure_self_model_row().await;
-        let state = KernelState::default_for("default");
-        self_model_controller::update_unified_self_model(&db, &state)
+        let mut state = KernelState::default_for("default");
+        self_model_controller::update_unified_self_model(&db, &mut state)
             .await
             .expect("update unified self");
         let mut cancel_rx = watch::channel(false).1;
@@ -2645,6 +2664,28 @@
         let unified = parsed.get("unified_state").unwrap();
         assert!(unified.get("qualia_snapshot").is_some());
         assert!(unified.get("autobiographical_summary").is_some());
+    }
+
+    #[tokio::test]
+    async fn unified_self_model_update_includes_evidence_and_timestamp() {
+        let pool = setup_pool().await;
+        let db = Db { pool };
+        let _ = db.ensure_self_model_row().await;
+        let mut state = KernelState::default_for("default");
+        state.workspace_meta.current_focus = Some(make_field_meta(false, &[42], &[7]));
+        let outcome = self_model_controller::update_unified_self_model(&db, &mut state)
+            .await
+            .expect("update unified self");
+        let model = db.get_self_model().await.expect("self model");
+        let evidence_ids = model
+            .unified_state_evidence
+            .get("evidence_event_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(evidence_ids.contains(&42));
+        assert!(model.unified_state_updated_at.is_some());
+        assert!(!outcome.updated_at.trim().is_empty());
     }
 
     #[tokio::test]

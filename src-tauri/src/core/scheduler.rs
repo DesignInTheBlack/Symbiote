@@ -60,6 +60,9 @@ const EPISODIC_IDENTITY_BACKFILL_INTERVAL_SECS: i64 = 6 * 60 * 60;
 const DREAM_INTERVAL_SECS: i64 = 600;
 /// Self-memory bridge interval: 5 minutes
 const SELF_MEMORY_BRIDGE_INTERVAL_SECS: i64 = 300;
+const SELF_REPORT_INTERVAL_SECS: i64 = 10 * 60;
+const SELF_REPORT_TURN_INTERVAL: i64 = 6;
+const SELF_REPORT_RELIABILITY_WARN: f32 = 0.45;
 
 const ROLLING_SUMMARY_RETRY_BASE_SECS: u64 = 5;
 const ROLLING_SUMMARY_RETRY_MAX_SECS: u64 = 120;
@@ -548,6 +551,147 @@ async fn latest_evidence_timestamp(db: &Db) -> Option<DateTime<Utc>> {
         }
     }
     latest
+}
+
+async fn decision_report_count_since(
+    db: &Db,
+    conversation_id: &str,
+    since: Option<&str>,
+) -> i64 {
+    let query = if since.is_some() {
+        "SELECT COUNT(*) FROM decision_reports WHERE conversation_id = ? AND datetime(created_at) > datetime(?)"
+    } else {
+        "SELECT COUNT(*) FROM decision_reports WHERE conversation_id = ?"
+    };
+    let mut stmt = sqlx::query_scalar(query);
+    stmt = stmt.bind(conversation_id);
+    if let Some(since) = since {
+        stmt = stmt.bind(since);
+    }
+    stmt.fetch_optional(&db.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+async fn self_report_due_for_conversation(
+    db: &Db,
+    conversation_id: &str,
+    now: DateTime<Utc>,
+    settings: &crate::models::Settings,
+) -> Option<KernelState> {
+    if !settings.self_report_channel.unwrap_or(true) {
+        return None;
+    }
+    let raw = db.get_kernel_state(conversation_id).await.ok().flatten();
+    let state: KernelState = raw
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| KernelState::default_for(conversation_id));
+    let last_report_at = state
+        .last_self_report_at
+        .as_deref()
+        .and_then(parse_timestamp);
+    let due_time = last_report_at
+        .map(|ts| now.signed_duration_since(ts).num_seconds() >= SELF_REPORT_INTERVAL_SECS)
+        .unwrap_or(true);
+    let turn_count = decision_report_count_since(
+        db,
+        conversation_id,
+        state.last_self_report_at.as_deref(),
+    )
+    .await;
+    let due_turns = turn_count >= SELF_REPORT_TURN_INTERVAL;
+    if due_time || due_turns {
+        Some(state)
+    } else {
+        None
+    }
+}
+
+async fn build_self_report_snapshot(
+    db: &Db,
+    state: &KernelState,
+) -> (Value, Vec<i64>, f32, bool) {
+    let controller_state = db.get_controller_state().await.ok().flatten().unwrap_or_default();
+    let metrics = self_model_controller::collect_self_evidence_metrics(&db.pool)
+        .await
+        .unwrap_or_default();
+    let reliability = self_model_controller::compute_self_model_reliability(&metrics);
+    let mut evidence_ids =
+        self_model_controller::collect_unified_self_evidence_ids(db).await.unwrap_or_default();
+    evidence_ids.sort();
+    evidence_ids.dedup();
+    let mut confidence = controller_state.confidence.clamp(0.0, 1.0);
+    let mut uncertainty = controller_state.uncertainty.clamp(0.0, 1.0);
+    if reliability < SELF_REPORT_RELIABILITY_WARN {
+        confidence = (confidence * 0.6).clamp(0.0, 1.0);
+        uncertainty = (uncertainty + 0.2).clamp(0.0, 1.0);
+    }
+    let mut constraints: Vec<String> = Vec::new();
+    if controller_state.verification_needed {
+        constraints.push("verification_needed".to_string());
+    }
+    if controller_state.reanchor_needed {
+        constraints.push("reanchor_needed".to_string());
+    }
+    if !controller_state.missing_fields.is_empty() {
+        constraints.push(format!(
+            "missing_fields: {}",
+            controller_state.missing_fields.join(", ")
+        ));
+    }
+    if reliability < SELF_REPORT_RELIABILITY_WARN {
+        constraints.push("self_model_reliability_low".to_string());
+    }
+    let status = if reliability < SELF_REPORT_RELIABILITY_WARN || controller_state.drift_score > 0.6 {
+        "degraded"
+    } else {
+        "operational"
+    };
+    let speculative = evidence_ids.is_empty() || reliability < SELF_REPORT_RELIABILITY_WARN;
+    let snapshot = json!({
+        "status": status,
+        "confidence": confidence,
+        "uncertainty": uncertainty,
+        "constraints": constraints,
+        "evidence_event_ids": evidence_ids,
+        "speculative": speculative,
+        "self_model_reliability": reliability,
+        "current_focus": state.workspace_current_focus.clone(),
+        "updated_at": Utc::now().to_rfc3339(),
+        "source": "cadence",
+    });
+    (snapshot, evidence_ids, reliability, speculative)
+}
+
+async fn persist_self_report_patch(db: &Db, state: &KernelState) -> bool {
+    let conversation_id = state.conversation_id.clone();
+    for _ in 0..2 {
+        let (mut base_state, version) = match db.get_kernel_state_with_meta(&conversation_id).await {
+            Ok(Some((json_state, version))) => {
+                let parsed: KernelState = serde_json::from_str(&json_state)
+                    .unwrap_or_else(|_| state.clone());
+                (parsed, Some(version))
+            }
+            _ => (state.clone(), None),
+        };
+        base_state.last_self_report_at = state.last_self_report_at.clone();
+        base_state.self_report_snapshot = state.self_report_snapshot.clone();
+        let json_state = serde_json::to_string(&base_state).unwrap_or_else(|_| "{}".to_string());
+        let updated = if let Some(version) = version {
+            db.update_kernel_state_with_version(&conversation_id, &json_state, Some("self_report"), version)
+                .await
+                .unwrap_or(false)
+        } else {
+            let _ = db.set_kernel_state(&conversation_id, &json_state, Some("self_report")).await;
+            true
+        };
+        if updated {
+            return true;
+        }
+    }
+    false
 }
 
 async fn run_policy_scan(db: &Db, app: &AppHandle) {
@@ -1106,7 +1250,9 @@ impl Scheduler {
                         let ids = conversation_ids.clone();
                         tokio::spawn(async move {
                             for cid in ids {
-                                let _ = kernel_clone.run_monologue_tick(&cid, false).await;
+                                let _ = kernel_clone
+                                    .run_monologue_tick(&cid, false, None, None)
+                                    .await;
                             }
                         });
                     }
@@ -1408,10 +1554,10 @@ impl Scheduler {
                             let mut refreshed = 0usize;
                             for cid in ids {
                                 let raw = db_clone.get_kernel_state(&cid).await.ok().flatten();
-                                let kernel_state: KernelState = raw
+                                let mut kernel_state: KernelState = raw
                                     .and_then(|s| serde_json::from_str(&s).ok())
                                     .unwrap_or_else(|| KernelState::default_for(&cid));
-                                match self_model_controller::update_unified_self_model(&db_clone, &kernel_state).await {
+                                match self_model_controller::update_unified_self_model(&db_clone, &mut kernel_state).await {
                                     Ok(_) => refreshed += 1,
                                     Err(err) => {
                                         let _ = system_log::log_event(
@@ -1448,6 +1594,61 @@ impl Scheduler {
                                 }),
                             )
                             .await;
+                        });
+                    }
+
+                    if background_allowed && !scheduler_degraded {
+                        let db_clone = db.clone();
+                        let app_clone = app.clone();
+                        let ids = conversation_ids.clone();
+                        tokio::spawn(async move {
+                            let settings = match db_clone.get_settings().await {
+                                Ok(settings) => settings,
+                                Err(_) => return,
+                            };
+                            for cid in ids {
+                                if let Some(mut state) =
+                                    self_report_due_for_conversation(&db_clone, &cid, Utc::now(), &settings).await
+                                {
+                                    let (snapshot, evidence_ids, reliability, speculative) =
+                                        build_self_report_snapshot(&db_clone, &state).await;
+                                    state.last_self_report_at = Some(Utc::now().to_rfc3339());
+                                    state.self_report_snapshot = Some(snapshot.clone());
+                                    if persist_self_report_patch(&db_clone, &state).await {
+                                        let _ = system_log::log_event(
+                                            &db_clone.pool,
+                                            Some(&app_clone),
+                                            "info",
+                                            "scheduler",
+                                            None,
+                                            None,
+                                            json!({
+                                                "event": "self_report_snapshot",
+                                                "conversation_id": cid,
+                                                "evidence_event_ids": evidence_ids,
+                                                "self_model_reliability": reliability,
+                                                "speculative": speculative,
+                                            }),
+                                        )
+                                        .await;
+                                    } else {
+                                        let _ = system_log::log_event(
+                                            &db_clone.pool,
+                                            Some(&app_clone),
+                                            "warn",
+                                            "scheduler",
+                                            None,
+                                            None,
+                                            json!({
+                                                "event": "self_report_snapshot_failed",
+                                                "conversation_id": cid,
+                                                "reason": "kernel_state_update_failed",
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
                         });
                     }
                     

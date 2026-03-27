@@ -112,6 +112,10 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
             return resolved;
         });
     };
+    const isPlaybackActive = () =>
+        isPlayingRef.current || audioQueueRef.current.length > 0;
+    const isTtsInterruptAllowed = (reason?: string) =>
+        Boolean(reason && ["user_stop", "barge_in", "halt"].includes(reason));
 
     // --- 1. Startup & Health Check ---
     useEffect(() => {
@@ -162,6 +166,10 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
     const startTtsWatchdog = () => {
         if (ttsWatchdogRef.current !== null) return;
         ttsWatchdogRef.current = window.setInterval(() => {
+            const playbackActive = isPlaybackActive();
+            if (playbackActive) {
+                return;
+            }
             if (!ttsActiveRef.current) {
                 clearTtsWatchdog();
                 return;
@@ -351,7 +359,7 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
 
     const restartVoiceService = (reason?: string) => {
         const now = Date.now();
-        if (statusRef.current === "speaking" && reason !== "tts_watchdog") {
+        if (statusRef.current === "speaking" || isPlaybackActive()) {
             pendingRestartAfterSpeechRef.current = true;
             pendingRestartReasonRef.current = reason || "deferred_restart";
             return;
@@ -430,7 +438,10 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
             if (statusRef.current === "recording") {
                 stopRecording();
             }
-            if (statusRef.current === "speaking") {
+            if (isPlaybackActive()) {
+                pendingRestartAfterSpeechRef.current = true;
+                pendingRestartReasonRef.current = "ws_closed";
+            } else if (statusRef.current === "speaking") {
                 stopAudioPlayback("ws_closed");
             }
             ttsActiveRef.current = false;
@@ -473,11 +484,11 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
             // Marker for end of stream
             ttsActiveRef.current = false;
             clearTtsWatchdog();
-        if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
-            if (ttsStartedAtRef.current !== null) {
-                const durationMs = Date.now() - ttsStartedAtRef.current;
-                void logUiTiming({
-                    event: "tts_speak_end",
+            if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
+                if (ttsStartedAtRef.current !== null) {
+                    const durationMs = Date.now() - ttsStartedAtRef.current;
+                    void logUiTiming({
+                        event: "tts_speak_end",
                         duration_ms: durationMs,
                         detail: ttsMessageIdRef.current ?? undefined,
                         run_id: ttsRunIdRef.current ?? undefined,
@@ -486,13 +497,22 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
                     ttsStartedAtRef.current = null;
                     ttsMessageIdRef.current = null;
                     ttsRunIdRef.current = null;
+                }
+                setStatusSafe((prev) => prev === "speaking" ? "ready" : prev);
+                emitVoiceEnergy(0);
+                triggerPendingRestart();
+                startNextTts();
             }
-            setStatusSafe((prev) => prev === "speaking" ? "ready" : prev);
-            emitVoiceEnergy(0);
-            triggerPendingRestart();
-            startNextTts();
-        }
         } else if (msg.type === "tts_error") {
+            if (isPlaybackActive()) {
+                pendingRestartAfterSpeechRef.current = true;
+                pendingRestartReasonRef.current = "tts_error";
+                ttsActiveRef.current = false;
+                clearTtsWatchdog();
+                setErrorMessage(msg.detail || "TTS error");
+                setStatusSafe((prev) => (prev === "speaking" ? prev : "error"));
+                return;
+            }
             stopAudioPlayback("tts_error");
             ttsActiveRef.current = false;
             clearTtsWatchdog();
@@ -707,7 +727,10 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
 
     const stopAudioPlayback = (reason?: string) => {
         console.log("[VoiceController] Stopping Audio Playback (Interrupt)");
-        const shouldClearQueue = Boolean(reason && ["user_stop", "barge_in", "halt", "tts_interrupt"].includes(reason));
+        if (isPlaybackActive() && !isTtsInterruptAllowed(reason)) {
+            return;
+        }
+        const shouldClearQueue = isTtsInterruptAllowed(reason);
         if (shouldClearQueue) {
             ttsQueueRef.current = [];
         }

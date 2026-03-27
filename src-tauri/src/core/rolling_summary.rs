@@ -20,7 +20,6 @@ use tauri::AppHandle;
 const SUMMARY_WINDOW_HOURS: i64 = 24;
 const SUMMARY_MAX_TURNS: usize = 60;
 const SUMMARY_FALLBACK_DAYS: i64 = 7;
-const DEFAULT_MODEL_CONTEXT_LIMIT: usize = 16_384;
 const ROLLING_SUMMARY_PROMPT_COHESION: &str = "Write a concise third-person narrative summary that preserves ongoing context without commentary or embellishment. \
 Summarize only the new turns since the last summary window. Do not list events. \
 If Workspace focus is provided and relevant, ensure the summary references it explicitly. \
@@ -72,10 +71,7 @@ async fn control_mode(db: &Db, subsystem_id: &str) -> String {
 }
 
 fn summary_prompt_cap_tokens(settings: &Settings) -> usize {
-    let limit = settings
-        .model_context_limit
-        .unwrap_or(DEFAULT_MODEL_CONTEXT_LIMIT as i32)
-        .max(1) as usize;
+    let limit = token_estimator::context_limit_tokens(settings);
     let cap = ((limit as f32) * 0.2).floor() as usize;
     cap.min(2000).max(1)
 }

@@ -8,6 +8,7 @@ use crate::models::{
     ControllerGate,
     ControllerState,
     GoalStackItem,
+    OutcomeEvent,
     SelfModel,
     WorkspaceFieldMeta,
     WorkspaceListItemMeta,
@@ -16,6 +17,7 @@ use crate::models::{
 };
 use crate::db::Db;
 use crate::core::kernel::KernelState;
+use crate::core::kernel::utils::text::{hash_payload, summarize_snippet};
 use crate::core::memory::types::Scope;
 use crate::core::cognitive_wave::{AmplitudeBounds, DecayProfile, WaveBand, WaveContributionInput};
 use crate::core::memory::retrieval;
@@ -53,6 +55,22 @@ pub struct ReconstructionOutput {
     pub reconstructed_goals: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct SelfModelUpdateOutcome {
+    pub version: i64,
+    pub updated_at: String,
+    pub evidence_event_ids: Vec<i64>,
+    pub reliability: f32,
+    pub kernel_state_updated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnifiedSelfModelContext {
+    pub autobiographical_summary: String,
+    pub outcome_events: Vec<OutcomeEvent>,
+    pub self_model_reliability: f32,
+}
+
 const PERSONA_KEYS: [&str; 5] = [
     "persona.tone",
     "persona.verbosity",
@@ -79,6 +97,8 @@ const PERSONA_MAX_AGE_DAYS: i64 = 30;
 const TELEMETRY_MAX_AGE_DAYS: i64 = 7;
 const TELEMETRY_MIN_COVERAGE: f32 = 0.5;
 const EVIDENCE_MIN_COVERAGE: f32 = 0.6;
+const SELF_MODEL_RELIABILITY_FLOOR: f32 = 0.15;
+const AUTOBIO_STABILITY_THRESHOLD: i64 = 3;
 
 pub async fn telemetry_keys_present(pool: &SqlitePool) -> Result<bool, String> {
     let count: i64 = sqlx::query_scalar(
@@ -327,6 +347,17 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
         missing_fields,
         conflict_count,
     })
+}
+
+pub fn compute_self_model_reliability(metrics: &SelfEvidenceMetrics) -> f32 {
+    let coverage = (0.6 * metrics.evidence_coverage + 0.4 * metrics.telemetry_coverage).clamp(0.0, 1.0);
+    let confidence = metrics.avg_confidence.clamp(0.0, 1.0);
+    let conflict_penalty = (metrics.conflict_count as f32 / 5.0).clamp(0.0, 1.0);
+    let mut reliability = (0.55 * coverage + 0.3 * confidence + 0.15 * (1.0 - conflict_penalty)).clamp(0.0, 1.0);
+    if !metrics.missing_fields.is_empty() {
+        reliability = reliability.min(0.55);
+    }
+    reliability.max(SELF_MODEL_RELIABILITY_FLOOR)
 }
 
 pub fn wave_contribution_from_controller_state(state: &ControllerState) -> WaveContributionInput {
@@ -578,6 +609,19 @@ fn collect_workspace_meta_evidence(meta: &WorkspaceMeta) -> (Vec<i64>, Vec<i64>)
     collect_list_meta_evidence(&meta.open_questions, &mut evidence_event_ids, &mut belief_ids);
     collect_list_meta_evidence(&meta.working_set_topics, &mut evidence_event_ids, &mut belief_ids);
     collect_hypothesis_evidence(&meta.active_hypotheses, &mut evidence_event_ids, &mut belief_ids);
+    if let Some(runtime) = meta.runtime.as_ref().and_then(|v| v.as_object()) {
+        for key in ["autobiographical_summary", "self_report_snapshot"].iter() {
+            if let Some(obj) = runtime.get(*key).and_then(|v| v.as_object()) {
+                if let Some(list) = obj.get("evidence_event_ids").and_then(|v| v.as_array()) {
+                    for id in list.iter().filter_map(|v| v.as_i64()) {
+                        if id > 0 {
+                            evidence_event_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     evidence_event_ids.sort();
     evidence_event_ids.dedup();
@@ -723,6 +767,7 @@ async fn latest_evidence_snippet(pool: &SqlitePool, source_type: &str) -> Option
 pub async fn build_unified_self_model(
     db: &Db,
     state: &KernelState,
+    context: &UnifiedSelfModelContext,
 ) -> Result<(Value, Value), String> {
     let controller_state = db
         .get_controller_state()
@@ -734,9 +779,7 @@ pub async fn build_unified_self_model(
     let qualia_state = qualia::compute_qualia_state(db, None).await?;
     let qualia_snapshot = render_qualia_snapshot(&qualia_state);
     let wave_state = latest_evidence_snippet(&db.pool, "wave_state").await;
-    let autobiographical_summary =
-        retrieval::render_autobiographical_context(&db.pool, Some(&state.conversation_id), 6)
-            .await;
+    let autobiographical_summary = context.autobiographical_summary.clone();
 
     let workspace = json!({
         "current_focus": state.workspace_current_focus.clone(),
@@ -755,16 +798,57 @@ pub async fn build_unified_self_model(
     let wave_evidence_ids = db
         .get_recent_evidence_ids_by_source_types(&["wave_state"], 4)
         .await;
+    let mut outcome_evidence_ids: Vec<i64> = context
+        .outcome_events
+        .iter()
+        .flat_map(|event| event.evidence_event_ids.iter().copied())
+        .collect();
+    outcome_evidence_ids.sort();
+    outcome_evidence_ids.dedup();
     let mut all_evidence_ids = evidence_event_ids.clone();
     all_evidence_ids.extend(qualia_evidence_ids.iter().copied());
     all_evidence_ids.extend(wave_evidence_ids.iter().copied());
+    all_evidence_ids.extend(outcome_evidence_ids.iter().copied());
     all_evidence_ids.sort();
     all_evidence_ids.dedup();
+    let outcome_events = context
+        .outcome_events
+        .iter()
+        .take(6)
+        .map(|event| {
+            json!({
+                "outcome_id": event.outcome_id,
+                "target_type": event.target_type,
+                "verdict": event.verdict,
+                "confidence": event.confidence,
+                "source": event.source,
+                "note": event.note,
+                "evidence_event_ids": event.evidence_event_ids,
+                "created_at": event.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let failure_count = context
+        .outcome_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.verdict.as_str(),
+                "failure" | "disconfirm" | "error"
+            )
+        })
+        .count();
+    let identity_drift_note = if failure_count >= 3 {
+        Some("Recent outcomes include repeated failures; verify identity constraints.".to_string())
+    } else {
+        None
+    };
     let evidence = json!({
         "evidence_event_ids": all_evidence_ids,
         "belief_ids": belief_ids,
         "qualia_evidence_ids": qualia_evidence_ids,
         "wave_evidence_ids": wave_evidence_ids,
+        "outcome_evidence_ids": outcome_evidence_ids,
     });
 
     let unified_state = json!({
@@ -777,14 +861,32 @@ pub async fn build_unified_self_model(
         "qualia_snapshot": qualia_snapshot,
         "wave_state": wave_state.unwrap_or_else(|| "None".to_string()),
         "autobiographical_summary": autobiographical_summary,
+        "action_outcomes": outcome_events,
+        "self_model_reliability": context.self_model_reliability,
+        "identity_drift_note": identity_drift_note,
         "updated_at": Utc::now().to_rfc3339(),
     });
 
     Ok((unified_state, evidence))
 }
 
-pub async fn update_unified_self_model(db: &Db, state: &KernelState) -> Result<(), String> {
-    let (unified_state, unified_evidence) = build_unified_self_model(db, state).await?;
+pub async fn update_unified_self_model(
+    db: &Db,
+    state: &mut KernelState,
+) -> Result<SelfModelUpdateOutcome, String> {
+    let evidence_metrics = collect_self_evidence_metrics(&db.pool).await?;
+    let reliability = compute_self_model_reliability(&evidence_metrics);
+    let autobiographical_summary =
+        retrieval::render_autobiographical_context(&db.pool, Some(&state.conversation_id), 6)
+            .await;
+    update_autobiographical_promotion(db, state, &autobiographical_summary).await;
+    let outcome_events = db.list_outcome_events(12).await.unwrap_or_default();
+    let context = UnifiedSelfModelContext {
+        autobiographical_summary,
+        outcome_events,
+        self_model_reliability: reliability,
+    };
+    let (unified_state, unified_evidence) = build_unified_self_model(db, state, &context).await?;
     let mut model = db.get_self_model().await.map_err(|e| e.to_string())?;
     model.unified_state = unified_state;
     model.unified_state_evidence = unified_evidence;
@@ -801,7 +903,90 @@ pub async fn update_unified_self_model(db: &Db, state: &KernelState) -> Result<(
         model.goals = json!([goal]);
     }
     db.set_self_model(&model).await.map_err(|e| e.to_string())?;
-    Ok(())
+
+    let mut kernel_state_updated = false;
+    let mut updated_at = Utc::now().to_rfc3339();
+    let mut version = state.self_model_version;
+    let conversation_id = state.conversation_id.clone();
+    for attempt in 0..3 {
+        let row = db
+            .get_kernel_state_with_meta(&conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (mut base_state, base_version) = if let Some((raw, version)) = row {
+            let parsed: KernelState = serde_json::from_str(&raw).unwrap_or_else(|_| state.clone());
+            (parsed, Some(version))
+        } else {
+            (state.clone(), None)
+        };
+        let next_version = base_state.self_model_version.saturating_add(1).max(1);
+        updated_at = Utc::now().to_rfc3339();
+        base_state.self_model_version = next_version;
+        base_state.self_model_updated_at = Some(updated_at.clone());
+        let json_state = serde_json::to_string(&base_state).unwrap_or_else(|_| "{}".to_string());
+        let updated = if let Some(expected) = base_version {
+            db.update_kernel_state_with_version(&conversation_id, &json_state, Some("self_model"), expected)
+                .await
+                .unwrap_or(false)
+        } else {
+            let _ = db.set_kernel_state(&conversation_id, &json_state, Some("self_model")).await;
+            true
+        };
+        if updated {
+            state.self_model_version = next_version;
+            state.self_model_updated_at = Some(updated_at.clone());
+            version = next_version;
+            kernel_state_updated = true;
+            break;
+        } else if attempt == 2 {
+            let _ = crate::core::system_log::log_event(
+                &db.pool,
+                None,
+                "warn",
+                "self_model",
+                None,
+                None,
+                json!({
+                    "event": "self_model_update_skipped",
+                    "reason": "kernel_state_version_conflict",
+                    "conversation_id": conversation_id,
+                    "attempts": attempt + 1,
+                }),
+            )
+            .await;
+        }
+    }
+    if !kernel_state_updated {
+        let _ = crate::core::system_log::log_event(
+            &db.pool,
+            None,
+            "warn",
+            "self_model",
+            None,
+            None,
+            json!({
+                "event": "self_model_update_skipped",
+                "reason": "kernel_state_update_failed",
+                "conversation_id": conversation_id,
+            }),
+        )
+        .await;
+    }
+
+    let evidence_event_ids = model
+        .unified_state_evidence
+        .get("evidence_event_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    Ok(SelfModelUpdateOutcome {
+        version,
+        updated_at,
+        evidence_event_ids,
+        reliability,
+        kernel_state_updated,
+    })
 }
 
 pub async fn collect_unified_self_evidence_ids(db: &Db) -> Result<Vec<i64>, String> {
@@ -978,6 +1163,94 @@ fn source_quality_for(raw: &str) -> f32 {
         "inference" => 0.5,
         _ => 0.6,
     }
+}
+
+async fn update_autobiographical_promotion(
+    db: &Db,
+    state: &mut KernelState,
+    summary: &str,
+) {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return;
+    }
+    let now = Utc::now().to_rfc3339();
+    let summary_hash = hash_payload(trimmed);
+    let mut runtime = state
+        .workspace_meta
+        .runtime
+        .clone()
+        .unwrap_or_else(|| json!({}));
+    if !runtime.is_object() {
+        runtime = json!({});
+    }
+    let obj = runtime.as_object_mut().unwrap();
+    let existing = obj
+        .get("autobiographical_summary")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let existing_obj = existing.as_object().cloned().unwrap_or_default();
+    let prev_hash = existing_obj
+        .get("summary_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut stability_count = existing_obj
+        .get("stability_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if prev_hash == summary_hash {
+        stability_count += 1;
+    } else {
+        stability_count = 1;
+    }
+    let mut promoted = existing_obj
+        .get("promoted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut evidence_ids = existing_obj
+        .get("evidence_event_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if stability_count >= AUTOBIO_STABILITY_THRESHOLD
+        && (!promoted || prev_hash != summary_hash || evidence_ids.is_empty())
+    {
+        let snippet = summarize_snippet(trimmed, 240);
+        if let Some(event_id) = db
+            .create_system_evidence_event(
+                &state.conversation_id,
+                "autobiographical_summary",
+                trimmed,
+                Some("autobiographical_summary"),
+                &snippet,
+            )
+            .await
+        {
+            evidence_ids = vec![event_id];
+            promoted = true;
+        }
+    }
+    let promoted_at = if promoted {
+        Some(now.clone())
+    } else {
+        existing_obj
+            .get("promoted_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let summary_record = json!({
+        "summary": trimmed,
+        "summary_hash": summary_hash,
+        "stability_count": stability_count,
+        "promoted": promoted,
+        "promoted_at": promoted_at,
+        "evidence_event_ids": evidence_ids,
+        "speculative": !promoted || evidence_ids.is_empty(),
+        "last_seen_at": now,
+    });
+    obj.insert("autobiographical_summary".to_string(), summary_record);
+    state.workspace_meta.runtime = Some(runtime);
 }
 
 #[cfg(test)]

@@ -3311,7 +3311,7 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         }
         if !column_exists(pool, "settings", "pending_prompt_recency_secs").await {
             sqlx::query(
-                "ALTER TABLE settings ADD COLUMN pending_prompt_recency_secs INTEGER NOT NULL DEFAULT 90",
+                "ALTER TABLE settings ADD COLUMN pending_prompt_recency_secs INTEGER NOT NULL DEFAULT 180",
             )
             .execute(pool)
             .await?;
@@ -3554,7 +3554,7 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
                 .await?;
         }
         if !column_exists(pool, "settings", "stability_disable_working_hypothesis").await {
-            sqlx::query("ALTER TABLE settings ADD COLUMN stability_disable_working_hypothesis BOOLEAN NOT NULL DEFAULT 0")
+            sqlx::query("ALTER TABLE settings ADD COLUMN stability_disable_working_hypothesis BOOLEAN NOT NULL DEFAULT 1")
                 .execute(pool)
                 .await?;
         }
@@ -3668,7 +3668,7 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         let _ = sqlx::query("UPDATE settings SET stability_introspection_structured = 1 WHERE stability_introspection_structured IS NULL")
             .execute(pool)
             .await;
-        let _ = sqlx::query("UPDATE settings SET stability_disable_working_hypothesis = 0 WHERE stability_disable_working_hypothesis IS NULL")
+        let _ = sqlx::query("UPDATE settings SET stability_disable_working_hypothesis = 1 WHERE stability_disable_working_hypothesis IS NULL")
             .execute(pool)
             .await;
         let _ = sqlx::query("UPDATE settings SET stability_state_disclosure_expanded = 1 WHERE stability_state_disclosure_expanded IS NULL")
@@ -3770,7 +3770,7 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         let _ = sqlx::query("UPDATE settings SET pending_prompt_alignment_enabled = 1 WHERE pending_prompt_alignment_enabled IS NULL")
             .execute(pool)
             .await;
-        let _ = sqlx::query("UPDATE settings SET pending_prompt_recency_secs = 90 WHERE pending_prompt_recency_secs IS NULL")
+        let _ = sqlx::query("UPDATE settings SET pending_prompt_recency_secs = 180 WHERE pending_prompt_recency_secs IS NULL")
             .execute(pool)
             .await;
         let _ = sqlx::query("UPDATE settings SET auto_memory_pass_enabled = 1 WHERE auto_memory_pass_enabled IS NULL")
@@ -3824,6 +3824,9 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             .execute(pool)
             .await;
         let _ = sqlx::query("UPDATE settings SET model_context_limit = 16384 WHERE model_context_limit IS NULL OR model_context_limit <= 0")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET model_context_limit = 2048 WHERE model_context_limit < 2048")
             .execute(pool)
             .await;
         let _ = sqlx::query("UPDATE settings SET introspection_confidence_threshold = 0.5 WHERE introspection_confidence_threshold IS NULL OR introspection_confidence_threshold <= 0")
@@ -5198,6 +5201,23 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             key,
             value,
             source_ref,
+            snippet,
+            "system",
+        )
+        .await
+    }
+
+    pub async fn create_memory_status_evidence_event(
+        &self,
+        conversation_id: &str,
+        snapshot_text: &str,
+        snippet: &str,
+    ) -> Option<i64> {
+        self.create_system_evidence_event_internal(
+            conversation_id,
+            "memory_status",
+            snapshot_text,
+            Some("memory_status"),
             snippet,
             "system",
         )
@@ -7704,7 +7724,7 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
                  enable_introspection = 1,
                  enable_monologue_validator = 1,
                  compact_prompt_enabled = 0,
-                 stability_disable_working_hypothesis = 0
+                 stability_disable_working_hypothesis = 1
              WHERE id = 1",
         )
         .execute(&self.pool)

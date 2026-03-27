@@ -131,6 +131,9 @@ pub struct CorePromptInput {
     pub wave_state: Option<String>,
     pub reflective_narrative: Option<String>,
     pub reflective_narrative_evidence_ids: Vec<i64>,
+    pub self_report_snapshot: Option<String>,
+    pub self_report_snapshot_evidence_ids: Vec<i64>,
+    pub context_spine: Option<String>,
     pub hydrated_context: Option<String>,
 }
 
@@ -471,6 +474,19 @@ fn collect_workspace_meta_evidence_ids(meta: &WorkspaceMeta) -> Vec<i64> {
     }
     for hypothesis in meta.active_hypotheses.iter() {
         push_ids(&hypothesis.evidence_event_ids);
+    }
+    if let Some(runtime) = meta.runtime.as_ref().and_then(|v| v.as_object()) {
+        for key in ["autobiographical_summary", "self_report_snapshot"].iter() {
+            if let Some(obj) = runtime.get(*key).and_then(|v| v.as_object()) {
+                if let Some(list) = obj.get("evidence_event_ids").and_then(|v| v.as_array()) {
+                    for id in list.iter().filter_map(|v| v.as_i64()) {
+                        if id > 0 {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
     }
     ids.sort();
     ids.dedup();
@@ -2323,6 +2339,12 @@ pub async fn build_core_system_message_with_layout(
             format!("[SYSTEM CONTEXT from {}]:\n{}", input.source, input.content)
         }
     };
+    let context_spine_block = mark_internal_only(
+        input
+            .context_spine
+            .as_deref()
+            .unwrap_or("None"),
+    );
 
     let kernel_state_value = db
         .get_kernel_state(conversation_id)
@@ -2659,6 +2681,11 @@ pub async fn build_core_system_message_with_layout(
     let qualia_intensity_text = format_optional_f64(qualia_intensity, 2);
     let wave_coherence_text = format_optional_f32(wave_coherence, 2);
     let wave_fragmentation_text = format_optional_f32(wave_fragmentation, 2);
+    let self_model_reliability = self_model
+        .as_ref()
+        .and_then(|model| model.unified_state.get("self_model_reliability"))
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32);
     let mut self_model_signal_lines = Vec::new();
     self_model_signal_lines.push(format!("confidence: {}", confidence_text));
     self_model_signal_lines.push(format!("uncertainty: {}", uncertainty_text));
@@ -2668,9 +2695,55 @@ pub async fn build_core_system_message_with_layout(
     self_model_signal_lines.push(format!("qualia_intensity: {}", qualia_intensity_text));
     self_model_signal_lines.push(format!("wave_coherence: {}", wave_coherence_text));
     self_model_signal_lines.push(format!("wave_fragmentation: {}", wave_fragmentation_text));
+    if let Some(value) = self_model_reliability {
+        self_model_signal_lines.push(format!("self_model_reliability: {:.2}", value));
+    }
+    let mut self_report_evidence_ids = input.self_report_snapshot_evidence_ids.clone();
+    let mut self_report_lines: Vec<String> = Vec::new();
+    if let Some(raw) = input.self_report_snapshot.as_deref() {
+        if let Ok(value) = serde_json::from_str::<Value>(raw) {
+            if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+                self_report_lines.push(format!("self_report_status: {}", status.trim()));
+            }
+            if let Some(confidence) = value.get("confidence").and_then(|v| v.as_f64()) {
+                self_report_lines.push(format!("self_report_confidence: {:.2}", confidence));
+            }
+            if let Some(uncertainty) = value.get("uncertainty").and_then(|v| v.as_f64()) {
+                self_report_lines.push(format!("self_report_uncertainty: {:.2}", uncertainty));
+            }
+            if let Some(speculative) = value.get("speculative").and_then(|v| v.as_bool()) {
+                self_report_lines.push(format!("self_report_speculative: {}", speculative));
+            }
+            if let Some(source) = value.get("source").and_then(|v| v.as_str()) {
+                self_report_lines.push(format!("self_report_source: {}", source.trim()));
+            }
+            if let Some(rel) = value
+                .get("self_model_reliability")
+                .and_then(|v| v.as_f64())
+            {
+                self_report_lines.push(format!("self_report_reliability: {:.2}", rel));
+            }
+            if self_report_evidence_ids.is_empty() {
+                if let Some(array) = value.get("evidence_event_ids").and_then(|v| v.as_array()) {
+                    for entry in array.iter() {
+                        if let Some(id) = entry.as_i64() {
+                            self_report_evidence_ids.push(id);
+                        }
+                    }
+                }
+            }
+        } else {
+            let clipped = truncate_to_budget(raw.trim(), 180);
+            self_report_lines.push(format!("self_report_snapshot_raw: {}", clipped));
+        }
+    }
+    if !self_report_lines.is_empty() {
+        self_model_signal_lines.extend(self_report_lines);
+    }
     let mut self_model_evidence_ids: Vec<i64> = Vec::new();
     self_model_evidence_ids.extend(qualia_evidence_ids.iter().copied());
     self_model_evidence_ids.extend(wave_evidence_ids.iter().copied());
+    self_model_evidence_ids.extend(self_report_evidence_ids.iter().copied());
     if let Some(state) = workspace_state.as_ref() {
         self_model_evidence_ids.extend(collect_workspace_meta_evidence_ids(&state.workspace_meta));
     }
@@ -2828,6 +2901,7 @@ pub async fn build_core_system_message_with_layout(
     );
     push_section("Tool Availability", tool_availability_block.clone(), true, false);
     push_section("User Input", user_reply.clone(), true, false);
+    push_section("Context Spine", context_spine_block, true, false);
     push_section("Working Memory", working_memory_block, true, false);
     push_section("Monologue Intent", monologue_intent_block.clone(), true, false);
     push_section("Monologue Digest", monologue_digest_block.clone(), true, true);
@@ -3473,6 +3547,9 @@ mod tests {
             wave_state: None,
             reflective_narrative: None,
             reflective_narrative_evidence_ids: Vec::new(),
+            self_report_snapshot: None,
+            self_report_snapshot_evidence_ids: Vec::new(),
+            context_spine: None,
             hydrated_context: None,
         }
     }
