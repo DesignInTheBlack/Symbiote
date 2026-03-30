@@ -20,7 +20,8 @@ use crate::core::kernel::KernelState;
 use crate::core::kernel::utils::text::{hash_payload, summarize_snippet};
 use crate::core::memory::types::Scope;
 use crate::core::cognitive_wave::{AmplitudeBounds, DecayProfile, WaveBand, WaveContributionInput};
-use crate::core::memory::retrieval;
+use crate::core::self_memory::compact_autobiographical;
+use crate::core::memory::attention::evidence::compute_evidence_quality;
 use crate::core::qualia;
 use num_complex::Complex32;
 
@@ -32,6 +33,7 @@ pub struct SelfEvidenceMetrics {
     pub telemetry_values: HashMap<String, EvidencePoint>,
     pub source_counts: HashMap<String, i64>,
     pub avg_confidence: f32,
+    pub avg_source_quality: f32,
     pub evidence_coverage: f32,
     pub telemetry_coverage: f32,
     pub missing_fields: Vec<String>,
@@ -166,7 +168,8 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
     if !raw_points.is_empty() {
         let placeholders = raw_points.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
-            "SELECT belief_id, source_type, weight FROM ics_evidence_events WHERE belief_id IN ({})",
+            "SELECT belief_id, source_type, weight, strength, created_at
+             FROM ics_evidence_events WHERE belief_id IN ({})",
             placeholders
         );
         let mut stmt = sqlx::query(&query);
@@ -178,9 +181,22 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
             let belief_id: i64 = row.get("belief_id");
             let source_raw: String = row.try_get("source_type").unwrap_or_default();
             let weight: f32 = row.try_get::<f64, _>("weight").unwrap_or(1.0) as f32;
+            let strength: Option<f32> = row.try_get::<f64, _>("strength").ok().map(|v| v as f32);
+            let created_at: Option<String> = row.try_get("created_at").ok();
             let normalized = source_raw.trim().to_lowercase();
             *source_counts.entry(normalized.clone()).or_insert(0) += 1;
-            let quality = (source_quality_for(&normalized) * weight.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            let source = match normalized.as_str() {
+                "user" | "user_focus" => crate::core::memory::types::SourceType::User,
+                "tool" => crate::core::memory::types::SourceType::Tool,
+                "inference" => crate::core::memory::types::SourceType::Inference,
+                _ => crate::core::memory::types::SourceType::System,
+            };
+            let age_days = created_at
+                .as_deref()
+                .and_then(parse_timestamp)
+                .map(|ts| (Utc::now().signed_duration_since(ts).num_seconds().max(0) as f32) / 86_400.0)
+                .unwrap_or(0.0);
+            let quality = compute_evidence_quality(source, weight, strength, age_days);
             source_quality_map
                 .entry(belief_id)
                 .and_modify(|v| {
@@ -196,6 +212,7 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
     let mut goal_values = Vec::new();
     let mut goal_removed = Vec::new();
     let mut confidences = Vec::new();
+    let mut quality_samples = Vec::new();
 
     for raw in raw_points {
         let key = raw.key.clone();
@@ -203,6 +220,7 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
         let confidence = raw.confidence;
         let last_evidence_at = raw.last_evidence_at.clone();
         let source_quality = source_quality_map.get(&raw.belief_id).copied().unwrap_or(0.5);
+        quality_samples.push(source_quality);
         let point = EvidencePoint {
             belief_id: raw.belief_id,
             key: key.clone(),
@@ -276,6 +294,12 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
         let sum: f32 = confidences.iter().sum();
         (sum / confidences.len() as f32).clamp(0.0, 1.0)
     };
+    let avg_source_quality = if quality_samples.is_empty() {
+        0.5
+    } else {
+        let sum: f32 = quality_samples.iter().sum();
+        (sum / quality_samples.len() as f32).clamp(0.0, 1.0)
+    };
 
     let mut missing_fields = Vec::new();
     let mut evidence_score = 0.0;
@@ -342,6 +366,7 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
         telemetry_values,
         source_counts,
         avg_confidence,
+        avg_source_quality,
         evidence_coverage,
         telemetry_coverage,
         missing_fields,
@@ -352,12 +377,81 @@ pub async fn collect_self_evidence_metrics(pool: &SqlitePool) -> Result<SelfEvid
 pub fn compute_self_model_reliability(metrics: &SelfEvidenceMetrics) -> f32 {
     let coverage = (0.6 * metrics.evidence_coverage + 0.4 * metrics.telemetry_coverage).clamp(0.0, 1.0);
     let confidence = metrics.avg_confidence.clamp(0.0, 1.0);
+    let quality = metrics.avg_source_quality.clamp(0.0, 1.0);
     let conflict_penalty = (metrics.conflict_count as f32 / 5.0).clamp(0.0, 1.0);
-    let mut reliability = (0.55 * coverage + 0.3 * confidence + 0.15 * (1.0 - conflict_penalty)).clamp(0.0, 1.0);
+    let mut reliability =
+        (0.45 * coverage + 0.25 * confidence + 0.2 * quality + 0.1 * (1.0 - conflict_penalty))
+            .clamp(0.0, 1.0);
     if !metrics.missing_fields.is_empty() {
         reliability = reliability.min(0.55);
     }
     reliability.max(SELF_MODEL_RELIABILITY_FLOOR)
+}
+
+pub fn compute_outcome_reliability(events: &[OutcomeEvent]) -> HashMap<String, f32> {
+    let mut sums: HashMap<String, (f32, f32)> = HashMap::new();
+    let now = Utc::now();
+    let half_life_days = 14.0_f32;
+    let decay_lambda = if half_life_days > 0.0 {
+        (2.0_f32).ln() / half_life_days
+    } else {
+        0.0
+    };
+    for event in events.iter() {
+        let verdict = event.verdict.trim().to_lowercase();
+        let target = match verdict.as_str() {
+            "confirm" => Some(1.0_f32),
+            "disconfirm" => Some(0.0_f32),
+            _ => None,
+        };
+        let Some(value) = target else {
+            continue;
+        };
+        let age_days = parse_timestamp(&event.created_at)
+            .map(|ts| (now.signed_duration_since(ts).num_seconds().max(0) as f32) / 86_400.0)
+            .unwrap_or(0.0);
+        let weight = if decay_lambda > 0.0 {
+            (-decay_lambda * age_days).exp()
+        } else {
+            1.0
+        };
+        let target_type = event.target_type.trim();
+        let source = event.source.trim();
+        let mut keys = Vec::new();
+        if !target_type.is_empty() {
+            keys.push(format!("outcome_target::{}", target_type));
+        }
+        if !source.is_empty() {
+            keys.push(format!("outcome_source::{}", source));
+        }
+        if target_type == "tool_dispatch" {
+            if !source.is_empty() {
+                keys.push(format!("tool::{}", source));
+            }
+            keys.push("candidate_kind::ToolCall".to_string());
+        } else if target_type == "message" {
+            keys.push("candidate_kind::EmitMessage".to_string());
+        } else if target_type == "gate_decision" {
+            if source.starts_with("tool::") || source.starts_with("candidate_kind::") {
+                keys.push(source.to_string());
+            }
+        }
+        for key in keys.into_iter() {
+            if key.trim().is_empty() {
+                continue;
+            }
+            let entry = sums.entry(key).or_insert((0.0_f32, 0.0_f32));
+            entry.0 += value * weight;
+            entry.1 += weight;
+        }
+    }
+    let mut out = HashMap::new();
+    for (key, (sum, weight_total)) in sums.into_iter() {
+        if weight_total > 0.0 {
+            out.insert(key, (sum / weight_total).clamp(0.0, 1.0));
+        }
+    }
+    out
 }
 
 pub fn wave_contribution_from_controller_state(state: &ControllerState) -> WaveContributionInput {
@@ -503,6 +597,7 @@ pub fn reconstruct_from_metrics(
         last_error: None,
         last_strategy: None,
         outcome_quality: None,
+        reliability: HashMap::new(),
         missing_fields: metrics.missing_fields.clone(),
         updated_at: Some(Utc::now().to_rfc3339()),
         notes,
@@ -517,7 +612,13 @@ pub fn reconstruct_from_metrics(
 
 pub fn evaluate_gates(state: &ControllerState) -> ControllerGate {
     let mut reasons = Vec::new();
-    let throttle_tools = state.autonomy_level < 0.25 || state.failure_streak >= 3;
+    let overall_reliability = state
+        .reliability
+        .get("overall")
+        .copied()
+        .unwrap_or(0.5);
+    let throttle_tools =
+        state.autonomy_level < 0.25 || state.failure_streak >= 3 || overall_reliability < 0.4;
     if throttle_tools {
         reasons.push("low_autonomy_throttle_tools".to_string());
     }
@@ -526,9 +627,12 @@ pub fn evaluate_gates(state: &ControllerState) -> ControllerGate {
         reasons.push("low_autonomy_throttle_threads".to_string());
     }
     let throttle_asks = false;
-    let prefer_verification = state.verification_needed;
+    let prefer_verification = state.verification_needed || overall_reliability < 0.45;
     if prefer_verification {
         reasons.push("verification_needed".to_string());
+        if overall_reliability < 0.45 {
+            reasons.push("low_reliability".to_string());
+        }
     }
     let reanchor = state.reanchor_needed;
     if reanchor {
@@ -610,7 +714,16 @@ fn collect_workspace_meta_evidence(meta: &WorkspaceMeta) -> (Vec<i64>, Vec<i64>)
     collect_list_meta_evidence(&meta.working_set_topics, &mut evidence_event_ids, &mut belief_ids);
     collect_hypothesis_evidence(&meta.active_hypotheses, &mut evidence_event_ids, &mut belief_ids);
     if let Some(runtime) = meta.runtime.as_ref().and_then(|v| v.as_object()) {
-        for key in ["autobiographical_summary", "self_report_snapshot"].iter() {
+        for key in [
+            "autobiographical_summary",
+            "self_report_snapshot",
+            "planner",
+            "evidence_health",
+            "goal_reconciliation",
+            "strategy_audit",
+        ]
+        .iter()
+        {
             if let Some(obj) = runtime.get(*key).and_then(|v| v.as_object()) {
                 if let Some(list) = obj.get("evidence_event_ids").and_then(|v| v.as_array()) {
                     for id in list.iter().filter_map(|v| v.as_i64()) {
@@ -768,6 +881,7 @@ pub async fn build_unified_self_model(
     db: &Db,
     state: &KernelState,
     context: &UnifiedSelfModelContext,
+    evidence_semantics_v2: bool,
 ) -> Result<(Value, Value), String> {
     let controller_state = db
         .get_controller_state()
@@ -798,6 +912,37 @@ pub async fn build_unified_self_model(
     let wave_evidence_ids = db
         .get_recent_evidence_ids_by_source_types(&["wave_state"], 4)
         .await;
+    let system_evidence_types = [
+        "candidate_created",
+        "candidate_accepted",
+        "arbitration_outcome",
+        "gate_decision",
+        "tool_dispatch",
+        "tool_result",
+        "tool_result_error",
+        "memory_write",
+        "memory_write_blocked",
+        "self_report_snapshot",
+        "scheduler_evidence_health",
+        "scheduler_goal_reconciliation",
+        "scheduler_strategy_audit",
+    ];
+    let system_evidence_ids = db
+        .get_recent_evidence_ids_by_source_types(
+            &system_evidence_types,
+            12,
+        )
+        .await;
+    let top_evidence_event_ids = if evidence_semantics_v2 {
+        let mut strength_types = Vec::new();
+        strength_types.extend(system_evidence_types.iter().copied());
+        strength_types.push("qualia_snapshot");
+        strength_types.push("wave_state");
+        strength_types.push("autobiographical_summary");
+        db.rank_evidence_ids_by_strength(&strength_types, 12).await
+    } else {
+        Vec::new()
+    };
     let mut outcome_evidence_ids: Vec<i64> = context
         .outcome_events
         .iter()
@@ -808,6 +953,7 @@ pub async fn build_unified_self_model(
     let mut all_evidence_ids = evidence_event_ids.clone();
     all_evidence_ids.extend(qualia_evidence_ids.iter().copied());
     all_evidence_ids.extend(wave_evidence_ids.iter().copied());
+    all_evidence_ids.extend(system_evidence_ids.iter().copied());
     all_evidence_ids.extend(outcome_evidence_ids.iter().copied());
     all_evidence_ids.sort();
     all_evidence_ids.dedup();
@@ -845,9 +991,11 @@ pub async fn build_unified_self_model(
     };
     let evidence = json!({
         "evidence_event_ids": all_evidence_ids,
+        "top_evidence_event_ids": top_evidence_event_ids,
         "belief_ids": belief_ids,
         "qualia_evidence_ids": qualia_evidence_ids,
         "wave_evidence_ids": wave_evidence_ids,
+        "system_evidence_ids": system_evidence_ids,
         "outcome_evidence_ids": outcome_evidence_ids,
     });
 
@@ -874,19 +1022,29 @@ pub async fn update_unified_self_model(
     db: &Db,
     state: &mut KernelState,
 ) -> Result<SelfModelUpdateOutcome, String> {
+    let settings = db.get_settings().await.ok();
+    let evidence_semantics_v2 = settings
+        .as_ref()
+        .and_then(|s| s.evidence_semantics_v2)
+        .unwrap_or(true);
+    let narrative_continuity = settings
+        .as_ref()
+        .and_then(|s| s.narrative_continuity)
+        .unwrap_or(true);
     let evidence_metrics = collect_self_evidence_metrics(&db.pool).await?;
     let reliability = compute_self_model_reliability(&evidence_metrics);
-    let autobiographical_summary =
-        retrieval::render_autobiographical_context(&db.pool, Some(&state.conversation_id), 6)
-            .await;
-    update_autobiographical_promotion(db, state, &autobiographical_summary).await;
+    let autobiographical_summary = compact_autobiographical(db, state, 6).await;
+    update_autobiographical_promotion(db, state, &autobiographical_summary, narrative_continuity).await;
     let outcome_events = db.list_outcome_events(12).await.unwrap_or_default();
     let context = UnifiedSelfModelContext {
         autobiographical_summary,
         outcome_events,
         self_model_reliability: reliability,
     };
-    let (unified_state, unified_evidence) = build_unified_self_model(db, state, &context).await?;
+    let (unified_state, unified_evidence) =
+        build_unified_self_model(db, state, &context, evidence_semantics_v2).await?;
+    state.self_model_unified = Some(unified_state.clone());
+    state.self_model_unified_evidence = Some(unified_evidence.clone());
     let mut model = db.get_self_model().await.map_err(|e| e.to_string())?;
     model.unified_state = unified_state;
     model.unified_state_evidence = unified_evidence;
@@ -923,6 +1081,8 @@ pub async fn update_unified_self_model(
         updated_at = Utc::now().to_rfc3339();
         base_state.self_model_version = next_version;
         base_state.self_model_updated_at = Some(updated_at.clone());
+        base_state.self_model_unified = state.self_model_unified.clone();
+        base_state.self_model_unified_evidence = state.self_model_unified_evidence.clone();
         let json_state = serde_json::to_string(&base_state).unwrap_or_else(|_| "{}".to_string());
         let updated = if let Some(expected) = base_version {
             db.update_kernel_state_with_version(&conversation_id, &json_state, Some("self_model"), expected)
@@ -973,10 +1133,18 @@ pub async fn update_unified_self_model(
         .await;
     }
 
-    let evidence_event_ids = model
+    let top_list = model
         .unified_state_evidence
-        .get("evidence_event_ids")
-        .and_then(|v| v.as_array())
+        .get("top_evidence_event_ids")
+        .and_then(|v| v.as_array());
+    let list = match top_list {
+        Some(arr) if !arr.is_empty() => Some(arr),
+        _ => model
+            .unified_state_evidence
+            .get("evidence_event_ids")
+            .and_then(|v| v.as_array()),
+    };
+    let evidence_event_ids = list
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
         .unwrap_or_default();
 
@@ -992,11 +1160,18 @@ pub async fn update_unified_self_model(
 pub async fn collect_unified_self_evidence_ids(db: &Db) -> Result<Vec<i64>, String> {
     let model = db.get_self_model().await.map_err(|e| e.to_string())?;
     let mut evidence_ids = Vec::new();
-    if let Some(list) = model
+    let top_list = model
         .unified_state_evidence
-        .get("evidence_event_ids")
-        .and_then(|v| v.as_array())
-    {
+        .get("top_evidence_event_ids")
+        .and_then(|v| v.as_array());
+    let list = match top_list {
+        Some(arr) if !arr.is_empty() => Some(arr),
+        _ => model
+            .unified_state_evidence
+            .get("evidence_event_ids")
+            .and_then(|v| v.as_array()),
+    };
+    if let Some(list) = list {
         for item in list.iter() {
             if let Some(id) = item.as_i64() {
                 if id > 0 {
@@ -1059,6 +1234,7 @@ mod tests_reconstruction {
             telemetry_values,
             source_counts: HashMap::new(),
             avg_confidence: 0.8,
+            avg_source_quality: 0.8,
             evidence_coverage: 1.0,
             telemetry_coverage: 1.0,
             missing_fields: Vec::new(),
@@ -1154,21 +1330,11 @@ fn recency_score(last_evidence_at: &Option<String>, max_age_days: i64) -> f32 {
     (1.0 - (age_days / max_age_days as f32)).clamp(0.0, 1.0)
 }
 
-fn source_quality_for(raw: &str) -> f32 {
-    match raw.trim().to_lowercase().as_str() {
-        "user" => 1.0,
-        "user_focus" => 1.0,
-        "tool" => 0.85,
-        "system" => 0.75,
-        "inference" => 0.5,
-        _ => 0.6,
-    }
-}
-
 async fn update_autobiographical_promotion(
     db: &Db,
     state: &mut KernelState,
     summary: &str,
+    narrative_continuity: bool,
 ) {
     let trimmed = summary.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
@@ -1213,6 +1379,16 @@ async fn update_autobiographical_promotion(
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
         .unwrap_or_default();
+    let mut narrative_snapshot_id = existing_obj
+        .get("narrative_snapshot_id")
+        .and_then(|v| v.as_i64());
+    let mut narrative_snapshot_at = existing_obj
+        .get("narrative_snapshot_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let mut narrative_snapshot_strength = existing_obj
+        .get("narrative_snapshot_strength")
+        .and_then(|v| v.as_f64());
     if stability_count >= AUTOBIO_STABILITY_THRESHOLD
         && (!promoted || prev_hash != summary_hash || evidence_ids.is_empty())
     {
@@ -1229,6 +1405,34 @@ async fn update_autobiographical_promotion(
         {
             evidence_ids = vec![event_id];
             promoted = true;
+        }
+    }
+
+    if narrative_continuity {
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let last_snapshot_at = existing_obj
+            .get("narrative_snapshot_at")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let due = last_snapshot_at
+            .map(|ts| now_dt.signed_duration_since(ts).num_days() >= 7)
+            .unwrap_or(true);
+        if due {
+            let avg_strength = db.average_evidence_strength(30).await.unwrap_or(0.0);
+            if avg_strength >= 0.5 {
+                if let Ok(model) = db.get_self_model().await {
+                    if let Ok(snapshot_id) = db
+                        .create_self_model_checkpoint_with_id(&model, Some("narrative_weekly"))
+                        .await
+                    {
+                        narrative_snapshot_id = Some(snapshot_id);
+                        narrative_snapshot_at = Some(now);
+                        narrative_snapshot_strength = Some(avg_strength);
+                    }
+                }
+            }
         }
     }
     let promoted_at = if promoted {
@@ -1248,6 +1452,9 @@ async fn update_autobiographical_promotion(
         "evidence_event_ids": evidence_ids,
         "speculative": !promoted || evidence_ids.is_empty(),
         "last_seen_at": now,
+        "narrative_snapshot_id": narrative_snapshot_id,
+        "narrative_snapshot_at": narrative_snapshot_at,
+        "narrative_snapshot_strength": narrative_snapshot_strength,
     });
     obj.insert("autobiographical_summary".to_string(), summary_record);
     state.workspace_meta.runtime = Some(runtime);
@@ -1313,6 +1520,7 @@ mod tests {
             telemetry_values: HashMap::new(),
             source_counts: HashMap::new(),
             avg_confidence: 0.85,
+            avg_source_quality: 0.8,
             evidence_coverage: 0.5,
             telemetry_coverage: 1.0,
             missing_fields: vec![],
@@ -1406,6 +1614,7 @@ mod tests {
             telemetry_values: telemetry_values.clone(),
             source_counts: HashMap::new(),
             avg_confidence: 0.8,
+            avg_source_quality: 0.7,
             evidence_coverage: 0.7,
             telemetry_coverage: 1.0,
             missing_fields: vec![],
@@ -1437,6 +1646,7 @@ mod tests {
             last_error: None,
             last_strategy: None,
             outcome_quality: None,
+            reliability: HashMap::new(),
             missing_fields: Vec::new(),
             updated_at: None,
             notes: Vec::new(),

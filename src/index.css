@@ -566,6 +566,63 @@ textarea:-ms-input-placeholder,
   padding: 24px clamp(24px, 6vw, 96px);
 }
 
+.chat-recommendations {
+  margin: 0 clamp(24px, 6vw, 96px) 20px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: var(--cockpit-panel-border);
+  background: var(--cockpit-panel-muted-bg);
+}
+
+.chat-recommendations-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+.chat-recommendations-count {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: var(--cockpit-panel-muted-border);
+  background: var(--cockpit-panel-muted-bg);
+  font-size: 11px;
+}
+
+.chat-recommendations-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-recommendation-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: var(--cockpit-card-border);
+  background: var(--cockpit-card-bg);
+}
+
+.chat-recommendation-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.chat-recommendation-detail {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.chat-recommendation-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 .chat-shell .system-state-panel {
   margin: 24px 24px 24px 0;
 }
@@ -3590,6 +3647,83 @@ input[type="range"]:active::-webkit-slider-thumb {
   grid-template-columns: 1.4fr 0.7fr 0.6fr;
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.health-recommendations {
+  margin: 12px 0 16px;
+  padding: 14px;
+  border-radius: 14px;
+  border: var(--cockpit-panel-border);
+  background: var(--cockpit-panel-muted-bg);
+}
+
+.health-recommendations-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+.health-recommendations-count {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: var(--cockpit-panel-muted-border);
+  background: var(--cockpit-panel-muted-bg);
+  font-size: 11px;
+}
+
+.health-recommendations-metrics {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.health-recommendations-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.health-recommendation-card {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  border-radius: 12px;
+  border: var(--cockpit-card-border);
+  background: var(--cockpit-card-bg);
+}
+
+.health-recommendation-card.ineligible {
+  opacity: 0.7;
+}
+
+.health-recommendation-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.health-recommendation-detail {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.health-recommendation-gate {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.health-recommendation-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 
 .flow-metrics {

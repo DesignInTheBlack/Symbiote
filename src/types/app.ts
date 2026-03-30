@@ -61,6 +61,37 @@ export interface SystemHealthSnapshot {
   subsystem_states: any;
 }
 
+export interface RecommendationItem {
+  recommendation_id: string;
+  kind: string;
+  title: string;
+  detail: string;
+  status: "eligible" | "ineligible" | "accepted" | "resolved" | "dismissed" | string;
+  action?: any;
+  gate?: any;
+  recovery_metric?: string | null;
+  recovery_target?: number | null;
+  baseline_value?: number | null;
+  current_value?: number | null;
+}
+
+export interface RecommendationEvent {
+  event_id: string;
+  recommendation_id: string;
+  conversation_id?: string | null;
+  kind: string;
+  status: string;
+  snapshot_id?: string | null;
+  action_json?: string | null;
+  gate_json?: string | null;
+  recovery_metric?: string | null;
+  recovery_target?: number | null;
+  baseline_value?: number | null;
+  resolved_value?: number | null;
+  time_to_recovery_ms?: number | null;
+  created_at: string;
+}
+
 export interface WaveStatus {
   coherence?: number | null;
   dominance?: number | null;

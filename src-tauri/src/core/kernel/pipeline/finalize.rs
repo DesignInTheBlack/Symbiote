@@ -2,6 +2,7 @@ use super::super::*;
 use sqlx::Row;
 use chrono::{TimeZone, Utc};
 use crate::core::system_log;
+use crate::core::kernel::utils::text::summarize_snippet;
 
 const SELF_REPORT_RELIABILITY_WARN: f32 = 0.45;
 
@@ -182,7 +183,12 @@ impl Kernel {
         obj.entry("candidate_id".to_string())
             .or_insert(json!(&message_id));
         obj.entry("bridge_id".to_string()).or_insert(json!(null));
-        if !obj.contains_key("evidence_event_ids") {
+        let mut evidence_event_ids: Vec<i64> = obj
+            .get("evidence_event_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| items.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if evidence_event_ids.is_empty() {
             if let Ok(Some(raw_ids)) = sqlx::query_scalar::<_, String>(
                 "SELECT evidence_event_ids
                  FROM decision_reports
@@ -195,12 +201,94 @@ impl Kernel {
             .await
             {
                 if let Ok(mut ids) = serde_json::from_str::<Vec<i64>>(&raw_ids) {
-                    ids.sort();
-                    ids.dedup();
-                    obj.insert("evidence_event_ids".to_string(), json!(ids));
+                    evidence_event_ids.append(&mut ids);
                 }
             }
         }
+        let settings = self.db.get_settings().await.ok();
+        let evidence_enabled = settings
+            .as_ref()
+            .and_then(|s| s.evidence_auto_capture)
+            .unwrap_or(true);
+        if evidence_enabled {
+            let snippet = summarize_snippet(content, 180);
+            let payload = json!({
+                "message_id": message_id,
+                "run_id": run_id,
+                "response_origin": response_origin.as_str(),
+                "content": summarize_snippet(content, 400),
+            });
+            let context_json = serde_json::to_string(&payload).ok();
+            if let Some(event_id) = self
+                .db
+                .emit_system_evidence_event_with_context(
+                    &conversation_id,
+                    "assistant_message",
+                    Some(&message_id),
+                    &snippet,
+                    context_json.as_deref(),
+                    Some(0.55),
+                )
+                .await
+            {
+                evidence_event_ids.push(event_id);
+                let _ = self
+                    .db
+                    .link_evidence_to_target(event_id, "run", run_id, "supports")
+                    .await;
+                let _ = self
+                    .db
+                    .link_evidence_to_target(event_id, "message", &message_id, "supports")
+                    .await;
+                if let Some(step_id) = obj
+                    .get("plan_step_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    let _ = self
+                        .db
+                        .link_evidence_to_target(event_id, "plan_step", step_id, "supports")
+                        .await;
+                }
+            }
+        }
+        if evidence_event_ids.is_empty() {
+            let payload = json!({
+                "message_id": message_id,
+                "run_id": run_id,
+                "reason": "missing_evidence",
+            });
+            let context_json = serde_json::to_string(&payload).ok();
+            if let Some(event_id) = self
+                .db
+                .emit_system_evidence_event_with_context(
+                    &conversation_id,
+                    "missing_evidence",
+                    Some(&message_id),
+                    "missing evidence for response",
+                    context_json.as_deref(),
+                    Some(0.1),
+                )
+                .await
+            {
+                evidence_event_ids.push(event_id);
+                let _ = self
+                    .db
+                    .link_evidence_to_target(event_id, "run", run_id, "supports")
+                    .await;
+                let _ = self
+                    .db
+                    .link_evidence_to_target(event_id, "message", &message_id, "supports")
+                    .await;
+            }
+        }
+        evidence_event_ids.sort();
+        evidence_event_ids.dedup();
+        obj.insert("evidence_event_ids".to_string(), json!(evidence_event_ids));
+        let mut top_ids = evidence_event_ids.clone();
+        top_ids.truncate(3);
+        obj.insert("top_evidence_event_ids".to_string(), json!(top_ids));
         if let Some(decision) = gate_decision {
             obj.insert("gate_decision".to_string(), json!(decision));
         }

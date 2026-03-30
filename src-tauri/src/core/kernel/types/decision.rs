@@ -105,6 +105,14 @@ pub struct DecisionReport {
     #[serde(default)]
     pub gate_notice: Option<String>,
     #[serde(default)]
+    pub gate_penalty: Option<f64>,
+    #[serde(default)]
+    pub gate_penalty_reasons: Option<Vec<String>>,
+    #[serde(default)]
+    pub soft_gate_decision: Option<String>,
+    #[serde(default)]
+    pub soft_gate_reasons: Option<Vec<String>>,
+    #[serde(default)]
     pub verification_outcome: Option<String>,
     #[serde(default)]
     pub verification_reasons: Option<Vec<String>>,
@@ -183,6 +191,10 @@ impl Default for DecisionReport {
             gate_decision: None,
             gate_reasons: None,
             gate_notice: None,
+            gate_penalty: None,
+            gate_penalty_reasons: None,
+            soft_gate_decision: None,
+            soft_gate_reasons: None,
             verification_outcome: None,
             verification_reasons: None,
             verification_confidence: None,

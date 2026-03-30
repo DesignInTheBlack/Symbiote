@@ -18,8 +18,8 @@ use crate::core::system_log;
 use crate::core::system_controls;
 use crate::core::episodic;
 use crate::core::world_model;
-use crate::core::memory::retrieval;
 use crate::core::kernel::utils::summarize_snippet;
+use crate::core::kernel::KernelState;
 use crate::models::{Tool, ToolFunction, Settings};
 
 pub struct ToolRegistry;
@@ -776,7 +776,20 @@ async fn get_unified_self(db: &Db, args_json: &str) -> Result<String, String> {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "default".to_string());
     let model = db.get_self_model().await.map_err(|e| format!("DB Error: {}", e))?;
-    let unified_state = model.unified_state;
+    let kernel_state = db
+        .get_kernel_state(&conversation_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<KernelState>(&raw).ok());
+    let unified_state = kernel_state
+        .as_ref()
+        .and_then(|state| state.self_model_unified.clone())
+        .unwrap_or_else(|| model.unified_state.clone());
+    let unified_evidence = kernel_state
+        .as_ref()
+        .and_then(|state| state.self_model_unified_evidence.clone())
+        .unwrap_or_else(|| model.unified_state_evidence.clone());
     let mut lines: Vec<String> = Vec::new();
     if let Some(workspace) = unified_state.get("workspace") {
         if let Some(focus) = workspace.get("current_focus").and_then(|v| v.as_str()) {
@@ -825,7 +838,7 @@ async fn get_unified_self(db: &Db, args_json: &str) -> Result<String, String> {
         "conversation_id": conversation_id,
         "summary": summary,
         "unified_state": unified_state,
-        "evidence": model.unified_state_evidence,
+        "evidence": unified_evidence,
         "updated_at": model.unified_state_updated_at,
     })
     .to_string())
@@ -840,11 +853,31 @@ async fn get_autobiographical_context(db: &Db, args_json: &str) -> Result<String
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "default".to_string());
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(6).clamp(1, 12);
-    let summary = retrieval::render_autobiographical_context(&db.pool, Some(&conversation_id), limit).await;
+    let kernel_state = db
+        .get_kernel_state(&conversation_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<KernelState>(&raw).ok())
+        .unwrap_or_else(|| KernelState::default_for(&conversation_id));
+    let summary = crate::core::self_memory::compact_autobiographical(db, &kernel_state, limit).await;
+    let workspace_state = db.get_workspace_state(&conversation_id).await.ok().flatten();
+    let (narrative_snapshot_id, narrative_snapshot_at) = workspace_state
+        .and_then(|state| state.workspace_meta.runtime)
+        .and_then(|runtime| runtime.get("autobiographical_summary").cloned())
+        .and_then(|value| value.as_object().cloned())
+        .map(|obj| {
+            let id = obj.get("narrative_snapshot_id").cloned().unwrap_or(Value::Null);
+            let at = obj.get("narrative_snapshot_at").cloned().unwrap_or(Value::Null);
+            (id, at)
+        })
+        .unwrap_or((Value::Null, Value::Null));
     Ok(serde_json::json!({
         "conversation_id": conversation_id,
         "limit": limit,
         "summary": summary,
+        "narrative_snapshot_id": narrative_snapshot_id,
+        "narrative_snapshot_at": narrative_snapshot_at,
     })
     .to_string())
 }

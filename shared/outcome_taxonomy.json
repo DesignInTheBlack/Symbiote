@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "verdicts": ["confirm", "disconfirm", "inconclusive"],
+  "target_types": [
+    "decision_report",
+    "message",
+    "tool_dispatch",
+    "qualia_reward",
+    "gate_decision"
+  ],
+  "sources": [
+    "operator",
+    "user_feedback",
+    "tool",
+    "qualia_reward"
+  ],
+  "notes": "Outcome events must use one of the allowed verdicts and target_types. Sources are advisory and may be extended, but new target_types/verdicts require taxonomy updates."
+}

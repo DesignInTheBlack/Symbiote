@@ -23,6 +23,8 @@ use crate::models::{
     EvidenceLineageEntry,
     OutcomeEvent,
     SystemLogEntry,
+    BaselineMetricsSnapshot,
+    RecommendationEvent,
 };
 use crate::core::voice_manager_v2::VoiceManager; // Import
 use tauri::{AppHandle, Manager, Emitter};
@@ -34,7 +36,7 @@ use uuid::Uuid;
 use sha2::{Digest, Sha256};
 use serde_json::Value;
 use sqlx::Row;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 pub struct PromptStatus {
@@ -1150,6 +1152,43 @@ pub struct SystemHealthSnapshotView {
     pub subsystem_states: Value,
 }
 
+#[derive(Serialize)]
+pub struct BaselineMetricsView {
+    pub baseline_id: String,
+    pub window_minutes: i64,
+    pub window_start: String,
+    pub window_end: String,
+    pub metrics: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecommendationActionInput {
+    pub recommendation_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    pub action: Value,
+    #[serde(default)]
+    pub gate: Option<Value>,
+    #[serde(default)]
+    pub recovery_metric: Option<String>,
+    #[serde(default)]
+    pub recovery_target: Option<f64>,
+    #[serde(default)]
+    pub baseline_value: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecommendationDismissInput {
+    pub recommendation_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub gate: Option<Value>,
+}
+
 fn parse_snapshot(snapshot: SystemHealthSnapshot) -> SystemHealthSnapshotView {
     let metrics = serde_json::from_str::<Value>(&snapshot.metrics_json)
         .unwrap_or_else(|_| json!({ "raw": snapshot.metrics_json }));
@@ -1162,6 +1201,19 @@ fn parse_snapshot(snapshot: SystemHealthSnapshot) -> SystemHealthSnapshotView {
         trace_id: snapshot.trace_id,
         metrics,
         subsystem_states,
+    }
+}
+
+fn parse_baseline(snapshot: BaselineMetricsSnapshot) -> BaselineMetricsView {
+    let metrics = serde_json::from_str::<Value>(&snapshot.metrics_json)
+        .unwrap_or_else(|_| json!({ "raw": snapshot.metrics_json }));
+    BaselineMetricsView {
+        baseline_id: snapshot.baseline_id,
+        window_minutes: snapshot.window_minutes,
+        window_start: snapshot.window_start,
+        window_end: snapshot.window_end,
+        metrics,
+        created_at: snapshot.created_at,
     }
 }
 
@@ -1195,6 +1247,156 @@ pub async fn get_system_health_history(
         .await
         .map_err(|e| e.to_string())?;
     Ok(snapshots.into_iter().map(parse_snapshot).collect())
+}
+
+#[tauri::command]
+pub async fn capture_baseline_metrics(
+    db: State<'_, Arc<Db>>,
+    app: AppHandle,
+    window_minutes: Option<i64>,
+) -> Result<BaselineMetricsView, String> {
+    let aggregator = system_health::HealthAggregator::new(db.inner().clone());
+    let baseline = aggregator
+        .capture_baseline_metrics(window_minutes, Some(&app))
+        .await
+        .map_err(|e| e.to_string())?;
+    let created_at = baseline.window_end.clone();
+    Ok(BaselineMetricsView {
+        baseline_id: baseline.baseline_id,
+        window_minutes: baseline.window_minutes,
+        window_start: baseline.window_start,
+        window_end: baseline.window_end,
+        metrics: baseline.metrics,
+        created_at,
+    })
+}
+
+#[tauri::command]
+pub async fn get_baseline_metrics(
+    db: State<'_, Arc<Db>>,
+    limit: Option<i64>,
+) -> Result<Vec<BaselineMetricsView>, String> {
+    let snapshots = db
+        .list_baseline_metrics(limit.unwrap_or(50))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(snapshots.into_iter().map(parse_baseline).collect())
+}
+
+#[tauri::command]
+pub async fn apply_recommendation(
+    db: State<'_, Arc<Db>>,
+    app: AppHandle,
+    input: RecommendationActionInput,
+) -> Result<RecommendationEvent, String> {
+    let action_type = input.action.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let apply_result = if action_type == "capture_baseline_metrics" {
+        let window_minutes = input
+            .action
+            .get("window_minutes")
+            .and_then(|v| v.as_i64());
+        let aggregator = system_health::HealthAggregator::new(db.inner().clone());
+        aggregator
+            .capture_baseline_metrics(window_minutes, Some(&app))
+            .await
+            .map_err(|e| e.to_string())?;
+        "baseline_metrics_captured".to_string()
+    } else {
+        system_controls::apply_recommendation_action(db.inner(), &input.action, "recommendation")
+            .await
+            .map_err(|e| {
+                let _ = system_log::log_event(
+                    &db.pool,
+                    Some(&app),
+                    "warn",
+                    "system",
+                    None,
+                    None,
+                    json!({
+                        "event": "recommendation_action_failed",
+                        "recommendation_id": input.recommendation_id,
+                        "error": e,
+                    }),
+                );
+                e
+            })?
+    };
+    let action_json = Some(input.action.to_string());
+    let gate_json = input.gate.as_ref().map(|v| v.to_string());
+    let event = db
+        .insert_recommendation_event(
+            &input.recommendation_id,
+            None,
+            &input.kind,
+            "accepted",
+            input.snapshot_id.as_deref(),
+            action_json.as_deref(),
+            gate_json.as_deref(),
+            input.recovery_metric.as_deref(),
+            input.recovery_target,
+            input.baseline_value,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = system_log::log_event(
+        &db.pool,
+        Some(&app),
+        "info",
+        "system",
+        None,
+        None,
+        json!({
+            "event": "recommendation_accepted",
+            "recommendation_id": input.recommendation_id,
+            "kind": input.kind,
+            "result": apply_result,
+        }),
+    )
+    .await;
+    Ok(event)
+}
+
+#[tauri::command]
+pub async fn dismiss_recommendation(
+    db: State<'_, Arc<Db>>,
+    app: AppHandle,
+    input: RecommendationDismissInput,
+) -> Result<RecommendationEvent, String> {
+    let gate_json = input.gate.as_ref().map(|v| v.to_string());
+    let event = db
+        .insert_recommendation_event(
+            &input.recommendation_id,
+            None,
+            &input.kind,
+            "dismissed",
+            input.snapshot_id.as_deref(),
+            None,
+            gate_json.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = system_log::log_event(
+        &db.pool,
+        Some(&app),
+        "info",
+        "system",
+        None,
+        None,
+        json!({
+            "event": "recommendation_dismissed",
+            "recommendation_id": input.recommendation_id,
+            "kind": input.kind,
+        }),
+    )
+    .await;
+    Ok(event)
 }
 
 #[tauri::command]

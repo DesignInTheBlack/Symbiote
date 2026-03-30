@@ -8,6 +8,7 @@ use crate::db::Db;
 use crate::core::memory::api::MemoryApi;
 use crate::core::memory::claims;
 use crate::core::memory::cache;
+use crate::core::memory::dsl::{self, DslStatement, FactStmt, Ref, RelStmt};
 use crate::core::memory::types::{ClaimOutcome, Scope, SourceType, MemoryPacket};
 use crate::core::model_client::ModelClient;
 use crate::core::episodic;
@@ -194,9 +195,12 @@ pub async fn memory_write(
     admin_override: Option<bool>,
 ) -> Result<crate::core::memory::compiler::CompileResult, String> {
     gate_allows_memory_write(&pool, "default", "memory_write").await?;
+    let db = Db { pool: (*pool).clone() };
+    let settings = db.get_settings().await.map_err(|e| e.to_string())?;
     let evidence_ids = normalize_evidence_ids(evidence_event_ids.as_deref());
     let admin_override = admin_override.unwrap_or(false);
     let manual_untrusted = admin_override && evidence_ids.is_empty();
+    let source_type = resolve_memory_write_source_type(source.as_deref(), admin_override);
     if memory_write_requires_evidence(&evidence_ids, admin_override) {
         let _ = system_log::log_event(
             &pool,
@@ -230,6 +234,33 @@ pub async fn memory_write(
         .await;
         return Err("memory_write evidence_event_ids were not found".to_string());
     }
+    let soft_anchor_enabled = settings.memory_soft_anchor.unwrap_or(true);
+    let user_source = matches!(source_type, SourceType::User);
+    let mut soft_anchor = false;
+    let mut soft_anchor_confidence: Option<f32> = None;
+    if soft_anchor_enabled && user_source && !evidence_ids.is_empty() && !admin_override {
+        if db.evidence_ids_are_user_anchored(&evidence_ids).await
+            && soft_anchor_allowed_for_input(&input)
+        {
+            soft_anchor = true;
+            let confidence = estimate_user_anchor_confidence(&evidence_ids);
+            soft_anchor_confidence = Some(confidence);
+            let _ = system_log::log_event(
+                &pool,
+                None,
+                "info",
+                "memory",
+                None,
+                None,
+                json!({
+                    "event": "memory_write_soft_anchor",
+                    "confidence": confidence,
+                    "evidence_event_ids": evidence_ids.clone(),
+                }),
+            )
+            .await;
+        }
+    }
     if admin_override {
         let _ = system_log::log_event(
             &pool,
@@ -260,26 +291,34 @@ pub async fn memory_write(
         .await;
     }
     let api = MemoryApi::new((*pool).clone(), Some((*model_client).clone()), "default".to_string()).await; // TODO: Session handling
-    
-    let source_type = resolve_memory_write_source_type(source.as_deref(), admin_override);
-    
+
     // Default scope global for now or pass in?
     let now = chrono::Utc::now();
-    let source_ref = if !evidence_ids.is_empty() {
-        Some(format!(
+    let mut source_ref_parts: Vec<String> = Vec::new();
+    if !evidence_ids.is_empty() {
+        source_ref_parts.push(format!(
             "evidence_event_ids:{}",
             evidence_ids
                 .iter()
                 .map(|id| id.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
-        ))
-    } else if manual_untrusted {
-        Some("manual_untrusted".to_string())
+        ));
+    }
+    if soft_anchor {
+        let confidence = soft_anchor_confidence.unwrap_or(0.5);
+        source_ref_parts.push(format!("user_anchored:confidence={:.2}", confidence));
+        source_ref_parts.push("provenance:user".to_string());
+    }
+    if manual_untrusted {
+        source_ref_parts.push("manual_untrusted".to_string());
     } else if admin_override {
-        Some("admin_override".to_string())
-    } else {
+        source_ref_parts.push("admin_override".to_string());
+    }
+    let source_ref = if source_ref_parts.is_empty() {
         None
+    } else {
+        Some(source_ref_parts.join(";"))
     };
     let result = api
         .parse_and_compile(&input, Scope::Global, source_type, source_ref, now)
@@ -344,9 +383,86 @@ async fn evidence_ids_exist(pool: &SqlitePool, ids: &[i64]) -> bool {
     count >= ids.len() as i64
 }
 
+fn soft_anchor_allowed_for_input(input: &str) -> bool {
+    let statements = dsl::parse_memory_block(input);
+    if statements.is_empty() {
+        return false;
+    }
+    for stmt in statements {
+        match stmt {
+            Ok(DslStatement::Fact(fact)) => {
+                if !soft_anchor_allowed_fact(&fact) {
+                    return false;
+                }
+            }
+            Ok(DslStatement::Rel(rel)) => {
+                if !soft_anchor_allowed_rel(&rel) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn soft_anchor_allowed_fact(stmt: &FactStmt) -> bool {
+    if !soft_anchor_subject_allowed(&stmt.subject) {
+        return false;
+    }
+    let key = stmt.key.trim().to_lowercase();
+    is_identity_key(&key) || is_preference_key(&key)
+}
+
+fn soft_anchor_allowed_rel(stmt: &RelStmt) -> bool {
+    let rel = stmt.rel_type.trim().to_lowercase();
+    if !matches!(rel.as_str(), "likes" | "dislikes" | "prefers" | "favorite" | "favorites") {
+        return false;
+    }
+    stmt.participants
+        .iter()
+        .any(|(_, reference)| soft_anchor_subject_allowed(reference))
+}
+
+fn soft_anchor_subject_allowed(reference: &Ref) -> bool {
+    matches!(reference, Ref::Handle(handle) if handle == "user" || handle == "assistant")
+}
+
+fn is_identity_key(key: &str) -> bool {
+    matches!(
+        key,
+        "name"
+            | "full_name"
+            | "preferred_name"
+            | "display_name"
+            | "nickname"
+            | "alias"
+            | "pronouns"
+            | "role"
+            | "title"
+    )
+}
+
+fn is_preference_key(key: &str) -> bool {
+    key.contains("preference")
+        || key.contains("favorite")
+        || key.contains("prefer")
+        || key.contains("likes")
+        || key.contains("dislikes")
+        || key.contains("avoid")
+}
+
+fn estimate_user_anchor_confidence(evidence_ids: &[i64]) -> f32 {
+    let count = evidence_ids.len().min(3) as f32;
+    (0.45 + (0.05 * count)).min(0.65)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_evidence_ids, memory_write_requires_evidence, resolve_memory_write_source_type, evidence_ids_exist};
+    use super::{
+        evidence_ids_exist, memory_write_requires_evidence, normalize_evidence_ids,
+        resolve_memory_write_source_type, soft_anchor_allowed_for_input,
+    };
     use crate::core::memory::types::SourceType;
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -388,6 +504,21 @@ mod tests {
             .expect("seed");
         assert!(evidence_ids_exist(&pool, &[1, 2]).await);
         assert!(!evidence_ids_exist(&pool, &[1, 3]).await);
+    }
+
+    #[test]
+    fn soft_anchor_allows_identity_fact() {
+        assert!(soft_anchor_allowed_for_input("$user:name = \"Alice\""));
+    }
+
+    #[test]
+    fn soft_anchor_allows_preference_relation() {
+        assert!(soft_anchor_allowed_for_input("likes(subject: $user, object: #Pizza)"));
+    }
+
+    #[test]
+    fn soft_anchor_rejects_non_preference_fact() {
+        assert!(!soft_anchor_allowed_for_input("$user:age = \"30\""));
     }
 }
 

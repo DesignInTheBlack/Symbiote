@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -169,6 +170,34 @@ pub struct SystemHealthSnapshot {
     pub trace_id: Option<String>,
     pub metrics_json: String,
     pub subsystem_states_json: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BaselineMetricsSnapshot {
+    pub baseline_id: String,
+    pub window_minutes: i64,
+    pub window_start: String,
+    pub window_end: String,
+    pub metrics_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RecommendationEvent {
+    pub event_id: String,
+    pub recommendation_id: String,
+    pub conversation_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub snapshot_id: Option<String>,
+    pub action_json: Option<String>,
+    pub gate_json: Option<String>,
+    pub recovery_metric: Option<String>,
+    pub recovery_target: Option<f64>,
+    pub baseline_value: Option<f64>,
+    pub resolved_value: Option<f64>,
+    pub time_to_recovery_ms: Option<i64>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -479,6 +508,8 @@ pub struct WorkspaceHypothesis {
     pub evidence_event_ids: Vec<i64>,
     #[serde(default)]
     pub belief_ids: Vec<i64>,
+    #[serde(default)]
+    pub evidence_quality: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -486,6 +517,14 @@ pub struct GoalStep {
     pub text: String,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub preconditions: Vec<String>,
+    #[serde(default)]
+    pub postconditions: Vec<String>,
+    #[serde(default)]
+    pub failure_count: i64,
+    #[serde(default)]
+    pub last_failure_at: Option<String>,
     #[serde(default)]
     pub evidence_event_ids: Vec<i64>,
     #[serde(default)]
@@ -519,6 +558,8 @@ pub struct WorkspaceFieldMeta {
     pub evidence_event_ids: Vec<i64>,
     #[serde(default)]
     pub belief_ids: Vec<i64>,
+    #[serde(default)]
+    pub evidence_quality: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -530,6 +571,8 @@ pub struct WorkspaceListItemMeta {
     pub evidence_event_ids: Vec<i64>,
     #[serde(default)]
     pub belief_ids: Vec<i64>,
+    #[serde(default)]
+    pub evidence_quality: Option<f32>,
     #[serde(default)]
     pub attempt_count: i64,
     #[serde(default)]
@@ -735,6 +778,19 @@ pub struct Settings {
     pub weight_latency: Option<f32>,
     pub weight_evidence_strictness: Option<f32>,
     pub weight_exploration: Option<f32>,
+    pub evidence_emit_budget: Option<i32>,
+    pub evidence_retention_days: Option<i32>,
+    pub gate_penalty_integration: Option<bool>,
+    pub evidence_auto_capture: Option<bool>,
+    pub response_fallback_enabled: Option<bool>,
+    pub memory_soft_anchor: Option<bool>,
+    pub context_extraction_boost: Option<bool>,
+    pub planner_enabled: Option<bool>,
+    pub confidence_calibration: Option<bool>,
+    pub scheduler_cognition: Option<bool>,
+    pub learning_feedback: Option<bool>,
+    pub evidence_semantics_v2: Option<bool>,
+    pub narrative_continuity: Option<bool>,
     pub monologue_provenance_guard: Option<bool>,
     pub organism_decay: Option<bool>,
     pub model_context_limit: Option<i32>,
@@ -905,6 +961,20 @@ impl Settings {
             0,
             None,
             "meta_cog_streak_limit",
+            &mut adjustments,
+        );
+        clamp_opt_i32(
+            &mut self.evidence_emit_budget,
+            0,
+            None,
+            "evidence_emit_budget",
+            &mut adjustments,
+        );
+        clamp_opt_i32(
+            &mut self.evidence_retention_days,
+            0,
+            None,
+            "evidence_retention_days",
             &mut adjustments,
         );
 
@@ -1131,6 +1201,8 @@ pub struct ControllerState {
     pub last_strategy: Option<String>,
     #[serde(default)]
     pub outcome_quality: Option<f32>,
+    #[serde(default)]
+    pub reliability: HashMap<String, f32>,
     pub missing_fields: Vec<String>,
     pub updated_at: Option<String>,
     pub notes: Vec<String>,

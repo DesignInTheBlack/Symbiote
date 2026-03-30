@@ -55,6 +55,7 @@ mod prediction;
 mod telemetry;
 mod gating;
 mod tools;
+mod planner;
 pub(crate) mod workspace;
 mod commit;
 mod run;

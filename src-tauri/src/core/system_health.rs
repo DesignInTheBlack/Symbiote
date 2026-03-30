@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -8,10 +8,13 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 use crate::core::{system_controls, system_log, workspace as core_workspace, self_model_controller};
+use crate::core::memory::attention::evidence::{evidence_quality_tier, EvidenceQualityTier};
+use crate::models::Settings;
 use crate::core::kernel::constants::{EVIDENCE_MIN, TELEMETRY_MIN};
 use crate::db::Db;
 
 pub const HEALTH_WINDOW_MINUTES: i64 = 60;
+pub const BASELINE_WINDOW_MINUTES: i64 = 60 * 24;
 const GATE_INPUT_LIMIT: i64 = 6;
 pub const UNITY_WINDOW_MINUTES: i64 = 30;
 const UNITY_GREEN_WINDOW_HOURS: i64 = 6;
@@ -20,6 +23,7 @@ const AUTO_DEGRADE_TOOL_FAILURE_RATE: f64 = 0.25;
 const OUTCOME_REMINDER_RUN_THRESHOLD: i64 = 10;
 const OUTCOME_REMINDER_COOLDOWN_MINUTES: i64 = 60;
 const MIN_EVIDENCE_EVENTS: i64 = 6;
+const CALIBRATION_SAMPLE_MIN: i64 = 200;
 const WARN_RATE_TARGET_PER_MIN: f64 = 8.0;
 const BENIGN_WARN_EVENTS: &[&str] = &[
     "prompt_trim_critical",
@@ -45,6 +49,60 @@ pub struct SystemHealthSnapshotPayload {
     pub trace_id: Option<String>,
     pub metrics: Value,
     pub subsystem_states: Value,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct BaselineMetricsPayload {
+    pub baseline_id: String,
+    pub window_minutes: i64,
+    pub window_start: String,
+    pub window_end: String,
+    pub metrics: Value,
+}
+
+struct CalibrationMetrics {
+    brier: Option<f64>,
+    ece: Option<f64>,
+    count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RecommendationInstance {
+    id: String,
+    kind: String,
+    title: String,
+    detail: String,
+    status: String,
+    action: Option<Value>,
+    gate: Option<Value>,
+    recovery_metric: Option<String>,
+    recovery_target: Option<f64>,
+    baseline_value: Option<f64>,
+    current_value: Option<f64>,
+}
+
+impl RecommendationInstance {
+    fn to_value(&self) -> Value {
+        json!({
+            "recommendation_id": self.id,
+            "kind": self.kind,
+            "title": self.title,
+            "detail": self.detail,
+            "status": self.status,
+            "action": self.action,
+            "gate": self.gate,
+            "recovery_metric": self.recovery_metric,
+            "recovery_target": self.recovery_target,
+            "baseline_value": self.baseline_value,
+            "current_value": self.current_value,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecoveryDirection {
+    LowerIsBetter,
+    HigherIsBetter,
 }
 
 pub struct HealthAggregator {
@@ -147,6 +205,152 @@ impl HealthAggregator {
         }
     }
 
+    async fn record_recommendation_events(
+        &self,
+        recommendations: &[RecommendationInstance],
+        snapshot_id: &str,
+        app_handle: Option<&AppHandle>,
+    ) {
+        for rec in recommendations {
+            let last = self
+                .db
+                .get_latest_recommendation_event(&rec.id)
+                .await
+                .ok()
+                .flatten();
+            if last
+                .as_ref()
+                .map(|entry| entry.status.as_str())
+                == Some(rec.status.as_str())
+            {
+                continue;
+            }
+            let action_json = rec.action.as_ref().map(|v| v.to_string());
+            let gate_json = rec.gate.as_ref().map(|v| v.to_string());
+            let _ = self
+                .db
+                .insert_recommendation_event(
+                    &rec.id,
+                    None,
+                    &rec.kind,
+                    &rec.status,
+                    Some(snapshot_id),
+                    action_json.as_deref(),
+                    gate_json.as_deref(),
+                    rec.recovery_metric.as_deref(),
+                    rec.recovery_target,
+                    rec.baseline_value,
+                    None,
+                    None,
+                )
+                .await;
+            let _ = system_log::log_event(
+                &self.db.pool,
+                app_handle,
+                "info",
+                "system",
+                None,
+                None,
+                json!({
+                    "event": format!("recommendation_{}", rec.status),
+                    "recommendation_id": rec.id,
+                    "kind": rec.kind,
+                    "snapshot_id": snapshot_id,
+                }),
+            )
+            .await;
+        }
+    }
+
+    async fn resolve_recommendations(
+        &self,
+        core_metrics: &Value,
+        baseline_present: bool,
+        snapshot_id: &str,
+        app_handle: Option<&AppHandle>,
+    ) {
+        let rows = sqlx::query(
+            "SELECT event_id, recommendation_id, kind, recovery_metric, recovery_target, baseline_value, created_at
+             FROM recommendation_events e
+             WHERE status = 'accepted'
+               AND NOT EXISTS (
+                   SELECT 1 FROM recommendation_events r
+                   WHERE r.recommendation_id = e.recommendation_id
+                     AND r.status IN ('resolved','dismissed')
+                     AND datetime(r.created_at) >= datetime(e.created_at)
+               )
+             ORDER BY datetime(created_at) DESC",
+        )
+        .fetch_all(&self.db.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in rows {
+            let recommendation_id: String = row.get("recommendation_id");
+            let kind: String = row.get("kind");
+            let recovery_metric: Option<String> = row.try_get("recovery_metric").ok();
+            let recovery_target: Option<f64> = row.try_get("recovery_target").ok();
+            let baseline_value: Option<f64> = row.try_get("baseline_value").ok();
+            let created_at: String = row.get("created_at");
+            let Some(metric) = recovery_metric.as_deref() else {
+                continue;
+            };
+            let Some(target) = recovery_target else {
+                continue;
+            };
+            let Some(current) = metric_value_for(metric, core_metrics, baseline_present) else {
+                continue;
+            };
+            let direction = recovery_direction(metric);
+            let meets = match direction {
+                RecoveryDirection::LowerIsBetter => current <= target,
+                RecoveryDirection::HigherIsBetter => current >= target,
+            };
+            if !meets {
+                continue;
+            }
+            let created_at_ts = parse_datetime(&created_at);
+            let now = Utc::now();
+            let time_to_recovery_ms = created_at_ts
+                .map(|ts| now.signed_duration_since(ts).num_milliseconds())
+                .unwrap_or(0);
+            let _ = self
+                .db
+                .insert_recommendation_event(
+                    &recommendation_id,
+                    None,
+                    &kind,
+                    "resolved",
+                    Some(snapshot_id),
+                    None,
+                    None,
+                    Some(metric),
+                    Some(target),
+                    baseline_value,
+                    Some(current),
+                    Some(time_to_recovery_ms),
+                )
+                .await;
+            let _ = system_log::log_event(
+                &self.db.pool,
+                app_handle,
+                "info",
+                "system",
+                None,
+                None,
+                json!({
+                    "event": "recommendation_resolved",
+                    "recommendation_id": recommendation_id,
+                    "metric": metric,
+                    "target": target,
+                    "value": current,
+                    "time_to_recovery_ms": time_to_recovery_ms,
+                }),
+            )
+            .await;
+        }
+    }
+
     pub async fn capture_snapshot(
         &self,
         run_id: Option<&str>,
@@ -154,16 +358,15 @@ impl HealthAggregator {
         app_handle: Option<&AppHandle>,
     ) -> Result<SystemHealthSnapshotPayload, String> {
         let now = Utc::now();
+        let snapshot_id = Uuid::new_v4().to_string();
         let since = now - ChronoDuration::minutes(HEALTH_WINDOW_MINUTES);
         let since_str = since.to_rfc3339();
 
         let control_map = system_controls::load_control_map(&self.db).await;
         let subsystem_states = build_subsystem_states(&control_map);
-        let cockpit_write_enabled = self
-            .db
-            .get_settings()
-            .await
-            .ok()
+        let settings = self.db.get_settings().await.ok();
+        let cockpit_write_enabled = settings
+            .as_ref()
             .and_then(|s| s.cockpit_write_enabled)
             .unwrap_or(false);
 
@@ -235,6 +438,8 @@ impl HealthAggregator {
         } else {
             None
         };
+        let calibration = fetch_outcome_calibration(&self.db.pool, &since_str, 500).await;
+        let calibration_ready = calibration.count >= CALIBRATION_SAMPLE_MIN;
         if outcome_total == 0 && kernel_cycle_count >= OUTCOME_REMINDER_RUN_THRESHOLD {
             let reminder_due = self
                 .db
@@ -759,6 +964,96 @@ impl HealthAggregator {
         } else {
             0.0
         };
+        let gate_override_count =
+            count_system_log_event(&self.db.pool, "memory_write_override", &since_str).await;
+        let gate_override_rate = if gate_total > 0 {
+            gate_override_count as f64 / gate_total as f64
+        } else {
+            0.0
+        };
+        let plan_completed = count_table_in_window(
+            &self.db.pool,
+            "thread_runs",
+            "updated_at",
+            &since_str,
+            Some("status = 'completed'"),
+        )
+        .await;
+        let plan_failed = count_table_in_window(
+            &self.db.pool,
+            "thread_runs",
+            "updated_at",
+            &since_str,
+            Some("status = 'failed'"),
+        )
+        .await;
+        let plan_total = plan_completed + plan_failed;
+        let plan_completion_rate = if plan_total > 0 {
+            plan_completed as f64 / plan_total as f64
+        } else {
+            0.0
+        };
+        let (task_confirm, task_disconfirm) =
+            fetch_task_outcome_counts(&self.db.pool, &since_str).await;
+        let task_total = task_confirm + task_disconfirm;
+        let task_completion_rate = if task_total > 0 {
+            task_confirm as f64 / task_total as f64
+        } else {
+            0.0
+        };
+        let self_report_total =
+            count_system_log_event(&self.db.pool, "self_report_snapshot", &since_str).await;
+        let self_report_missing =
+            count_system_log_event(&self.db.pool, "self_reflection_missing_evidence", &since_str).await
+                + count_system_log_event(&self.db.pool, "self_claim_missing_evidence", &since_str).await;
+        let self_report_coherence = if self_report_total > 0 {
+            (1.0 - (self_report_missing as f64 / self_report_total as f64)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let current_core_metrics = json!({
+            "plan_completion_rate": plan_completion_rate,
+            "plan_completed": plan_completed,
+            "plan_failed": plan_failed,
+            "plan_total": plan_total,
+            "task_completion_rate": task_completion_rate,
+            "task_outcome_total": task_total,
+            "task_outcome_confirm": task_confirm,
+            "task_outcome_disconfirm": task_disconfirm,
+            "gate_override_rate": gate_override_rate,
+            "gate_override_count": gate_override_count,
+            "gate_total": gate_total,
+            "tool_failure_rate": tool_failure_rate,
+            "tool_failures": tool_failures,
+            "tool_total": tool_dispatch_total,
+            "evidence_coverage": controller_evidence,
+            "evidence_event_total": evidence_event_total,
+            "self_report_coherence": self_report_coherence,
+            "self_report_total": self_report_total,
+            "self_report_missing": self_report_missing,
+        });
+        let baseline_snapshot = self.db.get_latest_baseline_metrics().await.ok().flatten();
+        let baseline_metrics = baseline_snapshot
+            .as_ref()
+            .and_then(|snap| serde_json::from_str::<Value>(&snap.metrics_json).ok())
+            .unwrap_or(Value::Null);
+        let baseline_deltas = compute_baseline_deltas(&baseline_metrics, &current_core_metrics);
+        let baseline_present = baseline_snapshot.is_some();
+        let recommendations = build_recommendations(
+            settings.as_ref(),
+            &control_map,
+            controller_confidence,
+            controller_evidence,
+            tool_failure_rate,
+            plan_completion_rate,
+            baseline_present,
+        );
+        self.resolve_recommendations(&current_core_metrics, baseline_present, &snapshot_id, app_handle)
+            .await;
+        self.record_recommendation_events(&recommendations, &snapshot_id, app_handle)
+            .await;
+        let recommendation_telemetry = fetch_recommendation_telemetry(&self.db.pool, &since_str).await;
+        let recommendation_items: Vec<Value> = recommendations.iter().map(|rec| rec.to_value()).collect();
         let tool_unreliable = tool_failure_rate >= AUTO_DEGRADE_TOOL_FAILURE_RATE;
 
         if app_handle.is_some() {
@@ -818,6 +1113,19 @@ impl HealthAggregator {
 
         let metrics = json!({
             "window_minutes": HEALTH_WINDOW_MINUTES,
+            "baseline": {
+                "latest": baseline_metrics,
+                "captured_at": baseline_snapshot.as_ref().map(|snap| snap.created_at.clone()),
+                "window_minutes": baseline_snapshot.as_ref().map(|snap| snap.window_minutes),
+                "window_start": baseline_snapshot.as_ref().map(|snap| snap.window_start.clone()),
+                "window_end": baseline_snapshot.as_ref().map(|snap| snap.window_end.clone()),
+            },
+            "baseline_deltas": baseline_deltas,
+            "core_metrics": current_core_metrics,
+            "recommendations": {
+                "items": recommendation_items,
+                "telemetry": recommendation_telemetry,
+            },
             "scheduler": {
                 "cadence_ms": scheduler_cadence_ms,
                 "avg_tick_duration_ms": scheduler_avg_tick_ms,
@@ -887,6 +1195,10 @@ impl HealthAggregator {
                 "inconclusive": outcome_inconclusive,
                 "accuracy": outcome_accuracy_opt,
                 "last_outcome_at": outcome_last_at,
+                "brier_score": calibration.brier,
+                "ece": calibration.ece,
+                "calibration_samples": calibration.count,
+                "calibration_ready": calibration_ready,
             },
             "scorecard": {
                 "combined_score": combined_score,
@@ -1069,7 +1381,6 @@ impl HealthAggregator {
             "error_state": error_state,
         });
 
-        let snapshot_id = Uuid::new_v4().to_string();
         let timestamp = now.to_rfc3339();
         let metrics_json = serde_json::to_string(&metrics).map_err(|e| e.to_string())?;
         let subsystem_states_json =
@@ -1111,6 +1422,168 @@ impl HealthAggregator {
             trace_id: trace_id.map(|v| v.to_string()),
             metrics,
             subsystem_states,
+        })
+    }
+
+    pub async fn capture_baseline_metrics(
+        &self,
+        window_minutes: Option<i64>,
+        app_handle: Option<&AppHandle>,
+    ) -> Result<BaselineMetricsPayload, String> {
+        let window_minutes = window_minutes.unwrap_or(BASELINE_WINDOW_MINUTES).max(1);
+        let now = Utc::now();
+        let since = now - ChronoDuration::minutes(window_minutes);
+        let since_str = since.to_rfc3339();
+
+        let gate_counts = fetch_gate_counts(&self.db.pool, &since_str).await;
+        let gate_total = gate_counts.values().copied().sum::<i64>();
+        let gate_override_count =
+            count_system_log_event(&self.db.pool, "memory_write_override", &since_str).await;
+        let gate_override_rate = if gate_total > 0 {
+            gate_override_count as f64 / gate_total as f64
+        } else {
+            0.0
+        };
+
+        let (tool_successes, tool_failures) =
+            fetch_tool_dispatch_counts(&self.db.pool, &since_str).await;
+        let tool_total = tool_successes + tool_failures;
+        let tool_failure_rate = if tool_total > 0 {
+            tool_failures as f64 / tool_total as f64
+        } else {
+            0.0
+        };
+
+        let plan_completed = count_table_in_window(
+            &self.db.pool,
+            "thread_runs",
+            "updated_at",
+            &since_str,
+            Some("status = 'completed'"),
+        )
+        .await;
+        let plan_failed = count_table_in_window(
+            &self.db.pool,
+            "thread_runs",
+            "updated_at",
+            &since_str,
+            Some("status = 'failed'"),
+        )
+        .await;
+        let plan_total = plan_completed + plan_failed;
+        let plan_completion_rate = if plan_total > 0 {
+            plan_completed as f64 / plan_total as f64
+        } else {
+            0.0
+        };
+        let (task_confirm, task_disconfirm) =
+            fetch_task_outcome_counts(&self.db.pool, &since_str).await;
+        let task_total = task_confirm + task_disconfirm;
+        let task_completion_rate = if task_total > 0 {
+            task_confirm as f64 / task_total as f64
+        } else {
+            0.0
+        };
+
+        let self_report_total =
+            count_system_log_event(&self.db.pool, "self_report_snapshot", &since_str).await;
+        let self_report_missing =
+            count_system_log_event(&self.db.pool, "self_reflection_missing_evidence", &since_str).await
+                + count_system_log_event(&self.db.pool, "self_claim_missing_evidence", &since_str).await;
+        let self_report_coherence = if self_report_total > 0 {
+            (1.0 - (self_report_missing as f64 / self_report_total as f64)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let (controller_state, _organism_state, _error_state) =
+            fetch_latest_subject_state(&self.db.pool).await;
+        let evidence_coverage = controller_state
+            .get("evidence_coverage")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let evidence_events = count_table_in_window(
+            &self.db.pool,
+            "ics_evidence_events",
+            "created_at",
+            &since_str,
+            None,
+        )
+        .await;
+        let self_evidence_events = count_table_in_window(
+            &self.db.pool,
+            "self_evidence_events",
+            "created_at",
+            &since_str,
+            None,
+        )
+        .await;
+        let evidence_event_total = evidence_events + self_evidence_events;
+        let calibration = fetch_outcome_calibration(&self.db.pool, &since_str, 500).await;
+
+        let metrics = json!({
+            "plan_completion_rate": plan_completion_rate,
+            "plan_completed": plan_completed,
+            "plan_failed": plan_failed,
+            "plan_total": plan_total,
+            "task_completion_rate": task_completion_rate,
+            "task_outcome_total": task_total,
+            "task_outcome_confirm": task_confirm,
+            "task_outcome_disconfirm": task_disconfirm,
+            "gate_override_rate": gate_override_rate,
+            "gate_override_count": gate_override_count,
+            "gate_total": gate_total,
+            "tool_failure_rate": tool_failure_rate,
+            "tool_failures": tool_failures,
+            "tool_total": tool_total,
+            "evidence_coverage": evidence_coverage,
+            "evidence_event_total": evidence_event_total,
+            "self_report_coherence": self_report_coherence,
+            "self_report_total": self_report_total,
+            "self_report_missing": self_report_missing,
+            "brier_score": calibration.brier,
+            "ece": calibration.ece,
+            "calibration_samples": calibration.count,
+        });
+        let metrics_json = serde_json::to_string(&metrics).map_err(|e| e.to_string())?;
+        let baseline_id = Uuid::new_v4().to_string();
+        let window_start = since.to_rfc3339();
+        let window_end = now.to_rfc3339();
+        self.db
+            .insert_baseline_metrics(
+                &baseline_id,
+                window_minutes,
+                &window_start,
+                &window_end,
+                &metrics_json,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let _ = system_log::log_event(
+            &self.db.pool,
+            app_handle,
+            "info",
+            "system",
+            None,
+            None,
+            json!({
+                "event": "baseline_metrics_captured",
+                "baseline_id": baseline_id,
+                "window_minutes": window_minutes,
+                "plan_total": plan_total,
+                "gate_total": gate_total,
+                "tool_total": tool_total,
+            }),
+        )
+        .await;
+
+        Ok(BaselineMetricsPayload {
+            baseline_id,
+            window_minutes,
+            window_start,
+            window_end,
+            metrics,
         })
     }
 }
@@ -1828,6 +2301,432 @@ fn subsystem_expected_missing(
         }
         _ => false,
     }
+}
+
+fn compute_baseline_deltas(baseline: &Value, current: &Value) -> Value {
+    let keys = [
+        "plan_completion_rate",
+        "task_completion_rate",
+        "gate_override_rate",
+        "tool_failure_rate",
+        "evidence_coverage",
+        "self_report_coherence",
+        "brier_score",
+        "ece",
+        "plan_total",
+        "task_outcome_total",
+        "tool_total",
+    ];
+    let mut map = serde_json::Map::new();
+    for key in keys.iter() {
+        let base_val = baseline.get(*key).and_then(|v| v.as_f64());
+        let cur_val = current.get(*key).and_then(|v| v.as_f64());
+        if let (Some(base), Some(cur)) = (base_val, cur_val) {
+            map.insert((*key).to_string(), json!(cur - base));
+        }
+    }
+    Value::Object(map)
+}
+
+fn evidence_tier_rank(tier: EvidenceQualityTier) -> i32 {
+    match tier {
+        EvidenceQualityTier::VeryLow => 0,
+        EvidenceQualityTier::Low => 1,
+        EvidenceQualityTier::Medium => 2,
+        EvidenceQualityTier::High => 3,
+    }
+}
+
+fn gate_recommendation(
+    confidence: f64,
+    evidence: f64,
+    evidence_tier: EvidenceQualityTier,
+    min_confidence: f64,
+    min_evidence: f64,
+    min_evidence_tier: EvidenceQualityTier,
+) -> Option<Value> {
+    let mut reasons = Vec::new();
+    if confidence < min_confidence {
+        reasons.push("confidence_low");
+    }
+    if evidence < min_evidence {
+        reasons.push("evidence_low");
+    }
+    if evidence_tier_rank(evidence_tier) < evidence_tier_rank(min_evidence_tier) {
+        reasons.push("evidence_quality_low");
+    }
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "confidence": confidence,
+            "min_confidence": min_confidence,
+            "evidence_coverage": evidence,
+            "min_evidence": min_evidence,
+            "evidence_quality_tier": evidence_tier.as_str(),
+            "min_evidence_quality_tier": min_evidence_tier.as_str(),
+            "reasons": reasons,
+        }))
+    }
+}
+
+fn recovery_direction(metric: &str) -> RecoveryDirection {
+    match metric {
+        "tool_failure_rate" | "gate_override_rate" => RecoveryDirection::LowerIsBetter,
+        _ => RecoveryDirection::HigherIsBetter,
+    }
+}
+
+fn metric_value_for(metric: &str, core_metrics: &Value, baseline_present: bool) -> Option<f64> {
+    match metric {
+        "baseline_present" => Some(if baseline_present { 1.0 } else { 0.0 }),
+        "tool_failure_rate" => core_metrics.get("tool_failure_rate").and_then(|v| v.as_f64()),
+        "plan_completion_rate" => core_metrics.get("plan_completion_rate").and_then(|v| v.as_f64()),
+        "task_completion_rate" => core_metrics.get("task_completion_rate").and_then(|v| v.as_f64()),
+        "evidence_coverage" => core_metrics.get("evidence_coverage").and_then(|v| v.as_f64()),
+        "self_report_coherence" => core_metrics.get("self_report_coherence").and_then(|v| v.as_f64()),
+        _ => None,
+    }
+}
+
+fn build_recommendations(
+    settings: Option<&Settings>,
+    control_map: &HashMap<String, system_controls::ControlState>,
+    confidence: f64,
+    evidence: f64,
+    tool_failure_rate: f64,
+    plan_completion_rate: f64,
+    baseline_present: bool,
+) -> Vec<RecommendationInstance> {
+    let mut recs = Vec::new();
+    let evidence_tier = evidence_quality_tier(evidence as f32);
+
+    if !baseline_present {
+        let gate = gate_recommendation(
+            confidence,
+            evidence,
+            evidence_tier,
+            0.0,
+            0.0,
+            EvidenceQualityTier::VeryLow,
+        );
+        recs.push(RecommendationInstance {
+            id: "baseline_capture".to_string(),
+            kind: "baseline".to_string(),
+            title: "Capture baseline metrics".to_string(),
+            detail: "No baseline metrics have been captured yet. Capture a baseline to anchor deltas.".to_string(),
+            status: if gate.is_some() { "ineligible".to_string() } else { "eligible".to_string() },
+            action: if gate.is_some() {
+                None
+            } else {
+                Some(json!({
+                    "type": "capture_baseline_metrics",
+                    "window_minutes": BASELINE_WINDOW_MINUTES,
+                }))
+            },
+            gate,
+            recovery_metric: Some("baseline_present".to_string()),
+            recovery_target: Some(1.0),
+            baseline_value: Some(0.0),
+            current_value: Some(0.0),
+        });
+    }
+
+    let evidence_auto_capture = settings.and_then(|s| s.evidence_auto_capture).unwrap_or(false);
+    let evidence_emit_budget = settings.and_then(|s| s.evidence_emit_budget).unwrap_or(0);
+    if evidence < EVIDENCE_MIN as f64 && !evidence_auto_capture {
+        let gate = gate_recommendation(
+            confidence,
+            evidence,
+            evidence_tier,
+            0.35,
+            0.2,
+            EvidenceQualityTier::VeryLow,
+        );
+        let mut settings_patch = serde_json::Map::new();
+        settings_patch.insert("evidence_auto_capture".to_string(), Value::Bool(true));
+        if evidence_emit_budget < 50 {
+            settings_patch.insert("evidence_emit_budget".to_string(), Value::Number(50.into()));
+        }
+        recs.push(RecommendationInstance {
+            id: "evidence_auto_capture".to_string(),
+            kind: "evidence".to_string(),
+            title: "Enable evidence auto-capture".to_string(),
+            detail: "Evidence coverage is low. Enable auto-capture and raise the emit budget.".to_string(),
+            status: if gate.is_some() { "ineligible".to_string() } else { "eligible".to_string() },
+            action: if gate.is_some() {
+                None
+            } else {
+                Some(json!({
+                    "type": "update_settings",
+                    "settings": Value::Object(settings_patch),
+                }))
+            },
+            gate,
+            recovery_metric: Some("evidence_coverage".to_string()),
+            recovery_target: Some(EVIDENCE_MIN as f64),
+            baseline_value: Some(evidence),
+            current_value: Some(evidence),
+        });
+    }
+
+    let tool_mode = system_controls::mode_for("tool_execution", control_map);
+    if tool_failure_rate >= AUTO_DEGRADE_TOOL_FAILURE_RATE && !system_controls::mode_is_degraded(&tool_mode) {
+        let gate = gate_recommendation(
+            confidence,
+            evidence,
+            evidence_tier,
+            0.45,
+            0.5,
+            EvidenceQualityTier::Low,
+        );
+        recs.push(RecommendationInstance {
+            id: "tool_execution_degrade".to_string(),
+            kind: "tool_reliability".to_string(),
+            title: "Degrade tool execution".to_string(),
+            detail: "Tool failure rate is high. Degrading tool execution can prevent repeated errors.".to_string(),
+            status: if gate.is_some() { "ineligible".to_string() } else { "eligible".to_string() },
+            action: if gate.is_some() {
+                None
+            } else {
+                Some(json!({
+                    "type": "set_system_control",
+                    "subsystem_id": "tool_execution",
+                    "mode": "degraded",
+                    "reason": "recommendation:tool_failure_rate",
+                }))
+            },
+            gate,
+            recovery_metric: Some("tool_failure_rate".to_string()),
+            recovery_target: Some(AUTO_DEGRADE_TOOL_FAILURE_RATE),
+            baseline_value: Some(tool_failure_rate),
+            current_value: Some(tool_failure_rate),
+        });
+    }
+
+    let planner_enabled = settings.and_then(|s| s.planner_enabled).unwrap_or(true);
+    if !planner_enabled {
+        let gate = gate_recommendation(
+            confidence,
+            evidence,
+            evidence_tier,
+            0.4,
+            0.4,
+            EvidenceQualityTier::Low,
+        );
+        recs.push(RecommendationInstance {
+            id: "planner_enable".to_string(),
+            kind: "planning".to_string(),
+            title: "Enable deterministic planner".to_string(),
+            detail: "Planner is disabled. Enable it to enforce step-by-step execution.".to_string(),
+            status: if gate.is_some() { "ineligible".to_string() } else { "eligible".to_string() },
+            action: if gate.is_some() {
+                None
+            } else {
+                Some(json!({
+                    "type": "update_settings",
+                    "settings": {
+                        "planner_enabled": true
+                    }
+                }))
+            },
+            gate,
+            recovery_metric: Some("plan_completion_rate".to_string()),
+            recovery_target: Some(plan_completion_rate.max(0.6)),
+            baseline_value: Some(plan_completion_rate),
+            current_value: Some(plan_completion_rate),
+        });
+    }
+
+    recs
+}
+
+async fn fetch_outcome_calibration(pool: &sqlx::SqlitePool, since: &str, limit: i64) -> CalibrationMetrics {
+    let mut pairs: Vec<(f64, f64)> = Vec::new();
+    if let Ok(rows) = sqlx::query(
+        "SELECT verdict, confidence FROM outcome_events
+         WHERE datetime(created_at) >= datetime(?)
+         ORDER BY datetime(created_at) DESC
+         LIMIT ?",
+    )
+    .bind(since)
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await
+    {
+        for row in rows {
+            let verdict: String = row.get("verdict");
+            let confidence: f64 = row.try_get::<f64, _>("confidence").unwrap_or(0.5);
+            let y = match verdict.trim().to_lowercase().as_str() {
+                "confirm" => Some(1.0),
+                "disconfirm" => Some(0.0),
+                _ => None,
+            };
+            if let Some(label) = y {
+                pairs.push((confidence.clamp(0.0, 1.0), label));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return CalibrationMetrics {
+            brier: None,
+            ece: None,
+            count: 0,
+        };
+    }
+    let count = pairs.len() as i64;
+    let brier = pairs
+        .iter()
+        .map(|(p, y)| {
+            let diff = p - y;
+            diff * diff
+        })
+        .sum::<f64>()
+        / (pairs.len() as f64);
+    let ece = compute_ece(&pairs, 10);
+    CalibrationMetrics {
+        brier: Some(brier),
+        ece: Some(ece),
+        count,
+    }
+}
+
+async fn fetch_task_outcome_counts(pool: &sqlx::SqlitePool, since: &str) -> (i64, i64) {
+    let mut confirm = 0_i64;
+    let mut disconfirm = 0_i64;
+    if let Ok(rows) = sqlx::query(
+        "SELECT verdict, COUNT(*) as count
+         FROM outcome_events
+         WHERE target_type = 'tool_dispatch'
+           AND verdict IN ('confirm','disconfirm')
+           AND datetime(created_at) >= datetime(?)
+         GROUP BY verdict",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await
+    {
+        for row in rows {
+            let verdict: String = row.try_get("verdict").unwrap_or_default();
+            let count: i64 = row.try_get("count").unwrap_or(0);
+            match verdict.as_str() {
+                "confirm" => confirm += count,
+                "disconfirm" => disconfirm += count,
+                _ => {}
+            }
+        }
+    }
+    (confirm, disconfirm)
+}
+
+fn median_f64(values: &mut Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    } else {
+        Some(values[mid])
+    }
+}
+
+async fn fetch_recommendation_telemetry(pool: &sqlx::SqlitePool, since: &str) -> Value {
+    let eligible =
+        count_table_in_window(pool, "recommendation_events", "created_at", since, Some("status = 'eligible'")).await;
+    let ineligible =
+        count_table_in_window(pool, "recommendation_events", "created_at", since, Some("status = 'ineligible'")).await;
+    let accepted =
+        count_table_in_window(pool, "recommendation_events", "created_at", since, Some("status = 'accepted'")).await;
+    let resolved =
+        count_table_in_window(pool, "recommendation_events", "created_at", since, Some("status = 'resolved'")).await;
+    let dismissed =
+        count_table_in_window(pool, "recommendation_events", "created_at", since, Some("status = 'dismissed'")).await;
+    let acceptance_rate = if eligible > 0 {
+        accepted as f64 / eligible as f64
+    } else {
+        0.0
+    };
+    let success_rate = if accepted > 0 {
+        resolved as f64 / accepted as f64
+    } else {
+        0.0
+    };
+
+    let mut times = Vec::new();
+    if let Ok(rows) = sqlx::query(
+        "SELECT time_to_recovery_ms FROM recommendation_events
+         WHERE status = 'resolved'
+           AND time_to_recovery_ms IS NOT NULL
+           AND datetime(created_at) >= datetime(?)",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await
+    {
+        for row in rows {
+            let value: Option<i64> = row.try_get("time_to_recovery_ms").ok();
+            if let Some(ms) = value {
+                times.push(ms as f64);
+            }
+        }
+    }
+    let median_time = median_f64(&mut times);
+
+    json!({
+        "eligible": eligible,
+        "ineligible": ineligible,
+        "accepted": accepted,
+        "resolved": resolved,
+        "dismissed": dismissed,
+        "acceptance_rate": acceptance_rate,
+        "success_rate": success_rate,
+        "median_time_to_recovery_ms": median_time,
+    })
+}
+
+fn parse_datetime(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc));
+    }
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc));
+    }
+    None
+}
+
+fn compute_ece(samples: &[(f64, f64)], bins: usize) -> f64 {
+    if samples.is_empty() || bins == 0 {
+        return 0.0;
+    }
+    let mut bin_counts = vec![0usize; bins];
+    let mut bin_conf_sum = vec![0.0_f64; bins];
+    let mut bin_acc_sum = vec![0.0_f64; bins];
+    for (p, y) in samples.iter() {
+        let mut idx = (p * bins as f64).floor() as usize;
+        if idx >= bins {
+            idx = bins - 1;
+        }
+        bin_counts[idx] += 1;
+        bin_conf_sum[idx] += *p;
+        bin_acc_sum[idx] += *y;
+    }
+    let total = samples.len() as f64;
+    let mut ece = 0.0_f64;
+    for i in 0..bins {
+        if bin_counts[i] == 0 {
+            continue;
+        }
+        let count = bin_counts[i] as f64;
+        let avg_conf = bin_conf_sum[i] / count;
+        let avg_acc = bin_acc_sum[i] / count;
+        ece += (avg_acc - avg_conf).abs() * (count / total);
+    }
+    ece
 }
 
 async fn count_benign_workspace_missing(

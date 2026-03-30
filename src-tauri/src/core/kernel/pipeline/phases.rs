@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::core::kernel::run::build_qualia_modulation_context;
+use std::collections::HashMap;
 
 pub(crate) struct ArbitrationPhaseResult {
     pub decision: KernelDecision,
@@ -36,6 +37,23 @@ impl Kernel {
             .await
         {
             candidates.push(promo);
+        }
+        for candidate in candidates.iter_mut() {
+            let payload = json!({
+                "candidate_id": candidate.id,
+                "kind": format!("{:?}", candidate.kind),
+                "source": candidate.source,
+            });
+            let snippet = format!(
+                "candidate {} kind={:?} source={}",
+                candidate.id, candidate.kind, candidate.source
+            );
+            if let Some(event_id) = self
+                .emit_system_evidence(state, settings, conversation_id, "candidate_created", Some(run_id), &snippet, Some(&payload))
+                .await
+            {
+                crate::core::kernel::run::append_candidate_evidence_id(candidate, event_id);
+            }
         }
 
         let mut subject_snapshot_hash: Option<String> = None;
@@ -94,6 +112,33 @@ impl Kernel {
         let residual_context = self
             .residual_influence_context(&decision_state, subject_state_snapshot.as_ref())
             .await;
+        let rollout_percent = settings.gate_rollout_percent.unwrap_or(100).clamp(0, 100);
+        let shadow_mode = settings.gate_shadow_mode.unwrap_or(false);
+        let rollout_bucket = gate_rollout_bucket(conversation_id);
+        let gate_penalty_enabled = settings.gate_penalty_integration.unwrap_or(true);
+        let use_soft_gate = gate_penalty_enabled
+            && !shadow_mode
+            && (rollout_percent >= 100 || rollout_bucket < rollout_percent);
+        let mut gate_penalties: HashMap<String, crate::core::subject_controller::GatePenalty> = HashMap::new();
+        let mut gate_signals_map: HashMap<String, crate::core::subject_controller::GateSignals> = HashMap::new();
+        if let Some(subject_state) = subject_state_snapshot.as_ref() {
+            for candidate in candidates.iter() {
+                let signals = self
+                    .compute_gate_signals_score(&decision_state, subject_state, None, candidate, anchor_hits, settings)
+                    .await;
+                gate_signals_map.insert(candidate.id.clone(), signals.clone());
+                if use_soft_gate {
+                    let penalty = crate::core::subject_controller::gate_penalty_for_candidate(
+                        subject_state,
+                        candidate,
+                        &decision_state.stop_state,
+                        &signals,
+                        settings.learning_feedback.unwrap_or(true),
+                    );
+                    gate_penalties.insert(candidate.id.clone(), penalty);
+                }
+            }
+        }
         let mut decision = self.arbitrate(
             candidates,
             settings,
@@ -103,12 +148,39 @@ impl Kernel {
             wave_context,
             qualia_context,
             residual_context,
+            if use_soft_gate { Some(&gate_penalties) } else { None },
             Some(run_id),
         );
         if decision.report.snapshot_hash.is_none() {
             decision.report.snapshot_hash = subject_snapshot_hash
                 .clone()
                 .or_else(|| state.last_subject_snapshot_hash.clone());
+        }
+        if let Some(selected) = decision.accepted.first() {
+            let payload = json!({
+                "candidate_id": selected.id,
+                "candidate_kind": format!("{:?}", selected.kind),
+                "candidate_source": selected.source,
+                "anchor_hits": anchor_hits,
+                "stage": "pre_gate",
+            });
+            let snippet = format!("arbitration winner {} kind={:?}", selected.id, selected.kind);
+            if let Some(event_id) = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "arbitration_outcome",
+                    Some(run_id),
+                    &snippet,
+                    Some(&payload),
+                )
+                .await
+            {
+                if let Some(first) = decision.accepted.get_mut(0) {
+                    crate::core::kernel::run::append_candidate_evidence_id(first, event_id);
+                }
+            }
         }
 
         if let (Some(snapshot_hash), Some(subject_state), Some(candidate)) = (
@@ -187,8 +259,8 @@ impl Kernel {
             }
 
             let signals = self
-                .compute_gate_signals(
-                    &mut decision_state,
+                .compute_gate_signals_score(
+                    &decision_state,
                     &subject_state,
                     Some(&decision),
                     &candidate,
@@ -196,31 +268,129 @@ impl Kernel {
                     settings,
                 )
                 .await;
-            let soft_gate = subject_controller::build_gate_decision(
+            self.commit_gate_signal_state(state, &signals);
+            self.commit_gate_signal_state(&mut decision_state, &signals);
+
+            let mut soft_gate = subject_controller::build_gate_decision(
                 &subject_state,
                 &candidate,
                 &decision_state.stop_state,
                 &signals,
             );
-            let legacy_gate =
+            let mut legacy_gate =
                 subject_controller::build_gate_decision_legacy(&subject_state, &candidate, &decision_state.stop_state);
             let soft_decision = soft_gate.decision.clone();
             let legacy_decision = legacy_gate.decision.clone();
-            let rollout_percent = settings.gate_rollout_percent.unwrap_or(100).clamp(0, 100);
-            let shadow_mode = settings.gate_shadow_mode.unwrap_or(false);
-            let rollout_bucket = gate_rollout_bucket(conversation_id);
-            let use_soft_gate = !shadow_mode && (rollout_percent >= 100 || rollout_bucket < rollout_percent);
-            let (mut gate, _shadow_gate) = if use_soft_gate {
-                (soft_gate, legacy_gate)
+            super::super::arbitration::apply_plan_verification_to_gate_decision(&mut soft_gate, &verification);
+            super::super::arbitration::apply_plan_verification_to_gate_decision(&mut legacy_gate, &verification);
+
+            let soft_reasons: Vec<String> = serde_json::from_str::<Value>(&soft_gate.evidence_refs_json)
+                .ok()
+                .and_then(|v| v.get("reasons").and_then(|r| r.as_array()).cloned())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str())
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let soft_penalty = if use_soft_gate {
+                gate_penalties
+                    .get(&candidate.id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::core::subject_controller::gate_penalty_for_candidate(
+                        &subject_state,
+                        &candidate,
+                        &decision_state.stop_state,
+                        &signals,
+                        settings.learning_feedback.unwrap_or(true),
+                    ))
             } else {
-                (legacy_gate, soft_gate)
+                crate::core::subject_controller::GatePenalty {
+                    penalty: 0.0,
+                    reasons: Vec::new(),
+                }
             };
-            super::super::arbitration::apply_plan_verification_to_gate_decision(&mut gate, &verification);
+
+            let mut hard_decision: Option<String> = None;
+            let mut hard_reasons: Vec<String> = Vec::new();
+            let mut tool_gate_detail: Option<String> = None;
+            if use_soft_gate {
+                if decision_state.stop_state.active {
+                    hard_decision = Some("DEFER".to_string());
+                    hard_reasons.push("stop_state_active".to_string());
+                }
+                if !self.plan_preconditions_met(&decision_state, &candidate) {
+                    hard_decision = Some("VERIFY".to_string());
+                    hard_reasons.push("plan_precondition_unmet".to_string());
+                }
+                if matches!(candidate.kind, CandidateKind::ToolCall) {
+                    let tool_name = candidate
+                        .payload
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !tool_name.is_empty() {
+                        let args_json = candidate
+                            .payload
+                            .get("arguments")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "{}".to_string());
+                        let tool_gate =
+                            self.tool_gate_decision(&tool_name, &args_json, settings, true);
+                        if !tool_gate.allowed {
+                            hard_decision = Some("DENY".to_string());
+                            let reason = tool_gate
+                                .reason
+                                .unwrap_or_else(|| "TOOL_BLOCK".to_string());
+                            hard_reasons.push(format!("tool_contract_{}", reason.to_lowercase()));
+                            tool_gate_detail = tool_gate.detail.clone();
+                        }
+                    }
+                }
+            }
+
+            let hard_gate = hard_decision.clone().map(|decision_label| subject_controller::GateDecisionRecord {
+                decision_id: Uuid::new_v4().to_string(),
+                decision: decision_label,
+                evidence_refs_json: json!({ "reasons": hard_reasons }).to_string(),
+                metrics_json: json!({
+                    "hard_gate": true,
+                    "tool_gate_detail": tool_gate_detail,
+                })
+                .to_string(),
+            });
+
+            let mut gate = if !use_soft_gate {
+                legacy_gate
+            } else if let Some(hard_gate) = hard_gate {
+                hard_gate
+            } else {
+                let mut gate = soft_gate.clone();
+                if !gate_allows_response(&gate.decision) {
+                    gate.decision = "ALLOW_WITH_NOTICE".to_string();
+                }
+                gate
+            };
+
+            let mut metrics = serde_json::from_str::<Value>(&soft_gate.metrics_json)
+                .unwrap_or_else(|_| json!({}));
+            if let Some(obj) = metrics.as_object_mut() {
+                obj.insert("soft_gate_decision".to_string(), json!(soft_gate.decision));
+                obj.insert("soft_gate_reasons".to_string(), json!(soft_reasons.clone()));
+                obj.insert("gate_penalty".to_string(), json!(soft_penalty.penalty));
+                obj.insert("gate_penalty_reasons".to_string(), json!(soft_penalty.reasons.clone()));
+                obj.insert("hard_gate_triggered".to_string(), json!(use_soft_gate && hard_decision.is_some()));
+            }
+            gate.metrics_json = metrics.to_string();
+
             let gate_reasons_log = serde_json::from_str::<Value>(&gate.evidence_refs_json)
                 .ok()
                 .and_then(|value| value.get("reasons").cloned())
                 .unwrap_or_else(|| json!([]));
-            state.gate_high_risk_streak = decision_state.gate_high_risk_streak;
             let _ = system_log::log_event(
                 &self.db.pool,
                 Some(&self.app_handle),
@@ -238,6 +408,9 @@ impl Kernel {
                     "legacy_decision": legacy_decision,
                     "enforced_decision": gate.decision,
                     "gate_reasons": gate_reasons_log,
+                    "gate_penalty": soft_penalty.penalty,
+                    "gate_penalty_reasons": soft_penalty.reasons,
+                    "hard_gate_decision": hard_decision,
                     "plan_verification": {
                         "outcome": verification.outcome,
                         "confidence": verification.confidence,
@@ -322,9 +495,46 @@ impl Kernel {
                 )
                 .await;
             }
+            let mut gate_evidence_ids: Vec<i64> = Vec::new();
+            let gate_payload = json!({
+                "candidate_id": candidate.id,
+                "candidate_kind": format!("{:?}", candidate.kind),
+                "decision": gate.decision,
+                "soft_decision": soft_decision,
+                "soft_reasons": soft_reasons,
+                "gate_penalty": soft_penalty.penalty,
+                "gate_penalty_reasons": soft_penalty.reasons,
+                "hard_gate": hard_decision.is_some(),
+            });
+            let gate_snippet = format!("gate_decision {} candidate={}", gate.decision, candidate.id);
+            if let Some(event_id) = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "gate_decision",
+                    Some(run_id),
+                    &gate_snippet,
+                    Some(&gate_payload),
+                )
+                .await
+            {
+                gate_evidence_ids.push(event_id);
+                if let Some(target) = decision.accepted.iter_mut().find(|c| c.id == candidate.id) {
+                    crate::core::kernel::run::append_candidate_evidence_id(target, event_id);
+                }
+            }
             decision.report.snapshot_hash = Some(snapshot_hash);
             decision.report.gate_decision_id = Some(gate.decision_id.clone());
             decision.report.gate_decision = Some(gate.decision.clone());
+            decision.report.gate_penalty = Some(soft_penalty.penalty as f64);
+            if !soft_penalty.reasons.is_empty() {
+                decision.report.gate_penalty_reasons = Some(soft_penalty.reasons.clone());
+            }
+            decision.report.soft_gate_decision = Some(soft_decision);
+            if !soft_reasons.is_empty() {
+                decision.report.soft_gate_reasons = Some(soft_reasons.clone());
+            }
             let reasons: Vec<String> = serde_json::from_str::<Value>(&gate.evidence_refs_json)
                 .ok()
                 .and_then(|v| v.get("reasons").and_then(|r| r.as_array()).cloned())
@@ -339,6 +549,54 @@ impl Kernel {
                 decision.report.gate_reasons = Some(reasons.clone());
             }
             decision.report.gate_notice = gate_notice_for(&gate.decision, &reasons);
+            if !gate_allows_response(&gate.decision) {
+                let verdict = match gate.decision.as_str() {
+                    "DENY" => "disconfirm",
+                    "DEFER" => "inconclusive",
+                    "VERIFY" => "inconclusive",
+                    _ => "inconclusive",
+                };
+                let source = if matches!(candidate.kind, CandidateKind::ToolCall) {
+                    candidate
+                        .payload
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .map(|name| format!("tool::{}", name.trim()))
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| format!("candidate_kind::{:?}", candidate.kind))
+                } else {
+                    format!("candidate_kind::{:?}", candidate.kind)
+                };
+                let mut evidence_ids = gate_evidence_ids.clone();
+                if evidence_ids.is_empty() {
+                    evidence_ids = candidate.evidence_event_ids.clone();
+                }
+                let note = if reasons.is_empty() {
+                    Some(gate.decision.clone())
+                } else {
+                    Some(
+                        json!({
+                            "decision": gate.decision,
+                            "reasons": reasons.clone(),
+                        })
+                        .to_string(),
+                    )
+                };
+                let _ = self
+                    .db
+                    .record_outcome_event(
+                        Some(run_id),
+                        Some(trace_id),
+                        Some(candidate.id.as_str()),
+                        "gate_decision",
+                        verdict,
+                        0.6,
+                        &source,
+                        note.as_deref(),
+                        &evidence_ids,
+                    )
+                    .await;
+            }
             if !gate_allows_response(&gate.decision) {
                 let reason_text = if reasons.is_empty() {
                     String::new()
@@ -410,6 +668,48 @@ impl Kernel {
                 decision.report.allowed_capabilities.monologue_run = false;
                 decision.report.allowed_capabilities.monologue_emit = false;
                 decision.report.allowed_capabilities.background_jobs = false;
+            }
+        }
+
+        for candidate in decision.accepted.iter_mut() {
+            let payload = json!({
+                "candidate_id": candidate.id,
+                "candidate_kind": format!("{:?}", candidate.kind),
+                "candidate_source": candidate.source,
+                "plan_step_id": candidate.payload.get("plan_step_id").and_then(|v| v.as_str()),
+                "step_index": candidate.payload.get("step_index").and_then(|v| v.as_i64()),
+            });
+            let snippet = format!("candidate accepted {} kind={:?}", candidate.id, candidate.kind);
+            if let Some(event_id) = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "candidate_accepted",
+                    Some(run_id),
+                    &snippet,
+                    Some(&payload),
+                )
+                .await
+            {
+                crate::core::kernel::run::append_candidate_evidence_id(candidate, event_id);
+                if let Some(step_id) = candidate
+                    .payload
+                    .get("plan_step_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    let _ = self
+                        .db
+                        .link_evidence_to_target(
+                            event_id,
+                            "plan_step",
+                            step_id,
+                            "step_of",
+                        )
+                        .await;
+                }
             }
         }
 

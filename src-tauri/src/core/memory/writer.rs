@@ -414,9 +414,11 @@ pub async fn write_fact(stmt: FactStmt, subject_id: i64, ctx: &WriteContext) -> 
                 let current_confidence: f64 = row.try_get("confidence").unwrap_or(1.0);
                 
                 // Reinforce
-                let weight = get_source_weight(ctx.source);
+                let source_ref = stmt.source_ref.as_deref().or(ctx.source_ref.as_deref());
+                let weight = get_source_weight_with_ref(ctx.source, source_ref);
                 let new_weight = weight_total as f32 + weight;
-                let new_confidence = current_confidence.max(stmt.certainty.unwrap_or(1.0) as f64);
+                let new_confidence =
+                    current_confidence.max(adjusted_certainty(stmt.certainty, source_ref));
                 
                 let episodic_event_id = if episodic_on { Some(Uuid::new_v4().to_string()) } else { None };
                 let _ = sqlx::query("INSERT INTO ics_evidence_events (belief_id, source_type, source_ref, snippet, weight, episodic_event_id) VALUES (?, ?, ?, ?, ?, ?)")
@@ -572,8 +574,9 @@ pub async fn write_fact(stmt: FactStmt, subject_id: i64, ctx: &WriteContext) -> 
             }
             
             // 4. Insert New Belief
-            let weight = get_source_weight(ctx.source);
-            let certainty = stmt.certainty.unwrap_or(1.0);
+            let source_ref = stmt.source_ref.as_deref().or(ctx.source_ref.as_deref());
+            let weight = get_source_weight_with_ref(ctx.source, source_ref);
+            let certainty = adjusted_certainty(stmt.certainty, source_ref) as f32;
             
             let layer = initial_layer_for_source(ctx.source);
             let res = sqlx::query("INSERT INTO ics_beliefs (kind, scope, polarity, layer, topic_key, signature_hash, evidence_weight_total, confidence, time_bucket_kind, time_bucket_value, observed_at, created_at) VALUES ('fact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")
@@ -1188,9 +1191,11 @@ pub async fn write_rel(
                 let weight_total: f64 = row.get("evidence_weight_total");
                 let current_confidence: f64 = row.try_get("confidence").unwrap_or(1.0);
                 
-                let weight = get_source_weight(ctx.source);
+                let source_ref = stmt.source_ref.as_deref().or(ctx.source_ref.as_deref());
+                let weight = get_source_weight_with_ref(ctx.source, source_ref);
                 let new_weight = weight_total as f32 + weight;
-                let new_confidence = current_confidence.max(stmt.certainty.unwrap_or(1.0) as f64);
+                let new_confidence =
+                    current_confidence.max(adjusted_certainty(stmt.certainty, source_ref));
                 
                 // Add Evidence
                  let episodic_event_id = if episodic_on { Some(Uuid::new_v4().to_string()) } else { None };
@@ -1253,8 +1258,9 @@ pub async fn write_rel(
             }
             
             // 4. Insert New
-            let weight = get_source_weight(ctx.source);
-            let certainty = stmt.certainty.unwrap_or(1.0);
+            let source_ref = stmt.source_ref.as_deref().or(ctx.source_ref.as_deref());
+            let weight = get_source_weight_with_ref(ctx.source, source_ref);
+            let certainty = adjusted_certainty(stmt.certainty, source_ref) as f32;
             
             let layer = initial_layer_for_source(ctx.source);
             let res = sqlx::query("INSERT INTO ics_beliefs (kind, scope, polarity, layer, topic_key, signature_hash, evidence_weight_total, confidence, time_bucket_kind, time_bucket_value, observed_at, created_at) VALUES ('rel', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")
@@ -1618,6 +1624,59 @@ fn get_source_weight(s: SourceType) -> f32 {
         SourceType::System => SOURCE_WEIGHT_SYSTEM,
         SourceType::Inference => SOURCE_WEIGHT_INFERENCE,
     }
+}
+
+fn get_source_weight_with_ref(s: SourceType, source_ref: Option<&str>) -> f32 {
+    let base = get_source_weight(s);
+    if let Some(confidence) = user_anchored_confidence(source_ref) {
+        return (base * confidence.clamp(0.2, 1.0)).max(0.05);
+    }
+    base
+}
+
+fn adjusted_certainty(certainty: Option<f32>, source_ref: Option<&str>) -> f64 {
+    let base = certainty.unwrap_or(1.0).clamp(0.05, 1.0);
+    if let Some(confidence) = user_anchored_confidence(source_ref) {
+        return base.min(confidence.clamp(0.05, 1.0)) as f64;
+    }
+    base as f64
+}
+
+fn user_anchored_confidence(source_ref: Option<&str>) -> Option<f32> {
+    let raw = source_ref?;
+    let lowered = raw.to_lowercase();
+    if !lowered.contains("user_anchored") {
+        return None;
+    }
+    if let Some(idx) = lowered.find("confidence=") {
+        let start = idx + "confidence=".len();
+        let mut num = String::new();
+        for ch in lowered[start..].chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                num.push(ch);
+            } else {
+                break;
+            }
+        }
+        if let Ok(value) = num.parse::<f32>() {
+            return Some(value.clamp(0.05, 1.0));
+        }
+    }
+    if let Some(idx) = lowered.find("user_anchored:") {
+        let start = idx + "user_anchored:".len();
+        let mut num = String::new();
+        for ch in lowered[start..].chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                num.push(ch);
+            } else {
+                break;
+            }
+        }
+        if let Ok(value) = num.parse::<f32>() {
+            return Some(value.clamp(0.05, 1.0));
+        }
+    }
+    Some(0.6)
 }
 
 async fn compaction_allowed(pool: &SqlitePool) -> bool {

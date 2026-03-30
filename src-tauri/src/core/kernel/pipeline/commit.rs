@@ -1,6 +1,12 @@
 use super::super::*;
 use crate::core::identity;
+use crate::core::memory::attention::evidence::{
+    evidence_quality_tier,
+    quality_floor_for_memory,
+    quality_floor_for_self_claim,
+};
 use crate::core::sensitivity::{phi_consent_allowed, redact_sensitive_json, redact_sensitive_text};
+use crate::models::WorkspaceMeta;
 
 fn workspace_before_after_for_payload(
     before: &WorkspaceSnapshot,
@@ -142,6 +148,123 @@ async fn ensure_candidate_evidence(
     EvidenceAttachOutcome { payload, has_evidence }
 }
 
+async fn check_memory_evidence_quality(
+    kernel: &Kernel,
+    state: &mut KernelState,
+    candidate: &Candidate,
+    evidence_event_ids: &[i64],
+    settings: &crate::models::Settings,
+    run_id: Option<&str>,
+    trace_id: Option<&str>,
+    category: &str,
+    conversation_id: &str,
+) -> bool {
+    if evidence_event_ids.is_empty() {
+        return true;
+    }
+    let evidence_gate_enabled = settings.enable_memory_evidence_gating.unwrap_or(true);
+    if !evidence_gate_enabled {
+        return true;
+    }
+    let strictness = settings.weight_evidence_strictness.unwrap_or(0.5);
+    let floor = quality_floor_for_memory(strictness);
+    if let Some(stats) = kernel.db.evidence_quality_stats(evidence_event_ids).await {
+        if stats.min < floor {
+            let tier = evidence_quality_tier(stats.min);
+            let _ = system_log::log_event(
+                &kernel.db.pool,
+                Some(&kernel.app_handle),
+                "warn",
+                "memory",
+                run_id,
+                trace_id,
+                json!({
+                    "event": "memory_write_blocked",
+                    "reason": "evidence_quality_low",
+                    "category": category,
+                    "candidate_id": candidate.id,
+                    "candidate_kind": format!("{:?}", candidate.kind),
+                    "candidate_source": candidate.source,
+                    "quality_min": stats.min,
+                    "quality_avg": stats.avg,
+                    "quality_tier": tier.as_str(),
+                    "quality_floor": floor,
+                    "evidence_count": stats.count,
+                }),
+            )
+            .await;
+            let payload = json!({
+                "reason": "evidence_quality_low",
+                "category": category,
+                "quality_min": stats.min,
+                "quality_avg": stats.avg,
+                "quality_tier": tier.as_str(),
+                "quality_floor": floor,
+                "evidence_count": stats.count,
+            });
+            let snippet = "memory_write_blocked evidence_quality_low".to_string();
+            let _ = kernel
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write_blocked",
+                    run_id,
+                    &snippet,
+                    Some(&payload),
+                )
+                .await;
+            return false;
+        }
+    }
+    true
+}
+
+async fn update_workspace_field_quality(db: &Db, field: &mut WorkspaceFieldMeta) {
+    if field.evidence_event_ids.is_empty() {
+        field.evidence_quality = None;
+        return;
+    }
+    if let Some(stats) = db.evidence_quality_stats(&field.evidence_event_ids).await {
+        field.evidence_quality = Some(stats.avg);
+    } else {
+        field.evidence_quality = None;
+    }
+}
+
+async fn update_workspace_meta_quality(db: &Db, meta: &mut WorkspaceMeta) {
+    if let Some(field) = meta.goal_thread.as_mut() {
+        update_workspace_field_quality(db, field).await;
+    }
+    if let Some(field) = meta.current_focus.as_mut() {
+        update_workspace_field_quality(db, field).await;
+    }
+    if let Some(field) = meta.focus_rationale.as_mut() {
+        update_workspace_field_quality(db, field).await;
+    }
+    for item in meta.open_questions.iter_mut() {
+        if let Some(stats) = db.evidence_quality_stats(&item.evidence_event_ids).await {
+            item.evidence_quality = Some(stats.avg);
+        } else {
+            item.evidence_quality = None;
+        }
+    }
+    for item in meta.working_set_topics.iter_mut() {
+        if let Some(stats) = db.evidence_quality_stats(&item.evidence_event_ids).await {
+            item.evidence_quality = Some(stats.avg);
+        } else {
+            item.evidence_quality = None;
+        }
+    }
+    for hypothesis in meta.active_hypotheses.iter_mut() {
+        if let Some(stats) = db.evidence_quality_stats(&hypothesis.evidence_event_ids).await {
+            hypothesis.evidence_quality = Some(stats.avg);
+        } else {
+            hypothesis.evidence_quality = None;
+        }
+    }
+}
+
 impl Kernel {
     pub(crate) async fn commit_cycle(
         &self,
@@ -193,8 +316,31 @@ impl Kernel {
         let mut cached_recent_user_evidence: Option<Vec<i64>> = None;
         let mut workspace_updated = false;
         let workspace_snapshot = WorkspaceSnapshot::from_state(state);
+        let mut inner_summary_written = false;
+        let mut episodic_written = 0usize;
+        let mut semantic_written = false;
+        let mut self_claims_written = 0usize;
 
         for candidate in &decision.accepted {
+            if !self.plan_preconditions_met(state, candidate) {
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "warn",
+                    "kernel",
+                    run_id,
+                    trace_id,
+                    json!({
+                        "event": "plan_step_commit_blocked",
+                        "candidate_id": candidate.id,
+                        "candidate_kind": format!("{:?}", candidate.kind),
+                        "plan_step_id": candidate.payload.get("plan_step_id").and_then(|v| v.as_str()),
+                        "step_index": candidate.payload.get("step_index").and_then(|v| v.as_i64()),
+                    }),
+                )
+                .await;
+                continue;
+            }
             if is_meta_cog_candidate(candidate) && !matches!(candidate.kind, CandidateKind::NoOp) {
                 let anchor = state
                     .workspace_current_focus
@@ -376,6 +522,22 @@ impl Kernel {
                         .await;
                         continue;
                     }
+                    let evidence_event_ids = extract_id_list(&evidence.payload, "evidence_event_ids");
+                    if !check_memory_evidence_quality(
+                        self,
+                        state,
+                        candidate,
+                        &evidence_event_ids,
+                        settings,
+                        run_id,
+                        trace_id,
+                        "inner_summary",
+                        conversation_id,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
                     if let Some(summary_json) = evidence.payload.get("summary_json").and_then(|v| v.as_str()) {
                         inner_summary_json = Some(summary_json.to_string());
                     }
@@ -411,6 +573,22 @@ impl Kernel {
                             }),
                         )
                         .await;
+                        continue;
+                    }
+                    let evidence_event_ids = extract_id_list(&evidence.payload, "evidence_event_ids");
+                    if !check_memory_evidence_quality(
+                        self,
+                        state,
+                        candidate,
+                        &evidence_event_ids,
+                        settings,
+                        run_id,
+                        trace_id,
+                        "episodic",
+                        conversation_id,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     if let Some(event_type) = evidence.payload.get("event_type").and_then(|v| v.as_str()) {
@@ -465,6 +643,22 @@ impl Kernel {
                             }),
                         )
                         .await;
+                        continue;
+                    }
+                    let evidence_event_ids = extract_id_list(&evidence.payload, "evidence_event_ids");
+                    if !check_memory_evidence_quality(
+                        self,
+                        state,
+                        candidate,
+                        &evidence_event_ids,
+                        settings,
+                        run_id,
+                        trace_id,
+                        "semantic_core",
+                        conversation_id,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     if let Some(summary) = evidence.payload.get("summary").and_then(|v| v.as_str()) {
@@ -549,24 +743,34 @@ impl Kernel {
                         .unwrap_or("{}")
                         .to_string();
                     if !action_id.is_empty() && !tool_name.is_empty() {
-                        let plan_step_id = candidate
-                            .payload
-                            .get("plan_step_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
+                        let proposal_id = decision.report.proposal_id.as_deref().unwrap_or("").trim();
+                        let plan_step_id = {
+                            if let Some(step_index) = candidate.payload.get("step_index").and_then(|v| v.as_i64()) {
+                                if !proposal_id.is_empty() {
+                                    Some(format!("{}:{}", proposal_id, step_index))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                candidate
+                                    .payload
+                                    .get("plan_step_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            }
+                        }
                             .or_else(|| {
                                 if crate::core::tool_registry::ToolRegistry::is_context_only_tool(
                                     &tool_name,
                                 ) {
                                     return None;
                                 }
-                                let proposal_id = decision.report.proposal_id.as_deref().unwrap_or("");
                                 if let Some(step_index) = candidate.payload.get("step_index").and_then(|v| v.as_i64()) {
-                                    if !proposal_id.trim().is_empty() {
+                                    if !proposal_id.is_empty() {
                                         return Some(format!("{}:{}", proposal_id, step_index));
                                     }
                                 }
-                                if !proposal_id.trim().is_empty() {
+                                if !proposal_id.is_empty() {
                                     return Some(format!("{}:{}", proposal_id, action_id));
                                 }
                                 let active_plan_id =
@@ -657,6 +861,22 @@ impl Kernel {
                         .await;
                         continue;
                     }
+                    let evidence_event_ids = extract_id_list(&evidence.payload, "evidence_event_ids");
+                    if !check_memory_evidence_quality(
+                        self,
+                        state,
+                        candidate,
+                        &evidence_event_ids,
+                        settings,
+                        run_id,
+                        trace_id,
+                        "workspace",
+                        conversation_id,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
                     workspace_candidate.payload = evidence.payload;
                     let disable_working_hypothesis =
                         settings.stability_disable_working_hypothesis.unwrap_or(true);
@@ -739,6 +959,7 @@ impl Kernel {
                         source: "kernel".to_string(),
                         failure_kind: None,
                         target_key: None,
+                        tags: vec!["candidate_kind::AnchorShift".to_string()],
                         action_id: Some(candidate.id.clone()),
                         timestamp: Utc::now().to_rfc3339(),
                     });
@@ -994,6 +1215,42 @@ impl Kernel {
                             }),
                         )
                         .await;
+                    }
+
+                    if !evidence_event_ids.is_empty() {
+                        let strictness = settings.weight_evidence_strictness.unwrap_or(0.5);
+                        let floor = quality_floor_for_self_claim(strictness);
+                        let evidence_gate_enabled = settings.enable_memory_evidence_gating.unwrap_or(true);
+                        if evidence_gate_enabled {
+                            if let Some(stats) = self.db.evidence_quality_stats(&evidence_event_ids).await {
+                                if stats.min < floor {
+                                    let tier = evidence_quality_tier(stats.min);
+                                    let _ = system_log::log_event(
+                                        &self.db.pool,
+                                        Some(&self.app_handle),
+                                        "warn",
+                                        "memory",
+                                        run_id,
+                                        trace_id,
+                                        json!({
+                                            "event": "memory_write_blocked",
+                                            "reason": "evidence_quality_low",
+                                            "category": "self_claim",
+                                            "candidate_id": candidate.id,
+                                            "candidate_kind": format!("{:?}", candidate.kind),
+                                            "candidate_source": candidate.source,
+                                            "quality_min": stats.min,
+                                            "quality_avg": stats.avg,
+                                            "quality_tier": tier.as_str(),
+                                            "quality_floor": floor,
+                                            "evidence_count": stats.count,
+                                        }),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
                     }
 
                     self_claims_to_write.push(SelfClaimInput {
@@ -1391,6 +1648,27 @@ impl Kernel {
                 }),
             )
             .await;
+            let payload = json!({
+                "reason": "gate_decision",
+                "gate_decision": decision.report.gate_decision,
+                "gate_decision_id": decision.report.gate_decision_id,
+                "snapshot_hash": decision.report.snapshot_hash,
+            });
+            let snippet = format!(
+                "memory_write_blocked gate_decision={}",
+                decision.report.gate_decision.clone().unwrap_or_else(|| "unknown".to_string())
+            );
+            let _ = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write_blocked",
+                    run_id,
+                    &snippet,
+                    Some(&payload),
+                )
+                .await;
             inner_summary_json = None;
             episodic_writes.clear();
             semantic_promotions.clear();
@@ -1413,6 +1691,22 @@ impl Kernel {
                 }),
             )
             .await;
+            let payload = json!({
+                "reason": "stop_state",
+                "stop_reasons": decision.report.stop_reasons,
+            });
+            let snippet = "memory_write_blocked stop_state".to_string();
+            let _ = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write_blocked",
+                    run_id,
+                    &snippet,
+                    Some(&payload),
+                )
+                .await;
             inner_summary_json = None;
             episodic_writes.clear();
             semantic_promotions.clear();
@@ -1628,6 +1922,7 @@ impl Kernel {
                             decision.report.gate_decision_id.as_deref(),
                         )
                         .await;
+                    inner_summary_written = true;
                 }
             }
         }
@@ -1678,6 +1973,7 @@ impl Kernel {
                         decision.report.gate_decision_id.as_deref(),
                     )
                     .await;
+                episodic_written = episodic_written.saturating_add(1);
             }
         }
 
@@ -1742,6 +2038,7 @@ impl Kernel {
                             decision.report.gate_decision_id.as_deref(),
                         )
                         .await;
+                    semantic_written = true;
                     state.last_semantic_promotion_at = Some(Utc::now().to_rfc3339());
                 }
             }
@@ -1774,6 +2071,7 @@ impl Kernel {
         self.update_self_state(state, inner_summary_json.as_deref(), None, settings);
         let disable_working_hypothesis = settings.stability_disable_working_hypothesis.unwrap_or(true);
         refresh_working_memory(state, Utc::now(), disable_working_hypothesis);
+        update_workspace_meta_quality(&self.db, &mut state.workspace_meta).await;
 
         let json_state = serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string());
         let state_write_owner = if is_internal_tick {
@@ -1922,6 +2220,7 @@ impl Kernel {
                 let claim_text = claim.claim_text.clone();
                 let claim_key = claim.claim_key.clone();
                 if let Ok(Some(claim_id)) = self_claims::record_self_claim(&self.db, claim).await {
+                    self_claims_written = self_claims_written.saturating_add(1);
                     if state.self_identity_claim_id.is_none()
                         && is_identity_self_claim(&claim_text, &claim_key)
                     {
@@ -1974,6 +2273,91 @@ impl Kernel {
                 })),
             )
             .await;
+            let payload = json!({
+                "reason": "memory_policy_violation",
+                "violations": policy_violations,
+            });
+            let snippet = "memory_write_blocked policy_violation".to_string();
+            let _ = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write_blocked",
+                    run_id,
+                    &snippet,
+                    Some(&payload),
+                )
+                .await;
+        }
+
+        if inner_summary_written {
+            let payload = json!({
+                "category": "inner_summary",
+                "count": 1,
+            });
+            let _ = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write",
+                    run_id,
+                    "memory_write inner_summary",
+                    Some(&payload),
+                )
+                .await;
+        }
+        if episodic_written > 0 {
+            let payload = json!({
+                "category": "episodic",
+                "count": episodic_written,
+            });
+            let _ = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write",
+                    run_id,
+                    "memory_write episodic",
+                    Some(&payload),
+                )
+                .await;
+        }
+        if semantic_written {
+            let payload = json!({
+                "category": "semantic_core",
+                "count": 1,
+            });
+            let _ = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write",
+                    run_id,
+                    "memory_write semantic_core",
+                    Some(&payload),
+                )
+                .await;
+        }
+        if self_claims_written > 0 {
+            let payload = json!({
+                "category": "self_claim",
+                "count": self_claims_written,
+            });
+            let _ = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "memory_write",
+                    run_id,
+                    "memory_write self_claim",
+                    Some(&payload),
+                )
+                .await;
         }
 
         if !is_internal_tick {

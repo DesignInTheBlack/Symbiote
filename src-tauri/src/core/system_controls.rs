@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use crate::models::SystemControlEntry;
+use crate::models::Settings;
 use crate::db::Db;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,6 +552,114 @@ pub async fn load_control_map(db: &Db) -> HashMap<String, ControlState> {
         Ok(entries) => map_from_entries(&entries),
         Err(_) => HashMap::new(),
     }
+}
+
+pub async fn apply_recommendation_action(
+    db: &Db,
+    action: &Value,
+    actor: &str,
+) -> Result<String, String> {
+    let action_type = action
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "recommendation_action_missing_type".to_string())?;
+    match action_type {
+        "set_system_control" => {
+            let subsystem_id = action
+                .get("subsystem_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "recommendation_action_missing_subsystem".to_string())?;
+            let mode = action
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "recommendation_action_missing_mode".to_string())?;
+            let reason = action
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("recommendation");
+            let override_critical = action
+                .get("override_critical")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let existing = db.get_system_controls().await.map_err(|e| e.to_string())?;
+            let current_states = map_from_entries(&existing);
+            let request = ControlChangeRequest {
+                subsystem_id: subsystem_id.to_string(),
+                mode: mode.to_string(),
+                value_json: action.get("value_json").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                actor: Some(actor.to_string()),
+                reason: Some(reason.to_string()),
+                override_critical,
+            };
+            validate_change(&request, &current_states)?;
+            db.insert_system_control_event(
+                subsystem_id,
+                current_states.get(subsystem_id).map(|s| s.mode.clone()),
+                &normalize_mode(mode),
+                request.value_json.clone(),
+                Some(actor.to_string()),
+                Some(reason.to_string()),
+                "accepted",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            db.set_system_control(
+                subsystem_id,
+                &normalize_mode(mode),
+                request.value_json.clone(),
+                Some(actor.to_string()),
+                Some(reason.to_string()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(format!("system_control:{}={}", subsystem_id, normalize_mode(mode)))
+        }
+        "update_settings" => {
+            let patch = action
+                .get("settings")
+                .ok_or_else(|| "recommendation_action_missing_settings".to_string())?;
+            let mut current = db.get_settings().await.map_err(|e| e.to_string())?;
+            apply_settings_patch(&mut current, patch)?;
+            db.update_settings(current)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok("settings_updated".to_string())
+        }
+        _ => Err(format!("recommendation_action_unknown: {}", action_type)),
+    }
+}
+
+fn apply_settings_patch(settings: &mut Settings, patch: &Value) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "settings_patch_invalid".to_string())?;
+    for (key, value) in obj.iter() {
+        match key.as_str() {
+            "evidence_auto_capture" => {
+                settings.evidence_auto_capture = value.as_bool();
+            }
+            "evidence_emit_budget" => {
+                settings.evidence_emit_budget = value.as_i64().map(|v| v as i32);
+            }
+            "planner_enabled" => {
+                settings.planner_enabled = value.as_bool();
+            }
+            "confidence_calibration" => {
+                settings.confidence_calibration = value.as_bool();
+            }
+            "gate_penalty_integration" => {
+                settings.gate_penalty_integration = value.as_bool();
+            }
+            "scheduler_cognition" => {
+                settings.scheduler_cognition = value.as_bool();
+            }
+            "learning_feedback" => {
+                settings.learning_feedback = value.as_bool();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

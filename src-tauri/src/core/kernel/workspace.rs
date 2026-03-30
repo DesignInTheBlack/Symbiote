@@ -123,6 +123,12 @@ pub(crate) fn update_workspace_runtime_meta(
         let carry_keys = [
             "autobiographical_summary",
             "self_report_snapshot",
+            "planner",
+            "evidence_health",
+            "contradiction_check",
+            "memory_gap_check",
+            "goal_reconciliation",
+            "strategy_audit",
         ];
         for key in carry_keys.iter() {
             if let Some(value) = existing.get(*key) {
@@ -1130,6 +1136,7 @@ pub(crate) fn extract_hypotheses(value: &Value) -> Vec<WorkspaceHypothesis> {
                     speculative: false,
                     evidence_event_ids: Vec::new(),
                     belief_ids: Vec::new(),
+                    evidence_quality: None,
                 });
                 continue;
             }
@@ -1175,6 +1182,7 @@ pub(crate) fn extract_hypotheses(value: &Value) -> Vec<WorkspaceHypothesis> {
                     speculative,
                     evidence_event_ids,
                     belief_ids,
+                    evidence_quality: None,
                 });
             }
         }
@@ -1189,6 +1197,7 @@ pub(crate) fn extract_hypotheses(value: &Value) -> Vec<WorkspaceHypothesis> {
                 speculative: false,
                 evidence_event_ids: Vec::new(),
                 belief_ids: Vec::new(),
+                evidence_quality: None,
             }];
         }
     }
@@ -1230,6 +1239,7 @@ pub(crate) fn make_field_meta(speculative: bool, evidence_event_ids: &[i64], bel
         speculative,
         evidence_event_ids: evidence_event_ids.to_vec(),
         belief_ids: belief_ids.to_vec(),
+        evidence_quality: None,
     }
 }
 
@@ -1239,6 +1249,7 @@ pub(crate) fn make_list_meta(text: &str, speculative: bool, evidence_event_ids: 
         speculative,
         evidence_event_ids: evidence_event_ids.to_vec(),
         belief_ids: belief_ids.to_vec(),
+        evidence_quality: None,
         attempt_count: 0,
         last_asked_at: None,
         expires_at: None,
@@ -1308,6 +1319,7 @@ pub(crate) fn normalize_hypotheses_payload(
                         speculative: false,
                         evidence_event_ids: Vec::new(),
                         belief_ids: Vec::new(),
+                        evidence_quality: None,
                     })
                 }
             })

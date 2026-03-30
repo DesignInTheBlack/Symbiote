@@ -31,6 +31,7 @@ fn extract_gate_risk(metrics_json: Option<&str>) -> Option<(f64, f64, f64)> {
 
 use crate::core::inner_summary::{sanitize_inner_summary, InnerSummary};
 use crate::core::memory::canonical::compute_value_hash;
+use crate::core::memory::attention::evidence::{evidence_quality_tier, quality_floor_for_self_claim};
 use crate::core::memory_policy::{MemoryPolicy, MemoryWriteCategory, MemoryWriteSource};
 use crate::core::self_memory::config::SELF_EVIDENCE_STALE_AFTER_HOURS;
 use crate::core::system_log;
@@ -334,6 +335,18 @@ pub async fn record_self_claim(db: &Db, mut input: SelfClaimInput) -> Result<Opt
     let has_evidence_ids = !input.evidence_event_ids.is_empty();
     let has_belief_ids = !input.belief_ids.is_empty();
     let source_type = input.source_type.as_deref().and_then(parse_source_type);
+    if has_evidence_ids {
+        let user_anchored = db
+            .evidence_ids_are_user_anchored(&input.evidence_event_ids)
+            .await;
+        if user_anchored {
+            if !input.provisional {
+                input.provisional = true;
+            }
+            input.requires_validation = true;
+            input.confidence = input.confidence.min(0.6).clamp(0.0, 1.0);
+        }
+    }
 
     if is_self_awareness {
         let user_invoked = source_type.as_deref() == Some("self_awareness_query");
@@ -416,6 +429,46 @@ pub async fn record_self_claim(db: &Db, mut input: SelfClaimInput) -> Result<Opt
         )
         .await;
         return Ok(None);
+    }
+
+    if has_evidence_ids {
+        let settings = db.get_settings().await.ok();
+        let strictness = settings
+            .as_ref()
+            .and_then(|s| s.weight_evidence_strictness)
+            .unwrap_or(0.5);
+        let evidence_gate_enabled = settings
+            .as_ref()
+            .and_then(|s| s.enable_memory_evidence_gating)
+            .unwrap_or(true);
+        if evidence_gate_enabled {
+            if let Some(stats) = db.evidence_quality_stats(&input.evidence_event_ids).await {
+                let floor = quality_floor_for_self_claim(strictness);
+                if stats.min < floor {
+                    let tier = evidence_quality_tier(stats.min);
+                    let _ = system_log::log_event(
+                        &db.pool,
+                        None,
+                        "warn",
+                        "memory",
+                        input.source_run_id.as_deref(),
+                        None,
+                        json!({
+                            "event": "self_claim_rejected",
+                            "reason": "evidence_quality_low",
+                            "claim_key": input.claim_key,
+                            "quality_min": stats.min,
+                            "quality_avg": stats.avg,
+                            "quality_tier": tier.as_str(),
+                            "quality_floor": floor,
+                            "evidence_count": stats.count,
+                        }),
+                    )
+                    .await;
+                    return Ok(None);
+                }
+            }
+        }
     }
 
     if is_self_awareness {

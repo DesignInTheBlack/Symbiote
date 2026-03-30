@@ -4,8 +4,11 @@ use crate::core::memory::canonical::compute_value_hash;
 use crate::core::memory::types::SourceType;
 use crate::core::episodic;
 use crate::core::sensitivity::{detect_sensitivity, phi_consent_allowed};
+use crate::core::memory::retrieval;
+use crate::core::kernel::KernelState;
 use crate::core::system_controls;
 use crate::core::system_log;
+use crate::db::Db;
 use serde_json::json;
 use uuid::Uuid;
 pub mod decay;
@@ -18,6 +21,39 @@ pub struct SelfMemoryWriteResult {
     pub belief_id: i64,
     pub evidence_event_id: Option<i64>,
     pub episodic_event_id: Option<String>,
+}
+
+pub async fn compact_autobiographical(
+    db: &Db,
+    state: &KernelState,
+    limit: i64,
+) -> String {
+    let recent = retrieval::render_autobiographical_context(
+        &db.pool,
+        Some(&state.conversation_id),
+        limit,
+    )
+    .await;
+    let stable = state
+        .workspace_meta
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.get("autobiographical_summary"))
+        .and_then(|value| value.get("summary"))
+        .and_then(|value| value.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+    match stable {
+        Some(stable_summary) if stable_summary != recent => {
+            if recent.trim().is_empty() {
+                stable_summary
+            } else {
+                format!("Stable thread: {}\nRecent thread: {}", stable_summary, recent.trim())
+            }
+        }
+        Some(stable_summary) => stable_summary,
+        None => recent,
+    }
 }
 
 async fn control_mode(pool: &SqlitePool, subsystem_id: &str) -> String {

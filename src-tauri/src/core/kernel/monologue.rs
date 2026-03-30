@@ -2481,6 +2481,7 @@ impl Kernel {
                     speculative: false,
                     evidence_event_ids: Vec::new(),
                     belief_ids: Vec::new(),
+                    evidence_quality: None,
                 };
                 candidates.push(self.make_candidate(
                     CandidateKind::UpdateWorkspace,
@@ -2580,6 +2581,7 @@ impl Kernel {
             qualia_context.clone(),
             residual_context.clone(),
             None,
+            None,
         );
         let mut decision_proactive = self.arbitrate(
             &candidates,
@@ -2590,6 +2592,7 @@ impl Kernel {
             wave_context,
             qualia_context,
             residual_context,
+            None,
             None,
         );
         self.defer_throttled_tools(&mut decision_internal, &decision_state).await;
@@ -3121,15 +3124,10 @@ impl Kernel {
                 let anchor_vocab = build_anchor_vocab(&state, &tool_names);
                 let anchor_hits = count_anchor_hits(&candidate_relevance_text(&primary_candidate), &anchor_vocab);
                 let signals = self
-                    .compute_gate_signals(
-                        &mut state,
-                        &subject_state,
-                        Some(&decision_internal),
-                        &primary_candidate,
-                        anchor_hits,
-                        &settings,
-                    )
+                    .compute_gate_signals_score(&state, &subject_state, Some(&decision_internal), &primary_candidate, anchor_hits, &settings)
                     .await;
+                self.commit_gate_signal_state(&mut state, &signals);
+
                 let soft_gate = subject_controller::build_gate_decision(
                     &subject_state,
                     &primary_candidate,
@@ -3146,12 +3144,108 @@ impl Kernel {
                 let rollout_percent = settings.gate_rollout_percent.unwrap_or(100).clamp(0, 100);
                 let shadow_mode = settings.gate_shadow_mode.unwrap_or(false);
                 let rollout_bucket = gate_rollout_bucket(conversation_id);
-                let use_soft_gate = !shadow_mode && (rollout_percent >= 100 || rollout_bucket < rollout_percent);
-                let (gate, _shadow_gate) = if use_soft_gate {
-                    (soft_gate, legacy_gate)
+                let gate_penalty_enabled = settings.gate_penalty_integration.unwrap_or(true);
+                let use_soft_gate = gate_penalty_enabled
+                    && !shadow_mode
+                    && (rollout_percent >= 100 || rollout_bucket < rollout_percent);
+
+                let soft_reasons: Vec<String> = serde_json::from_str::<Value>(&soft_gate.evidence_refs_json)
+                    .ok()
+                    .and_then(|v| v.get("reasons").and_then(|r| r.as_array()).cloned())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str())
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let soft_penalty = if use_soft_gate {
+                    crate::core::subject_controller::gate_penalty_for_candidate(
+                        &subject_state,
+                        &primary_candidate,
+                        &state.stop_state,
+                        &signals,
+                        settings.learning_feedback.unwrap_or(true),
+                    )
                 } else {
-                    (legacy_gate, soft_gate)
+                    crate::core::subject_controller::GatePenalty {
+                        penalty: 0.0,
+                        reasons: Vec::new(),
+                    }
                 };
+
+                let mut hard_decision: Option<String> = None;
+                let mut hard_reasons: Vec<String> = Vec::new();
+                let mut tool_gate_detail: Option<String> = None;
+                if use_soft_gate {
+                    if state.stop_state.active {
+                        hard_decision = Some("DEFER".to_string());
+                        hard_reasons.push("stop_state_active".to_string());
+                    }
+                    if !self.plan_preconditions_met(&state, &primary_candidate) {
+                        hard_decision = Some("VERIFY".to_string());
+                        hard_reasons.push("plan_precondition_unmet".to_string());
+                    }
+                    if matches!(primary_candidate.kind, CandidateKind::ToolCall) {
+                        let tool_name = primary_candidate
+                            .payload
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if !tool_name.is_empty() {
+                            let args_json = primary_candidate
+                                .payload
+                                .get("arguments")
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "{}".to_string());
+                            let tool_gate = self.tool_gate_decision(&tool_name, &args_json, &settings, true);
+                            if !tool_gate.allowed {
+                                hard_decision = Some("DENY".to_string());
+                                let reason = tool_gate
+                                    .reason
+                                    .unwrap_or_else(|| "TOOL_BLOCK".to_string());
+                                hard_reasons.push(format!("tool_contract_{}", reason.to_lowercase()));
+                                tool_gate_detail = tool_gate.detail.clone();
+                            }
+                        }
+                    }
+                }
+
+                let hard_gate = hard_decision.clone().map(|decision_label| subject_controller::GateDecisionRecord {
+                    decision_id: Uuid::new_v4().to_string(),
+                    decision: decision_label,
+                    evidence_refs_json: json!({ "reasons": hard_reasons }).to_string(),
+                    metrics_json: json!({
+                        "hard_gate": true,
+                        "tool_gate_detail": tool_gate_detail,
+                    })
+                    .to_string(),
+                });
+
+                let mut gate = if !use_soft_gate {
+                    legacy_gate
+                } else if let Some(hard_gate) = hard_gate {
+                    hard_gate
+                } else {
+                    let mut gate = soft_gate.clone();
+                    if !gate_allows_response(&gate.decision) {
+                        gate.decision = "ALLOW_WITH_NOTICE".to_string();
+                    }
+                    gate
+                };
+
+                let mut metrics = serde_json::from_str::<Value>(&gate.metrics_json).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = metrics.as_object_mut() {
+                    obj.insert("soft_gate_decision".to_string(), json!(soft_gate.decision));
+                    obj.insert("soft_gate_reasons".to_string(), json!(soft_reasons.clone()));
+                    obj.insert("gate_penalty".to_string(), json!(soft_penalty.penalty));
+                    obj.insert("gate_penalty_reasons".to_string(), json!(soft_penalty.reasons.clone()));
+                    obj.insert("hard_gate_triggered".to_string(), json!(use_soft_gate && hard_decision.is_some()));
+                }
+                gate.metrics_json = metrics.to_string();
                 let gate_reasons_log = serde_json::from_str::<Value>(&gate.evidence_refs_json)
                     .ok()
                     .and_then(|value| value.get("reasons").cloned())
@@ -3173,6 +3267,9 @@ impl Kernel {
                         "legacy_decision": legacy_decision,
                         "enforced_decision": gate.decision,
                         "gate_reasons": gate_reasons_log,
+                        "gate_penalty": soft_penalty.penalty,
+                        "gate_penalty_reasons": soft_penalty.reasons,
+                        "hard_gate_decision": hard_decision,
                         "shadow_mode": shadow_mode,
                         "rollout_percent": rollout_percent,
                         "rollout_bucket": rollout_bucket,
@@ -3219,6 +3316,14 @@ impl Kernel {
                 decision_internal.report.snapshot_hash = Some(snapshot.snapshot_hash.clone());
                 decision_internal.report.gate_decision_id = Some(gate.decision_id.clone());
                 decision_internal.report.gate_decision = Some(gate.decision.clone());
+                decision_internal.report.gate_penalty = Some(soft_penalty.penalty as f64);
+                if !soft_penalty.reasons.is_empty() {
+                    decision_internal.report.gate_penalty_reasons = Some(soft_penalty.reasons.clone());
+                }
+                decision_internal.report.soft_gate_decision = Some(soft_decision);
+                if !soft_reasons.is_empty() {
+                    decision_internal.report.soft_gate_reasons = Some(soft_reasons.clone());
+                }
                 let reasons: Vec<String> = serde_json::from_str::<Value>(&gate.evidence_refs_json)
                     .ok()
                     .and_then(|v| v.get("reasons").and_then(|r| r.as_array()).cloned())

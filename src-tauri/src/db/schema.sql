@@ -143,6 +143,36 @@ CREATE TABLE IF NOT EXISTS system_health_snapshots (
     subsystem_states_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS recommendation_events (
+    event_id TEXT PRIMARY KEY,
+    recommendation_id TEXT NOT NULL,
+    conversation_id TEXT,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL, -- eligible | ineligible | accepted | resolved | dismissed
+    snapshot_id TEXT,
+    action_json TEXT,
+    gate_json TEXT,
+    recovery_metric TEXT,
+    recovery_target REAL,
+    baseline_value REAL,
+    resolved_value REAL,
+    time_to_recovery_ms INTEGER,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_recommendation_events_created ON recommendation_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_recommendation_events_rec ON recommendation_events(recommendation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_recommendation_events_status ON recommendation_events(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS baseline_metrics (
+    baseline_id TEXT PRIMARY KEY,
+    window_minutes INTEGER NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS event_ledger (
     event_id TEXT PRIMARY KEY,
     timestamp DATETIME NOT NULL,
@@ -527,8 +557,8 @@ CREATE TABLE IF NOT EXISTS settings (
     monologue_interval_seconds INTEGER NOT NULL DEFAULT 20,
     monologue_timeout_secs INTEGER NOT NULL DEFAULT 75,
     monologue_retry_timeout_secs INTEGER NOT NULL DEFAULT 25,
-    empty_response_retry_max INTEGER NOT NULL DEFAULT 1,
-    empty_response_retry_timeout_ms INTEGER NOT NULL DEFAULT 2000,
+    empty_response_retry_max INTEGER NOT NULL DEFAULT 3,
+    empty_response_retry_timeout_ms INTEGER NOT NULL DEFAULT 4000,
     monologue_max_per_hour INTEGER NOT NULL DEFAULT 360,
     thread_max_depth INTEGER NOT NULL DEFAULT 4,
     allow_shell_tool BOOLEAN NOT NULL DEFAULT 0,
@@ -577,6 +607,19 @@ CREATE TABLE IF NOT EXISTS settings (
     weight_latency REAL NOT NULL DEFAULT 0.5,
     weight_evidence_strictness REAL NOT NULL DEFAULT 0.5,
     weight_exploration REAL NOT NULL DEFAULT 0.5,
+    evidence_emit_budget INTEGER NOT NULL DEFAULT 50,
+    evidence_retention_days INTEGER NOT NULL DEFAULT 30,
+    gate_penalty_integration BOOLEAN NOT NULL DEFAULT 1,
+    evidence_auto_capture BOOLEAN NOT NULL DEFAULT 1,
+    response_fallback_enabled BOOLEAN NOT NULL DEFAULT 1,
+    memory_soft_anchor BOOLEAN NOT NULL DEFAULT 1,
+    context_extraction_boost BOOLEAN NOT NULL DEFAULT 1,
+    planner_enabled BOOLEAN NOT NULL DEFAULT 1,
+    confidence_calibration BOOLEAN NOT NULL DEFAULT 1,
+    scheduler_cognition BOOLEAN NOT NULL DEFAULT 1,
+    learning_feedback BOOLEAN NOT NULL DEFAULT 1,
+    evidence_semantics_v2 BOOLEAN NOT NULL DEFAULT 1,
+    narrative_continuity BOOLEAN NOT NULL DEFAULT 1,
     monologue_provenance_guard BOOLEAN NOT NULL DEFAULT 1,
     organism_decay BOOLEAN NOT NULL DEFAULT 1,
     model_context_limit INTEGER NOT NULL DEFAULT 16384,
@@ -1169,6 +1212,8 @@ CREATE TABLE IF NOT EXISTS ics_evidence_events (
     snippet_hash TEXT,
     weight REAL NOT NULL,
     episodic_event_id TEXT,
+    context_json TEXT,
+    strength REAL NOT NULL DEFAULT 0.0,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (belief_id) REFERENCES ics_beliefs(id)
 );
@@ -1516,6 +1561,7 @@ CREATE INDEX IF NOT EXISTS idx_system_logs_category ON system_logs(category, tim
 CREATE INDEX IF NOT EXISTS idx_system_controls_subsystem ON system_controls(subsystem_id);
 CREATE INDEX IF NOT EXISTS idx_system_control_events_time ON system_control_events(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_system_health_snapshots_time ON system_health_snapshots(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_baseline_metrics_time ON baseline_metrics(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_event_ledger_time ON event_ledger(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_event_ledger_type ON event_ledger(type, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(created_at DESC);

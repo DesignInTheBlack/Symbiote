@@ -63,6 +63,12 @@ const SELF_MEMORY_BRIDGE_INTERVAL_SECS: i64 = 300;
 const SELF_REPORT_INTERVAL_SECS: i64 = 10 * 60;
 const SELF_REPORT_TURN_INTERVAL: i64 = 6;
 const SELF_REPORT_RELIABILITY_WARN: f32 = 0.45;
+const EVIDENCE_HEALTH_INTERVAL_SECS: i64 = 5 * 60;
+const CONTRADICTION_CHECK_INTERVAL_SECS: i64 = 10 * 60;
+const MEMORY_GAP_CLOSURE_INTERVAL_SECS: i64 = 10 * 60;
+const GOAL_RECONCILIATION_INTERVAL_SECS: i64 = 10 * 60;
+const STRATEGY_AUDIT_INTERVAL_SECS: i64 = 12 * 60;
+const GOAL_RECONCILIATION_STALE_HOURS: i64 = 6;
 
 const ROLLING_SUMMARY_RETRY_BASE_SECS: u64 = 5;
 const ROLLING_SUMMARY_RETRY_MAX_SECS: u64 = 120;
@@ -612,6 +618,7 @@ async fn self_report_due_for_conversation(
 async fn build_self_report_snapshot(
     db: &Db,
     state: &KernelState,
+    settings: &crate::models::Settings,
 ) -> (Value, Vec<i64>, f32, bool) {
     let controller_state = db.get_controller_state().await.ok().flatten().unwrap_or_default();
     let metrics = self_model_controller::collect_self_evidence_metrics(&db.pool)
@@ -649,6 +656,17 @@ async fn build_self_report_snapshot(
     } else {
         "operational"
     };
+    let snippet = format!("self_report status={} confidence={:.2}", status, confidence);
+    if settings.evidence_auto_capture.unwrap_or(true) {
+        if let Some(event_id) = db
+            .emit_system_evidence_event(&state.conversation_id, "self_report_snapshot", Some("scheduler"), &snippet)
+            .await
+        {
+            evidence_ids.push(event_id);
+        }
+    }
+    evidence_ids.sort();
+    evidence_ids.dedup();
     let speculative = evidence_ids.is_empty() || reliability < SELF_REPORT_RELIABILITY_WARN;
     let snapshot = json!({
         "status": status,
@@ -692,6 +710,352 @@ async fn persist_self_report_patch(db: &Db, state: &KernelState) -> bool {
         }
     }
     false
+}
+
+fn goal_status_complete(status: Option<&str>) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    matches!(
+        status.trim().to_lowercase().as_str(),
+        "done" | "complete" | "completed" | "finished"
+    )
+}
+
+async fn update_workspace_runtime_meta_field(
+    db: &Db,
+    conversation_id: &str,
+    field: &str,
+    payload: Value,
+) -> bool {
+    for _ in 0..2 {
+        let (mut base_state, version) = match db.get_kernel_state_with_meta(conversation_id).await {
+            Ok(Some((json_state, version))) => {
+                let parsed: KernelState = serde_json::from_str(&json_state)
+                    .unwrap_or_else(|_| KernelState::default_for(conversation_id));
+                (parsed, Some(version))
+            }
+            _ => (KernelState::default_for(conversation_id), None),
+        };
+        let mut runtime = base_state.workspace_meta.runtime.take().unwrap_or_else(|| json!({}));
+        if !runtime.is_object() {
+            runtime = json!({});
+        }
+        if let Some(obj) = runtime.as_object_mut() {
+            obj.insert(field.to_string(), payload.clone());
+        }
+        base_state.workspace_meta.runtime = Some(runtime);
+        let json_state = serde_json::to_string(&base_state).unwrap_or_else(|_| "{}".to_string());
+        let updated = if let Some(version) = version {
+            db.update_kernel_state_with_version(conversation_id, &json_state, Some(field), version)
+                .await
+                .unwrap_or(false)
+        } else {
+            let _ = db.set_kernel_state(conversation_id, &json_state, Some(field)).await;
+            true
+        };
+        if updated {
+            return true;
+        }
+    }
+    false
+}
+
+async fn run_evidence_health_check(
+    db: &Db,
+    conversation_id: &str,
+    settings: &crate::models::Settings,
+) -> Value {
+    let required_types = vec![
+        "candidate_created",
+        "candidate_accepted",
+        "arbitration_outcome",
+        "gate_decision",
+        "tool_dispatch",
+        "tool_result",
+        "tool_result_error",
+        "memory_write",
+        "memory_write_blocked",
+        "self_report_snapshot",
+        "scheduler_evidence_health",
+        "scheduler_contradiction_check",
+        "scheduler_memory_gap_check",
+        "scheduler_goal_reconciliation",
+        "scheduler_strategy_audit",
+    ];
+    let since = (Utc::now() - ChronoDuration::hours(24)).to_rfc3339();
+    let rows = sqlx::query(
+        "SELECT source_type, COUNT(*) as count
+         FROM ics_evidence_events
+         WHERE conversation_id = ?
+           AND datetime(created_at) >= datetime(?)
+         GROUP BY source_type",
+    )
+    .bind(conversation_id)
+    .bind(&since)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    for row in rows {
+        let source_type: String = row.try_get("source_type").unwrap_or_default();
+        let count: i64 = row.try_get("count").unwrap_or(0);
+        if !source_type.trim().is_empty() {
+            counts.insert(source_type, count);
+        }
+    }
+    let mut missing = Vec::new();
+    let mut low = Vec::new();
+    for required in required_types.iter() {
+        let count = counts.get(*required).copied().unwrap_or(0);
+        if count == 0 {
+            missing.push(required.to_string());
+        } else if count < 2 {
+            low.push(required.to_string());
+        }
+    }
+    let coverage = if required_types.is_empty() {
+        1.0
+    } else {
+        ((required_types.len() - missing.len()) as f32 / required_types.len() as f32).clamp(0.0, 1.0)
+    };
+    let status = if missing.is_empty() { "ok" } else { "degraded" };
+    let snippet = format!("evidence_health status={} missing={}", status, missing.len());
+    let mut evidence_event_ids = Vec::new();
+    if settings.evidence_auto_capture.unwrap_or(true) {
+        if let Some(event_id) = db
+            .emit_system_evidence_event(
+                conversation_id,
+                "scheduler_evidence_health",
+                Some("scheduler"),
+                &snippet,
+            )
+            .await
+        {
+            evidence_event_ids.push(event_id);
+        }
+    }
+    json!({
+        "status": status,
+        "coverage": coverage,
+        "required_types": required_types,
+        "counts": counts,
+        "missing_types": missing,
+        "low_types": low,
+        "updated_at": Utc::now().to_rfc3339(),
+        "evidence_event_ids": evidence_event_ids,
+    })
+}
+
+async fn run_contradiction_check(
+    db: &Db,
+    conversation_id: &str,
+    settings: &crate::models::Settings,
+) -> Value {
+    let rows = sqlx::query(
+        "SELECT id, topic_key, priority
+         FROM ics_conflict_sets
+         WHERE status = 'open'
+         ORDER BY CASE priority WHEN 'high' THEN 2 WHEN 'normal' THEN 1 ELSE 0 END DESC,
+                  datetime(updated_at) DESC
+         LIMIT 10",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
+    let mut topics: Vec<String> = Vec::new();
+    let mut high_priority = 0usize;
+    for row in rows.iter() {
+        let topic: String = row.try_get("topic_key").unwrap_or_default();
+        if !topic.trim().is_empty() {
+            topics.push(topic);
+        }
+        let priority: String = row.try_get("priority").unwrap_or_default();
+        if priority.trim().eq_ignore_ascii_case("high") {
+            high_priority += 1;
+        }
+    }
+    let total_open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ics_conflict_sets WHERE status = 'open'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    let status = if total_open == 0 { "ok" } else { "needs_attention" };
+    let snippet = format!("contradiction_check status={} open={}", status, total_open);
+    let mut evidence_event_ids = Vec::new();
+    if settings.evidence_auto_capture.unwrap_or(true) {
+        if let Some(event_id) = db
+            .emit_system_evidence_event(
+                conversation_id,
+                "scheduler_contradiction_check",
+                Some("scheduler"),
+                &snippet,
+            )
+            .await
+        {
+            evidence_event_ids.push(event_id);
+        }
+    }
+    json!({
+        "status": status,
+        "open_conflicts": total_open,
+        "high_priority_conflicts": high_priority,
+        "topics": topics,
+        "updated_at": Utc::now().to_rfc3339(),
+        "evidence_event_ids": evidence_event_ids,
+    })
+}
+
+async fn run_memory_gap_check(
+    db: &Db,
+    conversation_id: &str,
+    settings: &crate::models::Settings,
+) -> Value {
+    let rows = sqlx::query(
+        "SELECT claim_key, confidence, requires_validation, evidence_event_ids, created_at
+         FROM self_claims
+         WHERE conversation_id = ?
+           AND (requires_validation = 1 OR evidence_event_ids IS NULL OR evidence_event_ids = '' OR evidence_event_ids = '[]')
+         ORDER BY datetime(created_at) DESC
+         LIMIT 10",
+    )
+    .bind(conversation_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
+    let mut claims: Vec<Value> = Vec::new();
+    for row in rows.iter() {
+        let claim_key: String = row.try_get("claim_key").unwrap_or_default();
+        let confidence: f64 = row.try_get("confidence").unwrap_or(0.0);
+        let requires_validation: i64 = row.try_get("requires_validation").unwrap_or(0);
+        let created_at: String = row.try_get("created_at").unwrap_or_default();
+        claims.push(json!({
+            "claim_key": claim_key,
+            "confidence": confidence,
+            "requires_validation": requires_validation > 0,
+            "created_at": created_at,
+        }));
+    }
+    let total_gaps: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM self_claims
+         WHERE conversation_id = ?
+           AND (requires_validation = 1 OR evidence_event_ids IS NULL OR evidence_event_ids = '' OR evidence_event_ids = '[]')",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&db.pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    let status = if total_gaps == 0 { "ok" } else { "needs_attention" };
+    let snippet = format!("memory_gap_check status={} gaps={}", status, total_gaps);
+    let mut evidence_event_ids = Vec::new();
+    if settings.evidence_auto_capture.unwrap_or(true) {
+        if let Some(event_id) = db
+            .emit_system_evidence_event(
+                conversation_id,
+                "scheduler_memory_gap_check",
+                Some("scheduler"),
+                &snippet,
+            )
+            .await
+        {
+            evidence_event_ids.push(event_id);
+        }
+    }
+    json!({
+        "status": status,
+        "gap_count": total_gaps,
+        "sample_claims": claims,
+        "updated_at": Utc::now().to_rfc3339(),
+        "evidence_event_ids": evidence_event_ids,
+    })
+}
+
+fn build_goal_reconciliation_payload(state: &KernelState) -> Value {
+    let mut issues: Vec<String> = Vec::new();
+    if state.workspace_goal_thread.as_deref().unwrap_or("").trim().is_empty() {
+        issues.push("missing_goal_thread".to_string());
+    }
+    let active_goals: Vec<&crate::models::GoalStackItem> = state
+        .workspace_goal_stack
+        .iter()
+        .filter(|item| !goal_status_complete(item.status.as_deref()))
+        .collect();
+    if active_goals.len() > 1 {
+        issues.push("multiple_active_goals".to_string());
+    }
+    let active_goal = active_goals.first().cloned();
+    if let Some(goal) = active_goal {
+        if goal.steps.is_empty() {
+            issues.push("goal_missing_steps".to_string());
+        }
+        if goal.current_step_index >= goal.steps.len().max(1) {
+            issues.push("goal_step_index_out_of_range".to_string());
+        }
+        if let Some(updated_at) = goal.updated_at.as_deref().and_then(parse_timestamp) {
+            let age_hours = Utc::now().signed_duration_since(updated_at).num_hours();
+            if age_hours >= GOAL_RECONCILIATION_STALE_HOURS {
+                issues.push("goal_stale".to_string());
+            }
+        }
+    }
+    let status = if issues.is_empty() { "ok" } else { "needs_attention" };
+    let active_step = active_goal.and_then(|goal| goal.steps.get(goal.current_step_index)).map(|s| s.text.clone());
+    json!({
+        "status": status,
+        "issues": issues,
+        "active_goal": active_goal.map(|g| g.goal.clone()),
+        "current_step_index": active_goal.map(|g| g.current_step_index).unwrap_or(0),
+        "active_step": active_step,
+        "updated_at": Utc::now().to_rfc3339(),
+        "evidence_event_ids": [],
+    })
+}
+
+fn build_strategy_audit_payload(state: &KernelState) -> Value {
+    let mut failure_counts: HashMap<String, i64> = HashMap::new();
+    for outcome in state.recent_outcomes.iter().rev().take(20) {
+        if outcome.success {
+            continue;
+        }
+        let key = if !outcome.action_type.trim().is_empty() {
+            outcome.action_type.clone()
+        } else {
+            outcome.source.clone()
+        };
+        if key.trim().is_empty() {
+            continue;
+        }
+        *failure_counts.entry(key).or_insert(0) += 1;
+    }
+    let mut loops: Vec<String> = Vec::new();
+    for (key, count) in failure_counts.iter() {
+        if *count >= 3 {
+            loops.push(format!("{} ({} failures)", key, count));
+        }
+    }
+    let mut issues: Vec<String> = Vec::new();
+    if !loops.is_empty() {
+        issues.push("repeated_failure_loops".to_string());
+    }
+    if state.tool_failure_count >= 2 {
+        issues.push("tool_failures_elevated".to_string());
+    }
+    if state.failure_count >= 3 {
+        issues.push("overall_failure_streak".to_string());
+    }
+    let status = if issues.is_empty() { "ok" } else { "needs_attention" };
+    json!({
+        "status": status,
+        "issues": issues,
+        "failure_loops": loops,
+        "updated_at": Utc::now().to_rfc3339(),
+        "evidence_event_ids": [],
+    })
 }
 
 async fn run_policy_scan(db: &Db, app: &AppHandle) {
@@ -1079,6 +1443,16 @@ impl Scheduler {
                     - ChronoDuration::seconds(INTERNAL_STATE_MAP_CALIBRATION_INTERVAL_SECS);
                 let mut last_telemetry_calibration = Utc::now()
                     - ChronoDuration::seconds(TELEMETRY_CALIBRATION_INTERVAL_SECS);
+                let mut last_evidence_health =
+                    Utc::now() - ChronoDuration::seconds(EVIDENCE_HEALTH_INTERVAL_SECS);
+                let mut last_contradiction_check =
+                    Utc::now() - ChronoDuration::seconds(CONTRADICTION_CHECK_INTERVAL_SECS);
+                let mut last_memory_gap_check =
+                    Utc::now() - ChronoDuration::seconds(MEMORY_GAP_CLOSURE_INTERVAL_SECS);
+                let mut last_goal_reconciliation =
+                    Utc::now() - ChronoDuration::seconds(GOAL_RECONCILIATION_INTERVAL_SECS);
+                let mut last_strategy_audit =
+                    Utc::now() - ChronoDuration::seconds(STRATEGY_AUDIT_INTERVAL_SECS);
 
                 loop {
                     tokio::time::sleep(Duration::from_millis(cadence_ms)).await;
@@ -1148,6 +1522,16 @@ impl Scheduler {
                         (now - last_internal_state_map).num_seconds() >= INTERNAL_STATE_MAP_CALIBRATION_INTERVAL_SECS;
                     let mut telemetry_calibration_due =
                         (now - last_telemetry_calibration).num_seconds() >= TELEMETRY_CALIBRATION_INTERVAL_SECS;
+                    let mut evidence_health_due =
+                        (now - last_evidence_health).num_seconds() >= EVIDENCE_HEALTH_INTERVAL_SECS;
+                    let mut contradiction_check_due =
+                        (now - last_contradiction_check).num_seconds() >= CONTRADICTION_CHECK_INTERVAL_SECS;
+                    let mut memory_gap_check_due =
+                        (now - last_memory_gap_check).num_seconds() >= MEMORY_GAP_CLOSURE_INTERVAL_SECS;
+                    let mut goal_reconciliation_due =
+                        (now - last_goal_reconciliation).num_seconds() >= GOAL_RECONCILIATION_INTERVAL_SECS;
+                    let mut strategy_audit_due =
+                        (now - last_strategy_audit).num_seconds() >= STRATEGY_AUDIT_INTERVAL_SECS;
                     let mut self_model_refresh_due = false;
                     let mut latest_evidence_at: Option<DateTime<Utc>> = None;
                     let mut internal_state_map_ready_count: Option<i64> = None;
@@ -1170,6 +1554,30 @@ impl Scheduler {
                         internal_state_map_due = false;
                         telemetry_calibration_due = false;
                         self_model_refresh_due = false;
+                        evidence_health_due = false;
+                        contradiction_check_due = false;
+                        memory_gap_check_due = false;
+                        goal_reconciliation_due = false;
+                        strategy_audit_due = false;
+                    }
+                    let settings_snapshot = db.get_settings().await.ok();
+                    let scheduler_cognition_enabled = settings_snapshot
+                        .as_ref()
+                        .and_then(|s| s.scheduler_cognition)
+                        .unwrap_or(true);
+                    if !scheduler_cognition_enabled {
+                        evidence_health_due = false;
+                        contradiction_check_due = false;
+                        memory_gap_check_due = false;
+                        goal_reconciliation_due = false;
+                        strategy_audit_due = false;
+                    }
+                    if settings_snapshot.is_none() {
+                        evidence_health_due = false;
+                        contradiction_check_due = false;
+                        memory_gap_check_due = false;
+                        goal_reconciliation_due = false;
+                        strategy_audit_due = false;
                     }
                     if background_allowed && !scheduler_degraded {
                         internal_state_map_ready_count = internal_state_map_bootstrap_ready(&db).await;
@@ -1240,6 +1648,21 @@ impl Scheduler {
                     }
                     if telemetry_calibration_due {
                         last_telemetry_calibration = now;
+                    }
+                    if evidence_health_due {
+                        last_evidence_health = now;
+                    }
+                    if contradiction_check_due {
+                        last_contradiction_check = now;
+                    }
+                    if memory_gap_check_due {
+                        last_memory_gap_check = now;
+                    }
+                    if goal_reconciliation_due {
+                        last_goal_reconciliation = now;
+                    }
+                    if strategy_audit_due {
+                        last_strategy_audit = now;
                     }
 
                     // ============================================================
@@ -1597,6 +2020,231 @@ impl Scheduler {
                         });
                     }
 
+                    if background_allowed && evidence_health_due && !scheduler_degraded {
+                        let db_clone = db.clone();
+                        let app_clone = app.clone();
+                        let ids = conversation_ids.clone();
+                        let settings_opt = settings_snapshot.clone();
+                        tokio::spawn(async move {
+                            let Some(settings) = settings_opt else { return; };
+                            for cid in ids {
+                                let payload = run_evidence_health_check(&db_clone, &cid, &settings).await;
+                                let _ = update_workspace_runtime_meta_field(
+                                    &db_clone,
+                                    &cid,
+                                    "evidence_health",
+                                    payload.clone(),
+                                )
+                                .await;
+                                let _ = system_log::log_event(
+                                    &db_clone.pool,
+                                    Some(&app_clone),
+                                    "info",
+                                    "scheduler",
+                                    None,
+                                    None,
+                                    json!({
+                                        "event": "scheduler_evidence_health",
+                                        "conversation_id": cid,
+                                        "status": payload.get("status"),
+                                        "missing_types": payload.get("missing_types"),
+                                    }),
+                                )
+                                .await;
+                            }
+                        });
+                    }
+
+                    if background_allowed && contradiction_check_due && !scheduler_degraded {
+                        let db_clone = db.clone();
+                        let app_clone = app.clone();
+                        let ids = conversation_ids.clone();
+                        let settings_opt = settings_snapshot.clone();
+                        tokio::spawn(async move {
+                            let Some(settings) = settings_opt else { return; };
+                            for cid in ids {
+                                let payload = run_contradiction_check(&db_clone, &cid, &settings).await;
+                                let _ = update_workspace_runtime_meta_field(
+                                    &db_clone,
+                                    &cid,
+                                    "contradiction_check",
+                                    payload.clone(),
+                                )
+                                .await;
+                                let _ = system_log::log_event(
+                                    &db_clone.pool,
+                                    Some(&app_clone),
+                                    "info",
+                                    "scheduler",
+                                    None,
+                                    None,
+                                    json!({
+                                        "event": "scheduler_contradiction_check",
+                                        "conversation_id": cid,
+                                        "status": payload.get("status"),
+                                        "open_conflicts": payload.get("open_conflicts"),
+                                    }),
+                                )
+                                .await;
+                            }
+                        });
+                    }
+
+                    if background_allowed && memory_gap_check_due && !scheduler_degraded {
+                        let db_clone = db.clone();
+                        let app_clone = app.clone();
+                        let ids = conversation_ids.clone();
+                        let settings_opt = settings_snapshot.clone();
+                        tokio::spawn(async move {
+                            let Some(settings) = settings_opt else { return; };
+                            for cid in ids {
+                                let payload = run_memory_gap_check(&db_clone, &cid, &settings).await;
+                                let _ = update_workspace_runtime_meta_field(
+                                    &db_clone,
+                                    &cid,
+                                    "memory_gap_check",
+                                    payload.clone(),
+                                )
+                                .await;
+                                let _ = system_log::log_event(
+                                    &db_clone.pool,
+                                    Some(&app_clone),
+                                    "info",
+                                    "scheduler",
+                                    None,
+                                    None,
+                                    json!({
+                                        "event": "scheduler_memory_gap_check",
+                                        "conversation_id": cid,
+                                        "status": payload.get("status"),
+                                        "gap_count": payload.get("gap_count"),
+                                    }),
+                                )
+                                .await;
+                            }
+                        });
+                    }
+
+                    if background_allowed && goal_reconciliation_due && !scheduler_degraded {
+                        let db_clone = db.clone();
+                        let app_clone = app.clone();
+                        let ids = conversation_ids.clone();
+                        let settings_opt = settings_snapshot.clone();
+                        tokio::spawn(async move {
+                            let Some(settings) = settings_opt else { return; };
+                            for cid in ids {
+                                let raw = db_clone.get_kernel_state(&cid).await.ok().flatten();
+                                let state: KernelState = raw
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or_else(|| KernelState::default_for(&cid));
+                                let mut payload = build_goal_reconciliation_payload(&state);
+                                let snippet = format!(
+                                    "goal_reconciliation status={}",
+                                    payload.get("status").and_then(|v| v.as_str()).unwrap_or("unknown")
+                                );
+                                let mut evidence_ids = Vec::new();
+                                if settings.evidence_auto_capture.unwrap_or(true) {
+                                    if let Some(event_id) = db_clone
+                                        .emit_system_evidence_event(
+                                            &cid,
+                                            "scheduler_goal_reconciliation",
+                                            Some("scheduler"),
+                                            &snippet,
+                                        )
+                                        .await
+                                    {
+                                        evidence_ids.push(event_id);
+                                    }
+                                }
+                                if let Some(obj) = payload.as_object_mut() {
+                                    obj.insert("evidence_event_ids".to_string(), json!(evidence_ids));
+                                }
+                                let _ = update_workspace_runtime_meta_field(
+                                    &db_clone,
+                                    &cid,
+                                    "goal_reconciliation",
+                                    payload.clone(),
+                                )
+                                .await;
+                                let _ = system_log::log_event(
+                                    &db_clone.pool,
+                                    Some(&app_clone),
+                                    "info",
+                                    "scheduler",
+                                    None,
+                                    None,
+                                    json!({
+                                        "event": "scheduler_goal_reconciliation",
+                                        "conversation_id": cid,
+                                        "status": payload.get("status"),
+                                        "issues": payload.get("issues"),
+                                    }),
+                                )
+                                .await;
+                            }
+                        });
+                    }
+
+                    if background_allowed && strategy_audit_due && !scheduler_degraded {
+                        let db_clone = db.clone();
+                        let app_clone = app.clone();
+                        let ids = conversation_ids.clone();
+                        let settings_opt = settings_snapshot.clone();
+                        tokio::spawn(async move {
+                            let Some(settings) = settings_opt else { return; };
+                            for cid in ids {
+                                let raw = db_clone.get_kernel_state(&cid).await.ok().flatten();
+                                let state: KernelState = raw
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or_else(|| KernelState::default_for(&cid));
+                                let mut payload = build_strategy_audit_payload(&state);
+                                let snippet = format!(
+                                    "strategy_audit status={}",
+                                    payload.get("status").and_then(|v| v.as_str()).unwrap_or("unknown")
+                                );
+                                let mut evidence_ids = Vec::new();
+                                if settings.evidence_auto_capture.unwrap_or(true) {
+                                    if let Some(event_id) = db_clone
+                                        .emit_system_evidence_event(
+                                            &cid,
+                                            "scheduler_strategy_audit",
+                                            Some("scheduler"),
+                                            &snippet,
+                                        )
+                                        .await
+                                    {
+                                        evidence_ids.push(event_id);
+                                    }
+                                }
+                                if let Some(obj) = payload.as_object_mut() {
+                                    obj.insert("evidence_event_ids".to_string(), json!(evidence_ids));
+                                }
+                                let _ = update_workspace_runtime_meta_field(
+                                    &db_clone,
+                                    &cid,
+                                    "strategy_audit",
+                                    payload.clone(),
+                                )
+                                .await;
+                                let _ = system_log::log_event(
+                                    &db_clone.pool,
+                                    Some(&app_clone),
+                                    "info",
+                                    "scheduler",
+                                    None,
+                                    None,
+                                    json!({
+                                        "event": "scheduler_strategy_audit",
+                                        "conversation_id": cid,
+                                        "status": payload.get("status"),
+                                        "issues": payload.get("issues"),
+                                    }),
+                                )
+                                .await;
+                            }
+                        });
+                    }
+
                     if background_allowed && !scheduler_degraded {
                         let db_clone = db.clone();
                         let app_clone = app.clone();
@@ -1611,7 +2259,7 @@ impl Scheduler {
                                     self_report_due_for_conversation(&db_clone, &cid, Utc::now(), &settings).await
                                 {
                                     let (snapshot, evidence_ids, reliability, speculative) =
-                                        build_self_report_snapshot(&db_clone, &state).await;
+                                        build_self_report_snapshot(&db_clone, &state, &settings).await;
                                     state.last_self_report_at = Some(Utc::now().to_rfc3339());
                                     state.self_report_snapshot = Some(snapshot.clone());
                                     if persist_self_report_patch(&db_clone, &state).await {

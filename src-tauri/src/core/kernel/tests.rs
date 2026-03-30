@@ -14,7 +14,7 @@
     use crate::db::Db;
     use crate::core::tool_registry::ToolRegistry;
     use crate::core::self_model_controller;
-    use crate::models::{ControllerGate, GoalStackItem, GoalStep};
+    use crate::models::{ControllerGate, ControllerState, GoalStackItem, GoalStep};
     use serde_json::{json, Value};
     use sqlx::{sqlite::SqlitePoolOptions, SqlitePool, Row};
     use std::fs;
@@ -106,6 +106,19 @@
             weight_latency: None,
             weight_evidence_strictness: None,
             weight_exploration: None,
+            evidence_emit_budget: None,
+            evidence_retention_days: None,
+            gate_penalty_integration: None,
+            evidence_auto_capture: None,
+            response_fallback_enabled: None,
+            memory_soft_anchor: None,
+            context_extraction_boost: None,
+            planner_enabled: None,
+            confidence_calibration: None,
+            scheduler_cognition: None,
+            learning_feedback: None,
+            evidence_semantics_v2: None,
+            narrative_continuity: None,
             monologue_provenance_guard: None,
             organism_decay: None,
             model_context_limit: None,
@@ -1343,6 +1356,7 @@
                 None,
                 None,
                 None,
+                None,
             );
             let rejected = decision
                 .rejected
@@ -2136,6 +2150,7 @@
             speculative: false,
             evidence_event_ids: Vec::new(),
             belief_ids: Vec::new(),
+            evidence_quality: None,
         }];
         let shift = focus_shift_candidate(
             "Ken",
@@ -2170,6 +2185,7 @@
             speculative: false,
             evidence_event_ids: Vec::new(),
             belief_ids: Vec::new(),
+            evidence_quality: None,
         }];
         let shift = focus_shift_candidate(
             "Ken",
@@ -2339,6 +2355,7 @@
             speculative: false,
             evidence_event_ids: vec![1],
             belief_ids: Vec::new(),
+            evidence_quality: None,
         });
         assert!(workspace_has_verified_anchor(&state));
     }
@@ -2353,6 +2370,7 @@
                 source: "user_feedback".to_string(),
                 failure_kind: None,
                 target_key: None,
+                tags: Vec::new(),
                 action_id: None,
                 timestamp: "now".to_string(),
             },
@@ -2363,6 +2381,7 @@
                 source: "user_feedback".to_string(),
                 failure_kind: None,
                 target_key: None,
+                tags: Vec::new(),
                 action_id: None,
                 timestamp: "now".to_string(),
             },
@@ -2404,6 +2423,7 @@
             source: "web_lookup".to_string(),
             failure_kind: Some(TOOL_FAILURE_KIND_PLANNING.to_string()),
             target_key: Some(tool_penalty_key("web_lookup", None)),
+            tags: Vec::new(),
             action_id: None,
             timestamp: Utc::now().to_rfc3339(),
         };
@@ -2553,6 +2573,140 @@
             super::arbitration::plan_state_for_verification(&verification),
             "revised"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_step_blocks_after_repeated_failures() {
+        let (kernel, mut settings) = setup_kernel_for_gate_tests().await;
+        settings.learning_feedback = Some(true);
+        let _ = kernel.db.update_settings(settings).await;
+
+        let plan_id = "plan-1".to_string();
+        let mut state = KernelState::default_for("default");
+        state.workspace_active_plan_id = Some(plan_id.clone());
+        state.workspace_goal_stack = vec![GoalStackItem {
+            goal: "Test goal".to_string(),
+            steps: vec![
+                GoalStep {
+                    text: "Step 1".to_string(),
+                    ..Default::default()
+                },
+                GoalStep {
+                    text: "Step 2".to_string(),
+                    ..Default::default()
+                },
+            ],
+            current_step_index: 0,
+            status: None,
+            evidence_event_ids: Vec::new(),
+            belief_ids: Vec::new(),
+            updated_at: None,
+        }];
+
+        let outcome = Outcome {
+            action_type: "tool_dispatch_failed".to_string(),
+            success: false,
+            observations: "tool failed".to_string(),
+            source: "tool".to_string(),
+            failure_kind: None,
+            target_key: None,
+            tags: vec![
+                format!("plan_step_id::{}:1", plan_id),
+                "candidate_kind::ToolCall".to_string(),
+            ],
+            action_id: None,
+            timestamp: Utc::now().to_rfc3339(),
+        };
+
+        kernel.apply_outcomes(&mut state, &[outcome.clone()]).await;
+        kernel.apply_outcomes(&mut state, &[outcome]).await;
+
+        let step = &state.workspace_goal_stack[0].steps[0];
+        assert_eq!(step.status.as_deref(), Some("blocked"));
+        assert!(step.failure_count >= 2);
+        assert_eq!(state.workspace_goal_stack[0].current_step_index, 1);
+    }
+
+    #[tokio::test]
+    async fn low_reliability_candidate_loses_arbitration() {
+        let (kernel, mut settings) = setup_kernel_for_gate_tests().await;
+        settings.learning_feedback = Some(true);
+
+        let mut reliability = std::collections::HashMap::new();
+        reliability.insert("plan_step_id::plan-1:1".to_string(), 0.1);
+        reliability.insert("plan_step_id::plan-1:2".to_string(), 0.9);
+
+        let mut state = KernelState::default_for("default");
+        state.controller_state = Some(ControllerState {
+            reliability,
+            ..Default::default()
+        });
+
+        let candidate_low = make_candidate(
+            CandidateKind::EmitMessage,
+            json!({"content": "hi", "plan_step_id": "plan-1:1"}),
+        );
+        let candidate_high = make_candidate(
+            CandidateKind::EmitMessage,
+            json!({"content": "hi", "plan_step_id": "plan-1:2"}),
+        );
+
+        let decision = kernel.arbitrate(
+            &[candidate_low.clone(), candidate_high.clone()],
+            &settings,
+            &state,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let winner = decision.accepted.first().expect("winner");
+        assert_eq!(
+            winner.payload.get("plan_step_id").and_then(|v| v.as_str()),
+            Some("plan-1:2")
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_strength_ranking_prefers_high_strength() {
+        let pool = setup_pool().await;
+        let db = Db { pool };
+        let low_id = db
+            .create_system_evidence_event(
+                "default",
+                "evidence_test",
+                "low",
+                Some("test"),
+                "low evidence",
+            )
+            .await
+            .expect("low evidence id");
+        let high_id = db
+            .create_system_evidence_event(
+                "default",
+                "evidence_test",
+                "high",
+                Some("test"),
+                "high evidence",
+            )
+            .await
+            .expect("high evidence id");
+        let _ = sqlx::query("UPDATE ics_evidence_events SET strength = ? WHERE id = ?")
+            .bind(0.2_f64)
+            .bind(low_id)
+            .execute(&db.pool)
+            .await;
+        let _ = sqlx::query("UPDATE ics_evidence_events SET strength = ? WHERE id = ?")
+            .bind(0.9_f64)
+            .bind(high_id)
+            .execute(&db.pool)
+            .await;
+        let ranked = db.rank_evidence_ids_by_strength(&[], 2).await;
+        assert_eq!(ranked.first().copied(), Some(high_id));
     }
 
     #[test]

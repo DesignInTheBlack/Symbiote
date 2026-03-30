@@ -1614,6 +1614,7 @@ impl ModelClient {
 
         let (empty_retry_max, empty_retry_timeout_ms) = self.empty_response_retry_config().await;
         let mut empty_retry_count: usize = 0;
+        let mut empty_payload: Option<(String, Option<Vec<crate::models::ToolCall>>)> = None;
         let (raw_content, tool_calls) = loop {
             let (content, calls) = self
                 .stream_chat(self.app_handle.clone(), base_url, api_key, &final_request)
@@ -1643,15 +1644,24 @@ impl ModelClient {
                     }
                     continue;
                 }
+                empty_payload = Some((content, calls));
+                break ("".to_string(), None);
+            }
+            break (content, calls);
+        };
+
+        if empty_payload.is_some() {
+            let fallback_enabled = self.response_fallback_enabled().await;
+            if fallback_enabled {
                 let _ = system_log::log_event(
                     &self.db_pool,
                     Some(&self.app_handle),
-                    "error",
+                    "warn",
                     "model",
                     final_request.run_id.as_deref(),
                     None,
                     serde_json::json!({
-                        "event": "response_empty_error",
+                        "event": "response_empty_fallback",
                         "attempt": empty_retry_count,
                         "max": empty_retry_max,
                         "request_label": final_request.request_label.clone(),
@@ -1659,12 +1669,53 @@ impl ModelClient {
                     }),
                 )
                 .await;
-                self.emit_empty_response_error(&final_request, empty_retry_count, empty_retry_max)
-                    .await;
-                return Err("EMPTY_RESPONSE".to_string());
+                let mut fallback_request = final_request.clone();
+                fallback_request.stream = false;
+                if let Ok(fallback) = self
+                    .chat_with_meta(base_url, api_key, &fallback_request)
+                    .await
+                {
+                    let has_tool_calls = fallback.tool_calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+                    if !fallback.content.trim().is_empty() || has_tool_calls {
+                        let _ = system_log::log_event(
+                            &self.db_pool,
+                            Some(&self.app_handle),
+                            "info",
+                            "model",
+                            final_request.run_id.as_deref(),
+                            None,
+                            serde_json::json!({
+                                "event": "response_empty_recovered",
+                                "request_label": final_request.request_label.clone(),
+                                "stream": false,
+                            }),
+                        )
+                        .await;
+                        return Ok(fallback);
+                    }
+                }
             }
-            break (content, calls);
-        };
+
+            let _ = system_log::log_event(
+                &self.db_pool,
+                Some(&self.app_handle),
+                "error",
+                "model",
+                final_request.run_id.as_deref(),
+                None,
+                serde_json::json!({
+                    "event": "response_empty_error",
+                    "attempt": empty_retry_count,
+                    "max": empty_retry_max,
+                    "request_label": final_request.request_label.clone(),
+                    "stream": true,
+                }),
+            )
+            .await;
+            self.emit_empty_response_error(&final_request, empty_retry_count, empty_retry_max)
+                .await;
+            return Err("EMPTY_RESPONSE".to_string());
+        }
 
         let (content_no_tags, tag_set) =
             crate::core::memory::inject_context::strip_system_tags(&raw_content);
@@ -4286,6 +4337,15 @@ impl ModelClient {
             .unwrap_or(true)
     }
 
+    async fn response_fallback_enabled(&self) -> bool {
+        Db { pool: self.db_pool.clone() }
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.response_fallback_enabled)
+            .unwrap_or(true)
+    }
+
     async fn maybe_capture_memory_raw(&self, run_id: &str, memory_pass_id: &str, raw: &str) {
         let db = Db { pool: self.db_pool.clone() };
         let flag = match db.get_key("memory_capture_next").await {
@@ -5444,11 +5504,11 @@ fn empty_response_retry_config_from_settings(
 ) -> (usize, u64) {
     let max = settings
         .and_then(|s| s.empty_response_retry_max)
-        .unwrap_or(1)
+        .unwrap_or(3)
         .max(0) as usize;
     let timeout_ms = settings
         .and_then(|s| s.empty_response_retry_timeout_ms)
-        .unwrap_or(2000)
+        .unwrap_or(4000)
         .max(0) as u64;
     (max, timeout_ms)
 }
@@ -5597,8 +5657,8 @@ mod tests {
     #[test]
     fn empty_response_retry_config_defaults() {
         let (max, timeout) = empty_response_retry_config_from_settings(None);
-        assert_eq!(max, 1);
-        assert_eq!(timeout, 2000);
+        assert_eq!(max, 3);
+        assert_eq!(timeout, 4000);
     }
 
     #[tokio::test]
@@ -5660,5 +5720,111 @@ mod tests {
         let mut request_no_run = request.clone();
         request_no_run.run_id = Some("".to_string());
         assert!(!ModelClient::should_emit_empty_response_event(&request_no_run));
+    }
+
+    #[tokio::test]
+    async fn empty_stream_response_triggers_fallback() {
+        use tauri::Manager;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+
+        let server = tokio::spawn(async move {
+            for idx in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = Vec::new();
+                let mut temp = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut temp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&temp[..n]);
+                    if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response_body = if idx == 0 {
+                    "data: {\"choices\":[{\"delta\":{}}]}\n\ndata: [DONE]\n\n".to_string()
+                } else {
+                    "{\"choices\":[{\"message\":{\"content\":\"fallback\"}}]}".to_string()
+                };
+                let content_type = if idx == 0 {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+                    content_type,
+                    response_body.len(),
+                    response_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let schema_sql = fs::read_to_string("src/db/schema.sql").expect("schema.sql");
+        sqlx::query(&schema_sql)
+            .execute(&pool)
+            .await
+            .expect("apply schema");
+        let base_url = format!("http://{}/v1", addr);
+        sqlx::query(
+            "INSERT INTO settings (id, schema_version, api_base_url, response_fallback_enabled)
+             VALUES (1, 1, ?, 1)",
+        )
+        .bind(&base_url)
+        .execute(&pool)
+        .await
+        .expect("seed settings");
+
+        let app = tauri::Builder::default()
+            .build(tauri::generate_context!("tauri.conf.json"))
+            .expect("build app");
+        let client = ModelClient::new(pool, app.handle());
+
+        let request = ChatCompletionRequest {
+            model: "test".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            stream: true,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+            prefill: None,
+            skip_injection: Some(true),
+            skip_memory: Some(true),
+            skip_reminders: Some(true),
+            memory_expand: None,
+            allow_diagnostics: None,
+            json_strict: None,
+            skip_sanitization: Some(true),
+            run_id: None,
+            request_label: Some("primary_response".to_string()),
+        };
+
+        let response = client
+            .chat_with_meta_stream(&base_url, None, &request)
+            .await
+            .expect("fallback response");
+        assert_eq!(response.content.trim(), "fallback");
+
+        let _ = server.await;
     }
 }

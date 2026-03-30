@@ -78,7 +78,7 @@ const TIMEOUTS = {
   long: 30000,
 };
 
-const STREAM_SILENCE_MS = 5000;
+const STREAM_SILENCE_MS = 12000;
 const STAGE_WATCHDOG_MS: Record<string, number> = {
   ingest_input: 15000,
   prompt_build: 15000,
@@ -563,7 +563,10 @@ function App() {
     }
     watchdogTimerRef.current = window.setInterval(() => {
       const idleMs = Date.now() - lastActivityRef.current;
-      if (chatStateRef.current === "streaming" && idleMs > STREAM_SILENCE_MS) {
+      const streamStage = moduleStatusRef.current?.stage;
+      const allowStreamSilence =
+        !streamStage || streamStage === "streaming" || streamStage === "llm_wait";
+      if (chatStateRef.current === "streaming" && allowStreamSilence && idleMs > STREAM_SILENCE_MS) {
         if (import.meta.env.DEV) {
           console.log("[UI] Stream silence detected. Switching to post-processing.");
         }
@@ -597,9 +600,9 @@ function App() {
         showToast("Post-processing stalled. Input unlocked.", "error", "Recover", handleRecover);
         return;
       }
-      const stage = moduleStatusRef.current?.stage
+      const watchdogStage = moduleStatusRef.current?.stage
         || (chatStateRef.current === "post_processing" ? "post_processing" : null);
-      const watchdogMs = getWatchdogMs(stage);
+      const watchdogMs = getWatchdogMs(watchdogStage);
       if (idleMs > watchdogMs && !watchdogTriggeredRef.current) {
         watchdogTriggeredRef.current = true;
         suppressTokensRef.current = true;
@@ -728,6 +731,8 @@ function App() {
         setModuleStatus(null);
         return;
       }
+      lastActivityRef.current = Date.now();
+      watchdogTriggeredRef.current = false;
       setModuleStatus({
         stage,
         detail: event.payload?.detail ?? null,
@@ -1799,6 +1804,7 @@ function App() {
                   }
                   settings={settings}
                   selfModel={selfModel}
+                  healthSnapshot={systemHealthSnapshot}
                   showRaw={showRaw}
                   rollingSummary={rollingSummary}
                   rollingSummaryError={rollingSummaryError}

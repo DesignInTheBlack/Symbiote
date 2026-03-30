@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -163,6 +163,8 @@ pub struct KernelState {
     #[serde(default)]
     pub last_user_message_id: Option<String>,
     #[serde(default)]
+    pub last_input_evidence_event_ids: Vec<i64>,
+    #[serde(default)]
     pub anchor_epoch: i64,
     #[serde(default)]
     pub user_redirect_turns_remaining: i32,
@@ -266,6 +268,10 @@ pub struct KernelState {
     #[serde(default)]
     pub self_model_updated_at: Option<String>,
     #[serde(default)]
+    pub self_model_unified: Option<serde_json::Value>,
+    #[serde(default)]
+    pub self_model_unified_evidence: Option<serde_json::Value>,
+    #[serde(default)]
     pub last_self_report_at: Option<String>,
     #[serde(default)]
     pub self_report_snapshot: Option<serde_json::Value>,
@@ -305,6 +311,10 @@ pub struct KernelState {
     pub stop_state: StopState,
     #[serde(default)]
     pub gate_high_risk_streak: i32,
+    #[serde(skip)]
+    pub evidence_emit_budget_remaining: i32,
+    #[serde(skip)]
+    pub evidence_emit_dedup: HashSet<String>,
     #[serde(default)]
     pub meta_cog_event_count: i64,
     #[serde(default)]
@@ -440,6 +450,7 @@ impl KernelState {
             last_user_input: None,
             last_user_input_at: None,
             last_user_message_id: None,
+            last_input_evidence_event_ids: Vec::new(),
             anchor_epoch: 0,
             user_redirect_turns_remaining: 0,
             redirect_focus: None,
@@ -494,6 +505,8 @@ impl KernelState {
             controller_gate: None,
             self_model_version: 0,
             self_model_updated_at: None,
+            self_model_unified: None,
+            self_model_unified_evidence: None,
             last_self_report_at: None,
             self_report_snapshot: None,
             proaction_throttle_tools_override: None,
@@ -514,6 +527,8 @@ impl KernelState {
             stop_scope: None,
             stop_state: StopState::default(),
             gate_high_risk_streak: 0,
+            evidence_emit_budget_remaining: 0,
+            evidence_emit_dedup: HashSet::new(),
             meta_cog_event_count: 0,
             last_meta_cog_event: None,
             last_meta_cog_event_at: None,

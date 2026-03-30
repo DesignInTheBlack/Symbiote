@@ -35,11 +35,18 @@ pub struct PlanVerificationResult {
     pub confidence: f64,
 }
 
+#[derive(Clone)]
 pub struct GateDecisionRecord {
     pub decision_id: String,
     pub decision: String,
     pub evidence_refs_json: String,
     pub metrics_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatePenalty {
+    pub penalty: f32,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +103,104 @@ impl GateSignals {
             qualia_uncertainty_delta: 0.0,
         }
     }
+}
+
+fn gate_reason_weight(reason: &str) -> f32 {
+    match reason {
+        "stop_state_active" => 0.40,
+        "open_error_events" => 0.20,
+        "organism_integrity_risk" => 0.20,
+        "organism_social_alignment_low" => 0.12,
+        "attention_low_confidence" => 0.15,
+        "controller_drift_score" => 0.10,
+        "predictive_residual_high" => 0.10,
+        "diagnosis_loop" => 0.10,
+        "no_ignition" => 0.15,
+        "broadcast_missing" => 0.10,
+        "qualia_negative_reward" => 0.10,
+        "novelty_high" => 0.06,
+        "uncertainty_high" => 0.06,
+        "audit_required" => 0.20,
+        "multi_signal_risk" => 0.25,
+        "self_claim_missing_evidence" => 0.15,
+        "plan_precondition_unmet" => 0.35,
+        _ => 0.05,
+    }
+}
+
+pub fn gate_penalty_for_candidate(
+    subject_state: &SubjectState,
+    candidate: &Candidate,
+    stop_state: &StopState,
+    signals: &GateSignals,
+    learning_feedback: bool,
+) -> GatePenalty {
+    let gate = build_gate_decision(subject_state, candidate, stop_state, signals);
+    let mut reasons = serde_json::from_str::<Value>(&gate.evidence_refs_json)
+        .ok()
+        .and_then(|value| {
+            value.get("reasons").and_then(|reasons| {
+                reasons.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+        .unwrap_or_default();
+
+    let mut penalty = 0.0_f32;
+    for reason in reasons.iter() {
+        penalty += gate_reason_weight(reason);
+    }
+    penalty += (signals.uncertainty_score * 0.08) + (signals.novelty_score * 0.06);
+
+    if learning_feedback {
+        let reliability_keys = candidate_reliability_keys(candidate);
+        if !reliability_keys.is_empty() {
+            let mut scores = Vec::new();
+            for key in reliability_keys.iter() {
+                if let Some(value) = subject_state
+                    .self_model
+                    .controller_state
+                    .reliability
+                    .get(key)
+                {
+                    scores.push(*value);
+                }
+            }
+            if !scores.is_empty() {
+                let avg = scores.iter().sum::<f32>() / scores.len() as f32;
+                if avg < 0.5 {
+                    penalty += (0.5 - avg).clamp(0.0, 0.3);
+                    reasons.push("low_reliability".to_string());
+                }
+            }
+        }
+    }
+    penalty = penalty.clamp(0.0, 0.5);
+
+    GatePenalty { penalty, reasons }
+}
+
+pub fn candidate_reliability_keys(candidate: &Candidate) -> Vec<String> {
+    let mut keys = Vec::new();
+    keys.push(format!("candidate_kind::{:?}", candidate.kind));
+    if matches!(candidate.kind, CandidateKind::ToolCall) {
+        if let Some(name) = candidate.payload.get("tool_name").and_then(|v| v.as_str()) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                keys.push(format!("tool::{}", trimmed));
+            }
+        }
+    }
+    if let Some(step_id) = candidate.payload.get("plan_step_id").and_then(|v| v.as_str()) {
+        let trimmed = step_id.trim();
+        if !trimmed.is_empty() {
+            keys.push(format!("plan_step_id::{}", trimmed));
+        }
+    }
+    keys
 }
 
 fn is_user_invoked_self_awareness(candidate: &Candidate) -> bool {
@@ -1177,5 +1282,21 @@ mod tests {
         let candidate = candidate(CandidateKind::ToolCall, json!({"tool_name": "run_shell"}));
         let gate = build_gate_decision(&state, &candidate, &stop, &signals);
         assert_eq!(gate.decision, "ALLOW_WITH_AUDIT");
+    }
+
+    #[test]
+    fn low_reliability_adds_gate_penalty() {
+        let stop = StopState::default();
+        let mut state = base_subject_state();
+        state
+            .self_model
+            .controller_state
+            .reliability
+            .insert("tool::web.run".to_string(), 0.2);
+        let signals = GateSignals::baseline();
+        let candidate = candidate(CandidateKind::ToolCall, json!({"tool_name": "web.run"}));
+        let penalty = gate_penalty_for_candidate(&candidate, &signals, &state, &stop, true);
+        assert!(penalty.penalty > 0.0);
+        assert!(penalty.reasons.iter().any(|r| r == "low_reliability"));
     }
 }

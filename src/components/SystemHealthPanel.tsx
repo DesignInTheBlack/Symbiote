@@ -1,4 +1,5 @@
-﻿import { SystemHealthSnapshot } from "../types/app";
+﻿import { SystemHealthSnapshot, RecommendationItem } from "../types/app";
+import { invokeWithTimeout } from "../utils/tauri";
 
 interface SystemHealthPanelProps {
   snapshot: SystemHealthSnapshot | null;
@@ -58,6 +59,40 @@ export const SystemHealthPanel = ({ snapshot, history = [] }: SystemHealthPanelP
   const prevOutcomes = prevMetrics.outcomes ?? {};
   const scorecard = metrics.scorecard ?? {};
   const prevScorecard = prevMetrics.scorecard ?? {};
+  const recommendationsBlock = metrics.recommendations ?? {};
+  const recommendations = (recommendationsBlock.items ?? []) as RecommendationItem[];
+  const recommendationTelemetry = recommendationsBlock.telemetry ?? {};
+
+  const applyRecommendation = async (rec: RecommendationItem) => {
+    if (!rec.action) return;
+    await invokeWithTimeout(
+      "apply_recommendation",
+      {
+        recommendation_id: rec.recommendation_id,
+        kind: rec.kind,
+        snapshot_id: snapshot?.snapshot_id ?? null,
+        action: rec.action,
+        gate: rec.gate ?? null,
+        recovery_metric: rec.recovery_metric ?? null,
+        recovery_target: rec.recovery_target ?? null,
+        baseline_value: rec.baseline_value ?? null,
+      },
+      15000,
+    );
+  };
+
+  const dismissRecommendation = async (rec: RecommendationItem) => {
+    await invokeWithTimeout(
+      "dismiss_recommendation",
+      {
+        recommendation_id: rec.recommendation_id,
+        kind: rec.kind,
+        snapshot_id: snapshot?.snapshot_id ?? null,
+        gate: rec.gate ?? null,
+      },
+      10000,
+    );
+  };
 
   const gateVerifyRate = Number(gate.verify_rate ?? 0);
   const gateAlert = gateVerifyRate > 0.4 || Number(gate.counts?.DENY ?? 0) > 0;
@@ -136,6 +171,9 @@ export const SystemHealthPanel = ({ snapshot, history = [] }: SystemHealthPanelP
   const combinedScore = typeof scorecard.combined_score === "number" ? scorecard.combined_score : null;
   const driftPenalty = Number(scorecard.drift_penalty ?? 0);
   const scoreAlert = outcomeTotal > 0 && combinedScore !== null && combinedScore < 0.6;
+  const recommendationAcceptance = Number(recommendationTelemetry.acceptance_rate ?? 0);
+  const recommendationSuccess = Number(recommendationTelemetry.success_rate ?? 0);
+  const recommendationMedian = recommendationTelemetry.median_time_to_recovery_ms ?? null;
 
   const diffItems: { label: string; current: string; delta: string }[] = [];
   const pushDiff = (label: string, current: number, prev?: number | null, precision = 2) => {
@@ -192,6 +230,49 @@ export const SystemHealthPanel = ({ snapshot, history = [] }: SystemHealthPanelP
                 ))}
               </div>
             </details>
+          )}
+          {recommendations.length > 0 && (
+            <div className="health-recommendations">
+              <div className="health-recommendations-header">
+                <div>
+                  <strong>Recommendations</strong>
+                  <span className="health-recommendations-count">{recommendations.length}</span>
+                </div>
+                <div className="health-recommendations-metrics">
+                  <span>Accept {formatPercent(recommendationAcceptance)}</span>
+                  <span>Success {formatPercent(recommendationSuccess)}</span>
+                  {typeof recommendationMedian === "number" && (
+                    <span>Median {(recommendationMedian / 1000).toFixed(0)}s</span>
+                  )}
+                </div>
+              </div>
+              <div className="health-recommendations-list">
+                {recommendations.map((rec) => {
+                  const gateReasons = Array.isArray(rec.gate?.reasons) ? rec.gate.reasons.join(", ") : null;
+                  return (
+                    <div key={rec.recommendation_id} className={`health-recommendation-card ${rec.status}`}>
+                      <div className="health-recommendation-body">
+                        <div className="health-recommendation-title">{rec.title}</div>
+                        <div className="health-recommendation-detail">{rec.detail}</div>
+                        {gateReasons && (
+                          <div className="health-recommendation-gate">Gate: {gateReasons}</div>
+                        )}
+                      </div>
+                      <div className="health-recommendation-actions">
+                        {rec.status === "eligible" && rec.action && (
+                          <button className="btn btn-secondary" onClick={() => applyRecommendation(rec)}>
+                            Apply
+                          </button>
+                        )}
+                        <button className="btn btn-tertiary" onClick={() => dismissRecommendation(rec)}>
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           )}
 
           <div className="health-tier">

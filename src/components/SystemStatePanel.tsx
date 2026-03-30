@@ -120,6 +120,10 @@ export const SystemStatePanel = ({
     const workspaceContrib = snapshotMetrics.workspace_contributors ?? {};
     const selfClaims = snapshotMetrics.self_claims ?? {};
     const selfReflection = snapshotMetrics.self_reflection ?? {};
+    const recommendations = snapshotMetrics.recommendations ?? {};
+    const recommendationItems = Array.isArray(recommendations.items) ? recommendations.items : [];
+    const recommendationEligible = recommendationItems.filter((item) => item?.status === "eligible").length;
+    const recommendationTotal = recommendationItems.length;
 
     const phase = phaseFromStage(moduleStatus?.stage)
       ?? (avatar.processing_phase as SystemPhase)
@@ -219,6 +223,10 @@ export const SystemStatePanel = ({
       controller,
       organism,
       gate,
+      recommendations: {
+        total: recommendationTotal,
+        eligible: recommendationEligible,
+      },
       pending: {
         count: pendingPrompts,
         oldest: pending.oldest_at ?? avatar.pending_prompts ?? null,
@@ -286,6 +294,14 @@ export const SystemStatePanel = ({
       )}
 
       <div className="system-state-footer">
+        {metrics.recommendations?.total > 0 && (
+          <div className="system-state-signal">
+            <span>Recommendations</span>
+            <span>
+              {metrics.recommendations.eligible}/{metrics.recommendations.total} eligible
+            </span>
+          </div>
+        )}
         {memoryError && (
           <div className="system-state-signal system-state-alert">
             <span>Memory</span>

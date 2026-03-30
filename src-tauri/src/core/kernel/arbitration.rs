@@ -36,10 +36,15 @@ struct WaveScoreEntry {
     base_score: f32,
     factor: f32,
     qualia_factor: f32,
+    plan_factor: f32,
+    reliability_factor: f32,
+    gate_penalty: f32,
     adjusted_score: f32,
     residual_bias: f32,
     reason: String,
     qualia_reason: String,
+    plan_reason: String,
+    reliability_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +287,112 @@ fn qualia_modulation_factor(
 
     delta = delta.clamp(-0.2, 0.2);
     (1.0 + delta, reason)
+}
+
+fn goal_status_complete(status: Option<&str>) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    matches!(
+        status.trim().to_lowercase().as_str(),
+        "done" | "complete" | "completed" | "finished"
+    )
+}
+
+fn candidate_step_index(candidate: &Candidate) -> Option<usize> {
+    if let Some(idx) = candidate.payload.get("step_index").and_then(|v| v.as_i64()) {
+        if idx > 0 {
+            return Some((idx - 1) as usize);
+        }
+    }
+    if let Some(step_id) = candidate.payload.get("plan_step_id").and_then(|v| v.as_str()) {
+        let trimmed = step_id.trim();
+        if let Some((_, last)) = trimmed.rsplit_once(':') {
+            if let Ok(idx) = last.trim().parse::<i64>() {
+                if idx > 0 {
+                    return Some((idx - 1) as usize);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn plan_alignment_factor(state: &KernelState, candidate: &Candidate) -> (f32, String) {
+    let Some(active_goal) = state
+        .workspace_goal_stack
+        .iter()
+        .find(|item| !goal_status_complete(item.status.as_deref()))
+    else {
+        return (1.0, "plan_inactive".to_string());
+    };
+    if active_goal.steps.is_empty() {
+        return (1.0, "plan_no_steps".to_string());
+    }
+    let Some(step_idx) = candidate_step_index(candidate) else {
+        return (0.95, "plan_unmapped".to_string());
+    };
+    let current_idx = active_goal
+        .current_step_index
+        .min(active_goal.steps.len().saturating_sub(1));
+    let step = active_goal.steps.get(step_idx);
+    if let Some(step) = step {
+        if step.status.as_deref() == Some("blocked") {
+            return (0.60, "plan_blocked".to_string());
+        }
+    }
+    let mut factor = if step_idx == current_idx {
+        1.10
+    } else if step_idx > current_idx {
+        0.85
+    } else {
+        0.90
+    };
+    let mut reason = if step_idx == current_idx {
+        "plan_aligned".to_string()
+    } else if step_idx > current_idx {
+        "plan_ahead".to_string()
+    } else {
+        "plan_behind".to_string()
+    };
+    if let Some(step) = step {
+        if step.failure_count > 0 {
+            let penalty = (step.failure_count as f32 * 0.05).clamp(0.0, 0.2);
+            factor = (factor - penalty).clamp(0.6, 1.1);
+            reason = format!("{}:failures={}", reason, step.failure_count);
+        }
+    }
+    (factor, reason)
+}
+
+fn reliability_factor(
+    state: &KernelState,
+    candidate: &Candidate,
+    settings: &crate::models::Settings,
+) -> (f32, String) {
+    if !settings.learning_feedback.unwrap_or(true) {
+        return (1.0, "learning_feedback_disabled".to_string());
+    }
+    let controller = match state.controller_state.as_ref() {
+        Some(controller) => controller,
+        None => return (1.0, "controller_state_missing".to_string()),
+    };
+    let keys = subject_controller::candidate_reliability_keys(candidate);
+    if keys.is_empty() {
+        return (1.0, "reliability_keys_empty".to_string());
+    }
+    let mut values = Vec::new();
+    for key in keys.iter() {
+        if let Some(value) = controller.reliability.get(key) {
+            values.push(*value);
+        }
+    }
+    if values.is_empty() {
+        return (1.0, "reliability_unknown".to_string());
+    }
+    let avg = values.iter().sum::<f32>() / values.len() as f32;
+    let factor = (0.7 + 0.4 * avg).clamp(0.6, 1.1);
+    (factor, format!("reliability_avg={:.2}", avg))
 }
 
 fn derive_wave_calibration(state: &KernelState) -> WaveCalibration {
@@ -702,6 +813,7 @@ impl Kernel {
         wave_context: Option<WaveArbitrationContext>,
         qualia_context: Option<QualiaModulationContext>,
         residual_context: Option<ResidualInfluenceContext>,
+        gate_penalties: Option<&HashMap<String, crate::core::subject_controller::GatePenalty>>,
         run_id: Option<&str>,
     ) -> KernelDecision {
         let mut list = candidates.to_vec();
@@ -726,6 +838,12 @@ impl Kernel {
             } else {
                 (1.0, "qualia_disabled".to_string())
             };
+            let (plan_factor, plan_reason) = plan_alignment_factor(state, candidate);
+            let (reliability_factor, reliability_reason) = reliability_factor(state, candidate, settings);
+            let gate_penalty = gate_penalties
+                .and_then(|map| map.get(&candidate.id))
+                .map(|entry| entry.penalty)
+                .unwrap_or(0.0);
             let residual_bias = if residual_live {
                 residual_context
                     .as_ref()
@@ -734,17 +852,28 @@ impl Kernel {
             } else {
                 0.0
             };
-            let adjusted_score = base_score * factor * qualia_factor + residual_bias;
+            let adjusted_score = base_score
+                * factor
+                * qualia_factor
+                * plan_factor
+                * reliability_factor
+                * (1.0 - gate_penalty)
+                + residual_bias;
             score_cache.insert(
                 candidate.id.clone(),
                 WaveScoreEntry {
                     base_score,
                     factor,
                     qualia_factor,
+                    plan_factor,
+                    reliability_factor,
+                    gate_penalty,
                     adjusted_score,
                     residual_bias,
                     reason,
                     qualia_reason,
+                    plan_reason,
+                    reliability_reason,
                 },
             );
         }
@@ -787,7 +916,14 @@ impl Kernel {
                 let score_for_shadow = |candidate: &Candidate| {
                     let base = score_cache
                         .get(&candidate.id)
-                        .map(|entry| entry.base_score * entry.factor * entry.qualia_factor)
+                        .map(|entry| {
+                            entry.base_score
+                                * entry.factor
+                                * entry.qualia_factor
+                                * entry.plan_factor
+                                * entry.reliability_factor
+                                * (1.0 - entry.gate_penalty)
+                        })
                         .unwrap_or_else(|| candidate_weighted_score(candidate, settings));
                     base + residual_bias_for_candidate(candidate, ctx)
                 };
@@ -812,10 +948,15 @@ impl Kernel {
                         "base_score": entry.base_score,
                         "factor": entry.factor,
                         "qualia_factor": entry.qualia_factor,
+                        "plan_factor": entry.plan_factor,
+                        "reliability_factor": entry.reliability_factor,
+                        "gate_penalty": entry.gate_penalty,
                         "adjusted_score": entry.adjusted_score,
                         "residual_bias": entry.residual_bias,
                         "reason": entry.reason,
                         "qualia_reason": entry.qualia_reason,
+                        "plan_reason": entry.plan_reason,
+                        "reliability_reason": entry.reliability_reason,
                         "coherence": ctx.state.coherence,
                         "turbulence": ctx.state.turbulence,
                         "drift": ctx.state.drift,
@@ -855,9 +996,12 @@ impl Kernel {
                         "base_score": entry.base_score,
                         "wave_factor": entry.factor,
                         "qualia_factor": entry.qualia_factor,
+                        "reliability_factor": entry.reliability_factor,
+                        "gate_penalty": entry.gate_penalty,
                         "adjusted_score": entry.adjusted_score,
                         "residual_bias": entry.residual_bias,
                         "qualia_reason": entry.qualia_reason,
+                        "reliability_reason": entry.reliability_reason,
                         "qualia_tag": ctx.tag.clone(),
                         "qualia_intensity": ctx.intensity,
                         "qualia_confidence": ctx.confidence,

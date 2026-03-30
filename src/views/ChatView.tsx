@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { VoiceController, VoiceControllerHandle, VoiceStatus } from "../components/VoiceController";
-import { InnerMonologueEntry, Message, PendingPrompt, Settings, ModuleStatus, SelfModel } from "../types/app";
+import { InnerMonologueEntry, Message, PendingPrompt, Settings, ModuleStatus, SelfModel, SystemHealthSnapshot, RecommendationItem } from "../types/app";
 import { MessageContent } from "../components/MessageContent";
 import { StatusStrip } from "../components/StatusStrip";
 import { invokeWithTimeout } from "../utils/tauri";
@@ -19,6 +19,7 @@ interface ChatViewProps {
   isBusy: boolean;
   settings: Settings | null;
   selfModel?: SelfModel | null;
+  healthSnapshot?: SystemHealthSnapshot | null;
   showRaw: boolean;
   rollingSummary: string | null;
   rollingSummaryError: string | null;
@@ -76,6 +77,7 @@ export const ChatView = ({
   isBusy,
   settings,
   selfModel,
+  healthSnapshot,
   showRaw,
   rollingSummary,
   rollingSummaryError,
@@ -140,13 +142,58 @@ export const ChatView = ({
     : rollingSummaryPending
       ? "Generating summary..."
       : "No stored summary yet.";
+  const formatSelfReportNotice = (selfReport: any) => {
+    if (!selfReport || typeof selfReport !== "object") return null;
+    const notice = typeof selfReport.notice === "string" ? selfReport.notice.trim() : "";
+    if (notice) return notice;
+    const parts: string[] = [];
+    const status = typeof selfReport.status === "string" ? selfReport.status : "unknown";
+    parts.push(`status=${status}`);
+    const evidenceIds = Array.isArray(selfReport.evidence_event_ids) ? selfReport.evidence_event_ids : [];
+    const speculative = Boolean(selfReport.speculative) || evidenceIds.length === 0;
+    if (speculative) {
+      parts.push("speculative");
+    }
+    if (typeof selfReport.confidence === "number") {
+      parts.push(`conf=${selfReport.confidence.toFixed(2)}`);
+    }
+    if (typeof selfReport.uncertainty === "number") {
+      parts.push(`uncert=${selfReport.uncertainty.toFixed(2)}`);
+    }
+    if (typeof selfReport.self_model_reliability === "number") {
+      parts.push(`reliability=${selfReport.self_model_reliability.toFixed(2)}`);
+    }
+    const constraints = Array.isArray(selfReport.constraints)
+      ? selfReport.constraints.filter((item: unknown) => typeof item === "string" && item.trim().length > 0)
+      : [];
+    if (constraints.length > 0) {
+      const trimmed = constraints.slice(0, 2).join(", ");
+      const suffix = constraints.length > 2 ? ` +${constraints.length - 2} more` : "";
+      parts.push(`constraints=${trimmed}${suffix}`);
+    }
+    return parts.join(" | ");
+  };
+
   const trustBadgeFor = (message: Message) => {
     if (message.role !== "assistant") return null;
     const meta = (message.metadata ?? {}) as any;
-    const evidenceIds = Array.isArray(meta.evidence_event_ids) ? meta.evidence_event_ids : [];
+    const selfReport = meta?.self_report ?? null;
+    const evidenceIds: number[] = [];
+    if (Array.isArray(meta.evidence_event_ids)) {
+      evidenceIds.push(...meta.evidence_event_ids);
+    }
+    if (Array.isArray(meta.top_evidence_event_ids)) {
+      evidenceIds.push(...meta.top_evidence_event_ids);
+    }
+    if (typeof meta.evidence_event_id === "number") {
+      evidenceIds.push(meta.evidence_event_id);
+    }
+    if (Array.isArray(selfReport?.evidence_event_ids)) {
+      evidenceIds.push(...selfReport.evidence_event_ids);
+    }
     const beliefIds = Array.isArray(meta.belief_ids) ? meta.belief_ids : [];
-    const hasEvidence = evidenceIds.length > 0 || beliefIds.length > 0 || typeof meta.evidence_event_id === "number";
-    const isSpeculative = Boolean(meta.speculative || meta.speculative_reason);
+    const hasEvidence = evidenceIds.length > 0 || beliefIds.length > 0;
+    const isSpeculative = Boolean(meta.speculative || meta.speculative_reason || selfReport?.speculative);
     const gateDecision = meta.gate_decision as string | undefined;
     if (gateDecision === "ALLOW_WITH_AUDIT") {
       return { label: "Audit", tone: "audit", detail: "Audited response. Review evidence chain." };
@@ -235,6 +282,38 @@ export const ChatView = ({
       return { label: "Error", detail: "Response stalled" };
     }
     return { label: "Idle", detail: "Standing by" };
+  };
+
+  const recommendationItems = (healthSnapshot?.metrics?.recommendations?.items ?? []) as RecommendationItem[];
+  const eligibleRecommendations = recommendationItems.filter((rec) => rec.status === "eligible");
+  const applyRecommendation = async (rec: RecommendationItem) => {
+    if (!rec.action) return;
+    await invokeWithTimeout(
+      "apply_recommendation",
+      {
+        recommendation_id: rec.recommendation_id,
+        kind: rec.kind,
+        snapshot_id: healthSnapshot?.snapshot_id ?? null,
+        action: rec.action,
+        gate: rec.gate ?? null,
+        recovery_metric: rec.recovery_metric ?? null,
+        recovery_target: rec.recovery_target ?? null,
+        baseline_value: rec.baseline_value ?? null,
+      },
+      15000,
+    );
+  };
+  const dismissRecommendation = async (rec: RecommendationItem) => {
+    await invokeWithTimeout(
+      "dismiss_recommendation",
+      {
+        recommendation_id: rec.recommendation_id,
+        kind: rec.kind,
+        snapshot_id: healthSnapshot?.snapshot_id ?? null,
+        gate: rec.gate ?? null,
+      },
+      10000,
+    );
   };
 
   const streamStatus = deriveStreamStatus();
@@ -794,6 +873,7 @@ export const ChatView = ({
           const extraNotice: string | null = meta?.extra_notice ?? null;
           const gateDecision: string | null = meta?.gate_decision ?? null;
           const selfReport = meta?.self_report ?? null;
+          const selfReportNotice = formatSelfReportNotice(selfReport);
           const trustBadge = trustBadgeFor(m);
 
           return (
@@ -855,7 +935,7 @@ export const ChatView = ({
                   <div className="self-report-banner">
                     <span className="self-report-title">Self-Report</span>
                     <span className="self-report-body">
-                      {selfReport.notice || "Unverified self-report."}
+                      {selfReportNotice || "Self-report available."}
                     </span>
                   </div>
                 )}
@@ -924,6 +1004,33 @@ export const ChatView = ({
 
         </div>
       </div>
+
+      {eligibleRecommendations.length > 0 && (
+        <div className="chat-recommendations glass">
+          <div className="chat-recommendations-header">
+            <span>Recommended Actions</span>
+            <span className="chat-recommendations-count">{eligibleRecommendations.length}</span>
+          </div>
+          <div className="chat-recommendations-list">
+            {eligibleRecommendations.slice(0, 3).map((rec) => (
+              <div key={rec.recommendation_id} className="chat-recommendation-item">
+                <div className="chat-recommendation-body">
+                  <div className="chat-recommendation-title">{rec.title}</div>
+                  <div className="chat-recommendation-detail">{rec.detail}</div>
+                </div>
+                <div className="chat-recommendation-actions">
+                  <button className="btn btn-secondary" onClick={() => applyRecommendation(rec)}>
+                    Apply
+                  </button>
+                  <button className="btn btn-tertiary" onClick={() => dismissRecommendation(rec)}>
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="input-area">
         <div className="input-meta-row">

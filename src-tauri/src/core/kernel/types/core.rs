@@ -54,6 +54,8 @@ pub struct Outcome {
     pub failure_kind: Option<String>,
     #[serde(default)]
     pub target_key: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub action_id: Option<String>,
     pub timestamp: String,
 }

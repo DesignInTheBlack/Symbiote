@@ -476,7 +476,16 @@ fn collect_workspace_meta_evidence_ids(meta: &WorkspaceMeta) -> Vec<i64> {
         push_ids(&hypothesis.evidence_event_ids);
     }
     if let Some(runtime) = meta.runtime.as_ref().and_then(|v| v.as_object()) {
-        for key in ["autobiographical_summary", "self_report_snapshot"].iter() {
+        for key in [
+            "autobiographical_summary",
+            "self_report_snapshot",
+            "planner",
+            "evidence_health",
+            "goal_reconciliation",
+            "strategy_audit",
+        ]
+        .iter()
+        {
             if let Some(obj) = runtime.get(*key).and_then(|v| v.as_object()) {
                 if let Some(list) = obj.get("evidence_event_ids").and_then(|v| v.as_array()) {
                     for id in list.iter().filter_map(|v| v.as_i64()) {
@@ -495,7 +504,12 @@ fn collect_workspace_meta_evidence_ids(meta: &WorkspaceMeta) -> Vec<i64> {
 
 fn extract_unified_state_evidence_ids(value: &Value) -> Vec<i64> {
     let mut ids: Vec<i64> = Vec::new();
-    if let Some(list) = value.get("evidence_event_ids").and_then(|v| v.as_array()) {
+    let top_list = value.get("top_evidence_event_ids").and_then(|v| v.as_array());
+    let list = match top_list {
+        Some(arr) if !arr.is_empty() => Some(arr),
+        _ => value.get("evidence_event_ids").and_then(|v| v.as_array()),
+    };
+    if let Some(list) = list {
         for item in list.iter() {
             if let Some(id) = item.as_i64() {
                 if id > 0 {
@@ -934,6 +948,24 @@ pub(crate) fn detect_context_intent(
         matched_rules.push("recall_trigger".to_string());
     }
 
+    let memory_triggers = [
+        "remember",
+        "memory",
+        "preference",
+        "preferences",
+        "prefer",
+        "favorite",
+        "favourite",
+        "likes",
+        "dislike",
+        "who am i",
+        "what do you know about me",
+    ];
+    if memory_triggers.iter().any(|t| lower.contains(t)) {
+        tags.push("memory".to_string());
+        matched_rules.push("memory_trigger".to_string());
+    }
+
     let world_triggers = [
         "world model",
         "belief graph",
@@ -965,6 +997,66 @@ pub(crate) fn detect_context_intent(
     if plan_triggers.iter().any(|t| lower.contains(t)) {
         tags.push("planning".to_string());
         matched_rules.push("planning_trigger".to_string());
+    }
+
+    let uncertainty_triggers = [
+        "not sure",
+        "unsure",
+        "uncertain",
+        "confidence",
+        "probability",
+        "maybe",
+        "likely",
+        "uncertainty",
+    ];
+    if uncertainty_triggers.iter().any(|t| lower.contains(t)) {
+        tags.push("uncertainty".to_string());
+        matched_rules.push("uncertainty_trigger".to_string());
+    }
+
+    let tool_triggers = [
+        "tool",
+        "tools",
+        "search",
+        "browse",
+        "web",
+        "lookup",
+        "research",
+        "call api",
+        "run tool",
+    ];
+    if tool_triggers.iter().any(|t| lower.contains(t)) {
+        tags.push("tools".to_string());
+        matched_rules.push("tools_trigger".to_string());
+    }
+
+    let loop_triggers = [
+        "loop",
+        "again",
+        "repeat",
+        "same answer",
+        "circling",
+        "stuck",
+        "cycle",
+    ];
+    if loop_triggers.iter().any(|t| lower.contains(t)) {
+        tags.push("looping".to_string());
+        matched_rules.push("looping_trigger".to_string());
+    }
+
+    let debug_triggers = [
+        "error",
+        "bug",
+        "broken",
+        "crash",
+        "not working",
+        "issue",
+        "failed",
+        "failure",
+    ];
+    if debug_triggers.iter().any(|t| lower.contains(t)) {
+        tags.push("debug".to_string());
+        matched_rules.push("debug_trigger".to_string());
     }
 
     let self_awareness_triggers = [
@@ -1001,6 +1093,19 @@ pub(crate) fn detect_context_intent(
     if capability_triggers.iter().any(|t| lower.contains(t)) {
         tags.push("capabilities".to_string());
         matched_rules.push("capabilities_trigger".to_string());
+    }
+
+    let partnership_triggers = [
+        "partner",
+        "collaborate",
+        "co-pilot",
+        "copilot",
+        "together",
+        "team up",
+    ];
+    if partnership_triggers.iter().any(|t| lower.contains(t)) {
+        tags.push("partnership".to_string());
+        matched_rules.push("partnership_trigger".to_string());
     }
 
     let introspection_triggers = [
@@ -2416,11 +2521,13 @@ pub async fn build_core_system_message_with_layout(
             speculative: true,
             evidence_event_ids: Vec::new(),
             belief_ids: Vec::new(),
+            evidence_quality: None,
         });
         state.workspace_meta.focus_rationale = Some(WorkspaceFieldMeta {
             speculative: true,
             evidence_event_ids: Vec::new(),
             belief_ids: Vec::new(),
+            evidence_quality: None,
         });
         workspace_state = Some(state);
     }

@@ -6,6 +6,7 @@ pub mod system_log;
 pub mod system_log_schema;
 pub mod system_controls;
 pub mod system_health;
+pub mod outcome_taxonomy;
 pub mod sensitivity;
 pub mod identity;
 pub mod kernel;

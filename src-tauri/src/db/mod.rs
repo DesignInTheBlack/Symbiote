@@ -11,6 +11,7 @@ use tauri::{AppHandle, Manager};
 use std::fs;
 use crate::core::system_log;
 use crate::core::system_controls;
+use crate::core::outcome_taxonomy;
 use crate::models::{
     ConversationSummaryChunk,
     ControllerState,
@@ -31,6 +32,8 @@ use crate::models::{
     SystemControlEntry,
     SystemControlEvent,
     SystemHealthSnapshot,
+    BaselineMetricsSnapshot,
+    RecommendationEvent,
     ContextTagEntry,
     UserIntentSummary,
 };
@@ -45,7 +48,7 @@ use crate::core::memory::canonical::{
     normalize_rel_type,
     serialize_participant_ids,
 };
-use crate::core::memory::attention::evidence::compute_evidence_weight;
+use crate::core::memory::attention::evidence::{compute_evidence_quality, compute_evidence_weight};
 use uuid::Uuid;
 use crate::core::memory::scope::parse_scope_str;
 use crate::core::memory::types::{Scope, SourceType};
@@ -69,6 +72,14 @@ pub struct DeferredEmit {
     pub payload_json: String,
     pub source: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvidenceQualityStats {
+    pub min: f32,
+    pub max: f32,
+    pub avg: f32,
+    pub count: usize,
 }
 
 impl Db {
@@ -372,6 +383,42 @@ impl Db {
             .execute(&self.pool)
             .await;
         }
+        if !table_exists(&self.pool, "baseline_metrics").await {
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS baseline_metrics (
+                    baseline_id TEXT PRIMARY KEY,
+                    window_minutes INTEGER NOT NULL,
+                    window_start TEXT NOT NULL,
+                    window_end TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"
+            )
+            .execute(&self.pool)
+            .await;
+        }
+        if !table_exists(&self.pool, "recommendation_events").await {
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS recommendation_events (
+                    event_id TEXT PRIMARY KEY,
+                    recommendation_id TEXT NOT NULL,
+                    conversation_id TEXT,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    snapshot_id TEXT,
+                    action_json TEXT,
+                    gate_json TEXT,
+                    recovery_metric TEXT,
+                    recovery_target REAL,
+                    baseline_value REAL,
+                    resolved_value REAL,
+                    time_to_recovery_ms INTEGER,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"
+            )
+            .execute(&self.pool)
+            .await;
+        }
         let _ = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_system_controls_subsystem ON system_controls(subsystem_id)"
         )
@@ -384,6 +431,26 @@ impl Db {
         .await;
         let _ = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_system_health_snapshots_time ON system_health_snapshots(timestamp DESC)"
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_baseline_metrics_time ON baseline_metrics(created_at DESC)"
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recommendation_events_created ON recommendation_events(created_at DESC)"
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recommendation_events_rec ON recommendation_events(recommendation_id, created_at DESC)"
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recommendation_events_status ON recommendation_events(status, created_at DESC)"
         )
         .execute(&self.pool)
         .await;
@@ -2219,7 +2286,7 @@ No other text before or after.
         self.ensure_settings_columns().await?;
         let row = sqlx::query(
             "SELECT schema_version, api_base_url, api_key, streaming_enabled, history_window, injection_policy, request_defaults, active_model_id, json_reliable_model_id, system_prompt, voice_name, voice_speed, summarization_api_url, summarization_model, embedding_model, user_display_name, assistant_display_name, onboarding_completed, ui_theme, voice_pitch_semitones, voice_reverb_amount, voice_compression, voice_formant_shift, trace_history_limit, cockpit_write_enabled, episodic_enabled, episodic_injection_enabled, episodic_compaction_enabled, episodic_injection_limit, episodic_opt_out, memory_claims_enabled, phi_consent, seed_personal_user, lexical_fallback_enabled, memory_half_life_hours, research_budget_per_hour, research_budget_reset_window,
-research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, monologue_retry_timeout_secs, empty_response_retry_max, empty_response_retry_timeout_ms, monologue_max_per_hour, thread_max_depth, allow_shell_tool, shell_command_allowlist, ask_budget_max, calculator_followups_max, loop_similarity_threshold, loop_recent_k, meta_cog_outcome_turns, meta_cog_cycle_window_turns, meta_cog_outcome_timeout_s, meta_cog_cooldown_s, meta_cog_streak_limit, registry_profile_name, controller_enabled, monologue_stabilization_enabled, monologue_surface_enabled, show_monologue_in_chat, enable_introspection, heartbeat_enabled, dream_enabled, binding_enforcement_enabled, pending_prompt_alignment_enabled, pending_prompt_recency_secs, auto_memory_pass_enabled, summary_cohesion_enabled, compact_prompt_enabled, context_hydration_mode, context_budgeter_enabled, context_miss_detector_enabled, world_model_reconcile_mode, goal_loop_enabled, goal_loop_interval_turns, goal_loop_load_threshold_ms, json_only_disabled_models, tool_failure_gate_window_mins, tool_failure_gate_tool_names, gate_default_soft, gate_shadow_mode, gate_rollout_percent, self_report_channel, self_awareness_expression_mode, explicit_feedback_only, weight_user_satisfaction, weight_policy_rigor, weight_latency, weight_evidence_strictness, weight_exploration, monologue_provenance_guard, organism_decay, model_context_limit, introspection_confidence_threshold, introspection_drift_threshold, introspection_ambiguity_threshold, enable_attribution_gate, enable_user_utterance_evidence, enable_attribution_metadata, enable_tool_schema_validation, enable_context_evidence, enable_monologue_validator, enable_memory_evidence_gating, enable_speculative_workspace_containment, stability_prompt_override_guard, stability_monologue_tagged, stability_introspection_structured, stability_disable_working_hypothesis, stability_state_disclosure_expanded, stability_transcript_normalization, stability_memory_hygiene, stability_non_stream_sanitization FROM settings WHERE id = 1"
+research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, monologue_retry_timeout_secs, empty_response_retry_max, empty_response_retry_timeout_ms, monologue_max_per_hour, thread_max_depth, allow_shell_tool, shell_command_allowlist, ask_budget_max, calculator_followups_max, loop_similarity_threshold, loop_recent_k, meta_cog_outcome_turns, meta_cog_cycle_window_turns, meta_cog_outcome_timeout_s, meta_cog_cooldown_s, meta_cog_streak_limit, registry_profile_name, controller_enabled, monologue_stabilization_enabled, monologue_surface_enabled, show_monologue_in_chat, enable_introspection, heartbeat_enabled, dream_enabled, binding_enforcement_enabled, pending_prompt_alignment_enabled, pending_prompt_recency_secs, auto_memory_pass_enabled, summary_cohesion_enabled, compact_prompt_enabled, context_hydration_mode, context_budgeter_enabled, context_miss_detector_enabled, world_model_reconcile_mode, goal_loop_enabled, goal_loop_interval_turns, goal_loop_load_threshold_ms, json_only_disabled_models, tool_failure_gate_window_mins, tool_failure_gate_tool_names, gate_default_soft, gate_shadow_mode, gate_rollout_percent, self_report_channel, self_awareness_expression_mode, explicit_feedback_only, weight_user_satisfaction, weight_policy_rigor, weight_latency, weight_evidence_strictness, weight_exploration, evidence_emit_budget, evidence_retention_days, gate_penalty_integration, evidence_auto_capture, response_fallback_enabled, memory_soft_anchor, context_extraction_boost, planner_enabled, confidence_calibration, scheduler_cognition, learning_feedback, evidence_semantics_v2, narrative_continuity, monologue_provenance_guard, organism_decay, model_context_limit, introspection_confidence_threshold, introspection_drift_threshold, introspection_ambiguity_threshold, enable_attribution_gate, enable_user_utterance_evidence, enable_attribution_metadata, enable_tool_schema_validation, enable_context_evidence, enable_monologue_validator, enable_memory_evidence_gating, enable_speculative_workspace_containment, stability_prompt_override_guard, stability_monologue_tagged, stability_introspection_structured, stability_disable_working_hypothesis, stability_state_disclosure_expanded, stability_transcript_normalization, stability_memory_hygiene, stability_non_stream_sanitization FROM settings WHERE id = 1"
         )
         .fetch_one(&self.pool)
         .await?;
@@ -2322,6 +2389,19 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
             weight_latency: row.try_get::<f64, _>("weight_latency").ok().map(|v| v as f32),
             weight_evidence_strictness: row.try_get::<f64, _>("weight_evidence_strictness").ok().map(|v| v as f32),
             weight_exploration: row.try_get::<f64, _>("weight_exploration").ok().map(|v| v as f32),
+            evidence_emit_budget: row.try_get::<i64, _>("evidence_emit_budget").ok().map(|v| v as i32),
+            evidence_retention_days: row.try_get::<i64, _>("evidence_retention_days").ok().map(|v| v as i32),
+            gate_penalty_integration: row.try_get::<i32, _>("gate_penalty_integration").ok().map(|v| v != 0),
+            evidence_auto_capture: row.try_get::<i32, _>("evidence_auto_capture").ok().map(|v| v != 0),
+            response_fallback_enabled: row.try_get::<i32, _>("response_fallback_enabled").ok().map(|v| v != 0),
+            memory_soft_anchor: row.try_get::<i32, _>("memory_soft_anchor").ok().map(|v| v != 0),
+            context_extraction_boost: row.try_get::<i32, _>("context_extraction_boost").ok().map(|v| v != 0),
+            planner_enabled: row.try_get::<i32, _>("planner_enabled").ok().map(|v| v != 0),
+            confidence_calibration: row.try_get::<i32, _>("confidence_calibration").ok().map(|v| v != 0),
+            scheduler_cognition: row.try_get::<i32, _>("scheduler_cognition").ok().map(|v| v != 0),
+            learning_feedback: row.try_get::<i32, _>("learning_feedback").ok().map(|v| v != 0),
+            evidence_semantics_v2: row.try_get::<i32, _>("evidence_semantics_v2").ok().map(|v| v != 0),
+            narrative_continuity: row.try_get::<i32, _>("narrative_continuity").ok().map(|v| v != 0),
             monologue_provenance_guard: row
                 .try_get::<i32, _>("monologue_provenance_guard")
                 .ok()
@@ -2446,12 +2526,12 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
         let empty_response_retry_max = settings
             .empty_response_retry_max
             .or(current.empty_response_retry_max)
-            .unwrap_or(1)
+            .unwrap_or(3)
             .max(0);
         let empty_response_retry_timeout_ms = settings
             .empty_response_retry_timeout_ms
             .or(current.empty_response_retry_timeout_ms)
-            .unwrap_or(2000)
+            .unwrap_or(4000)
             .max(0);
         let monologue_max_per_hour = settings
             .monologue_max_per_hour
@@ -2635,6 +2715,49 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
             .or(current.weight_exploration)
             .unwrap_or(0.5)
             .clamp(0.0, 1.0);
+        let evidence_emit_budget = settings
+            .evidence_emit_budget
+            .or(current.evidence_emit_budget)
+            .unwrap_or(50)
+            .max(0);
+        let evidence_retention_days = settings
+            .evidence_retention_days
+            .or(current.evidence_retention_days)
+            .unwrap_or(30)
+            .max(0);
+        let gate_penalty_integration = settings
+            .gate_penalty_integration
+            .unwrap_or(current.gate_penalty_integration.unwrap_or(true)) as i32;
+        let evidence_auto_capture = settings
+            .evidence_auto_capture
+            .unwrap_or(current.evidence_auto_capture.unwrap_or(true)) as i32;
+        let response_fallback_enabled = settings
+            .response_fallback_enabled
+            .unwrap_or(current.response_fallback_enabled.unwrap_or(true)) as i32;
+        let memory_soft_anchor = settings
+            .memory_soft_anchor
+            .unwrap_or(current.memory_soft_anchor.unwrap_or(true)) as i32;
+        let context_extraction_boost = settings
+            .context_extraction_boost
+            .unwrap_or(current.context_extraction_boost.unwrap_or(true)) as i32;
+        let planner_enabled = settings
+            .planner_enabled
+            .unwrap_or(current.planner_enabled.unwrap_or(true)) as i32;
+        let confidence_calibration = settings
+            .confidence_calibration
+            .unwrap_or(current.confidence_calibration.unwrap_or(true)) as i32;
+        let scheduler_cognition = settings
+            .scheduler_cognition
+            .unwrap_or(current.scheduler_cognition.unwrap_or(true)) as i32;
+        let learning_feedback = settings
+            .learning_feedback
+            .unwrap_or(current.learning_feedback.unwrap_or(true)) as i32;
+        let evidence_semantics_v2 = settings
+            .evidence_semantics_v2
+            .unwrap_or(current.evidence_semantics_v2.unwrap_or(true)) as i32;
+        let narrative_continuity = settings
+            .narrative_continuity
+            .unwrap_or(current.narrative_continuity.unwrap_or(true)) as i32;
         let monologue_provenance_guard = settings
             .monologue_provenance_guard
             .unwrap_or(current.monologue_provenance_guard.unwrap_or(true)) as i32;
@@ -2719,7 +2842,7 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
         if let Err(e) = sqlx::query(
             "UPDATE settings SET api_base_url = ?, api_key = ?, streaming_enabled = ?, history_window = ?, injection_policy = ?, request_defaults = ?, active_model_id = ?, json_reliable_model_id = ?, system_prompt = ?, voice_name = ?, voice_speed = ?, summarization_api_url = ?, summarization_model = ?, embedding_model = ?, user_display_name = ?, assistant_display_name = ?, onboarding_completed = ?, ui_theme = ?, episodic_enabled = ?, episodic_injection_enabled = ?, episodic_compaction_enabled = ?, episodic_injection_limit = ?, episodic_opt_out = ?, memory_claims_enabled = ?, phi_consent = ?, seed_personal_user = ?, lexical_fallback_enabled = ?, memory_half_life_hours = ?, voice_pitch_semitones = ?, voice_reverb_amount = ?, voice_compression = ?, voice_formant_shift = ?, trace_history_limit = ?, cockpit_write_enabled = ?, research_budget_per_hour = ?, 
 research_budget_reset_window = ?, research_cost_per_call = ?, monologue_interval_seconds = ?, monologue_timeout_secs = ?, monologue_retry_timeout_secs = ?, empty_response_retry_max = ?, empty_response_retry_timeout_ms = ?, monologue_max_per_hour = ?, 
-thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_budget_max = ?, calculator_followups_max = ?, loop_similarity_threshold = ?, loop_recent_k = ?, meta_cog_outcome_turns = ?, meta_cog_cycle_window_turns = ?, meta_cog_outcome_timeout_s = ?, meta_cog_cooldown_s = ?, meta_cog_streak_limit = ?, registry_profile_name = ?, controller_enabled = ?, monologue_stabilization_enabled = ?, monologue_surface_enabled = ?, show_monologue_in_chat = ?, enable_introspection = ?, heartbeat_enabled = ?, dream_enabled = ?, binding_enforcement_enabled = ?, pending_prompt_alignment_enabled = ?, pending_prompt_recency_secs = ?, auto_memory_pass_enabled = ?, summary_cohesion_enabled = ?, compact_prompt_enabled = ?, context_hydration_mode = ?, context_budgeter_enabled = ?, context_miss_detector_enabled = ?, world_model_reconcile_mode = ?, goal_loop_enabled = ?, goal_loop_interval_turns = ?, goal_loop_load_threshold_ms = ?, json_only_disabled_models = ?, tool_failure_gate_window_mins = ?, tool_failure_gate_tool_names = ?, gate_default_soft = ?, gate_shadow_mode = ?, gate_rollout_percent = ?, self_report_channel = ?, self_awareness_expression_mode = ?, explicit_feedback_only = ?, weight_user_satisfaction = ?, weight_policy_rigor = ?, weight_latency = ?, weight_evidence_strictness = ?, weight_exploration = ?, monologue_provenance_guard = ?, organism_decay = ?, model_context_limit = ?, introspection_confidence_threshold = ?, introspection_drift_threshold = ?, introspection_ambiguity_threshold = ?, enable_attribution_gate = ?, enable_user_utterance_evidence = ?, enable_attribution_metadata = ?, enable_tool_schema_validation = ?, enable_context_evidence = ?, enable_monologue_validator = ?, enable_memory_evidence_gating = ?, enable_speculative_workspace_containment = ?, stability_prompt_override_guard = ?, stability_monologue_tagged = ?, stability_introspection_structured = ?, stability_disable_working_hypothesis = ?, stability_state_disclosure_expanded = ?, stability_transcript_normalization = ?, stability_memory_hygiene = ?, stability_non_stream_sanitization = ? WHERE id = 1"
+thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_budget_max = ?, calculator_followups_max = ?, loop_similarity_threshold = ?, loop_recent_k = ?, meta_cog_outcome_turns = ?, meta_cog_cycle_window_turns = ?, meta_cog_outcome_timeout_s = ?, meta_cog_cooldown_s = ?, meta_cog_streak_limit = ?, registry_profile_name = ?, controller_enabled = ?, monologue_stabilization_enabled = ?, monologue_surface_enabled = ?, show_monologue_in_chat = ?, enable_introspection = ?, heartbeat_enabled = ?, dream_enabled = ?, binding_enforcement_enabled = ?, pending_prompt_alignment_enabled = ?, pending_prompt_recency_secs = ?, auto_memory_pass_enabled = ?, summary_cohesion_enabled = ?, compact_prompt_enabled = ?, context_hydration_mode = ?, context_budgeter_enabled = ?, context_miss_detector_enabled = ?, world_model_reconcile_mode = ?, goal_loop_enabled = ?, goal_loop_interval_turns = ?, goal_loop_load_threshold_ms = ?, json_only_disabled_models = ?, tool_failure_gate_window_mins = ?, tool_failure_gate_tool_names = ?, gate_default_soft = ?, gate_shadow_mode = ?, gate_rollout_percent = ?, self_report_channel = ?, self_awareness_expression_mode = ?, explicit_feedback_only = ?, weight_user_satisfaction = ?, weight_policy_rigor = ?, weight_latency = ?, weight_evidence_strictness = ?, weight_exploration = ?, evidence_emit_budget = ?, evidence_retention_days = ?, gate_penalty_integration = ?, evidence_auto_capture = ?, response_fallback_enabled = ?, memory_soft_anchor = ?, context_extraction_boost = ?, planner_enabled = ?, confidence_calibration = ?, scheduler_cognition = ?, learning_feedback = ?, evidence_semantics_v2 = ?, narrative_continuity = ?, monologue_provenance_guard = ?, organism_decay = ?, model_context_limit = ?, introspection_confidence_threshold = ?, introspection_drift_threshold = ?, introspection_ambiguity_threshold = ?, enable_attribution_gate = ?, enable_user_utterance_evidence = ?, enable_attribution_metadata = ?, enable_tool_schema_validation = ?, enable_context_evidence = ?, enable_monologue_validator = ?, enable_memory_evidence_gating = ?, enable_speculative_workspace_containment = ?, stability_prompt_override_guard = ?, stability_monologue_tagged = ?, stability_introspection_structured = ?, stability_disable_working_hypothesis = ?, stability_state_disclosure_expanded = ?, stability_transcript_normalization = ?, stability_memory_hygiene = ?, stability_non_stream_sanitization = ? WHERE id = 1"
         )
         .bind(settings.api_base_url)
         .bind(settings.api_key)
@@ -2811,6 +2934,19 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         .bind(weight_latency)
         .bind(weight_evidence_strictness)
         .bind(weight_exploration)
+        .bind(evidence_emit_budget)
+        .bind(evidence_retention_days)
+        .bind(gate_penalty_integration)
+        .bind(evidence_auto_capture)
+        .bind(response_fallback_enabled)
+        .bind(memory_soft_anchor)
+        .bind(context_extraction_boost)
+        .bind(planner_enabled)
+        .bind(confidence_calibration)
+        .bind(scheduler_cognition)
+        .bind(learning_feedback)
+        .bind(evidence_semantics_v2)
+        .bind(narrative_continuity)
         .bind(monologue_provenance_guard)
         .bind(organism_decay)
         .bind(model_context_limit)
@@ -3209,10 +3345,10 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             sqlx::query("ALTER TABLE settings ADD COLUMN monologue_retry_timeout_secs INTEGER NOT NULL DEFAULT 25").execute(pool).await?;
         }
         if !column_exists(pool, "settings", "empty_response_retry_max").await {
-            sqlx::query("ALTER TABLE settings ADD COLUMN empty_response_retry_max INTEGER NOT NULL DEFAULT 1").execute(pool).await?;
+            sqlx::query("ALTER TABLE settings ADD COLUMN empty_response_retry_max INTEGER NOT NULL DEFAULT 3").execute(pool).await?;
         }
         if !column_exists(pool, "settings", "empty_response_retry_timeout_ms").await {
-            sqlx::query("ALTER TABLE settings ADD COLUMN empty_response_retry_timeout_ms INTEGER NOT NULL DEFAULT 2000").execute(pool).await?;
+            sqlx::query("ALTER TABLE settings ADD COLUMN empty_response_retry_timeout_ms INTEGER NOT NULL DEFAULT 4000").execute(pool).await?;
         }
         if !column_exists(pool, "settings", "monologue_max_per_hour").await {
             sqlx::query("ALTER TABLE settings ADD COLUMN monologue_max_per_hour INTEGER NOT NULL DEFAULT 360").execute(pool).await?;
@@ -3465,6 +3601,92 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         }
         if !column_exists(pool, "settings", "weight_exploration").await {
             sqlx::query("ALTER TABLE settings ADD COLUMN weight_exploration REAL NOT NULL DEFAULT 0.5")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "evidence_emit_budget").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN evidence_emit_budget INTEGER NOT NULL DEFAULT 50")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "evidence_retention_days").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN evidence_retention_days INTEGER NOT NULL DEFAULT 30")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "gate_penalty_integration").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN gate_penalty_integration BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "evidence_auto_capture").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN evidence_auto_capture BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "response_fallback_enabled").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN response_fallback_enabled BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "memory_soft_anchor").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN memory_soft_anchor BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "context_extraction_boost").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN context_extraction_boost BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        let _ = sqlx::query(
+            "UPDATE settings
+             SET response_fallback_enabled = 1
+             WHERE response_fallback_enabled IS NULL",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "UPDATE settings
+             SET memory_soft_anchor = 1
+             WHERE memory_soft_anchor IS NULL",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "UPDATE settings
+             SET context_extraction_boost = 1
+             WHERE context_extraction_boost IS NULL",
+        )
+        .execute(pool)
+        .await;
+        if !column_exists(pool, "settings", "planner_enabled").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN planner_enabled BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "confidence_calibration").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN confidence_calibration BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "scheduler_cognition").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN scheduler_cognition BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "learning_feedback").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN learning_feedback BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "evidence_semantics_v2").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN evidence_semantics_v2 BOOLEAN NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
+        }
+        if !column_exists(pool, "settings", "narrative_continuity").await {
+            sqlx::query("ALTER TABLE settings ADD COLUMN narrative_continuity BOOLEAN NOT NULL DEFAULT 1")
                 .execute(pool)
                 .await?;
         }
@@ -3817,6 +4039,45 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         let _ = sqlx::query("UPDATE settings SET weight_exploration = 0.5 WHERE weight_exploration IS NULL")
             .execute(pool)
             .await;
+        let _ = sqlx::query("UPDATE settings SET evidence_emit_budget = 50 WHERE evidence_emit_budget IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET evidence_retention_days = 30 WHERE evidence_retention_days IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET gate_penalty_integration = 1 WHERE gate_penalty_integration IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET evidence_auto_capture = 1 WHERE evidence_auto_capture IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET response_fallback_enabled = 1 WHERE response_fallback_enabled IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET memory_soft_anchor = 1 WHERE memory_soft_anchor IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET context_extraction_boost = 1 WHERE context_extraction_boost IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET planner_enabled = 1 WHERE planner_enabled IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET confidence_calibration = 1 WHERE confidence_calibration IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET scheduler_cognition = 1 WHERE scheduler_cognition IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET learning_feedback = 1 WHERE learning_feedback IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET evidence_semantics_v2 = 1 WHERE evidence_semantics_v2 IS NULL")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("UPDATE settings SET narrative_continuity = 1 WHERE narrative_continuity IS NULL")
+            .execute(pool)
+            .await;
         let _ = sqlx::query("UPDATE settings SET monologue_provenance_guard = 1 WHERE monologue_provenance_guard IS NULL")
             .execute(pool)
             .await;
@@ -3838,6 +4099,16 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         let _ = sqlx::query("UPDATE settings SET introspection_ambiguity_threshold = 0.5 WHERE introspection_ambiguity_threshold IS NULL OR introspection_ambiguity_threshold <= 0")
             .execute(pool)
             .await;
+        if !column_exists(pool, "ics_evidence_events", "context_json").await {
+            let _ = sqlx::query("ALTER TABLE ics_evidence_events ADD COLUMN context_json TEXT")
+                .execute(pool)
+                .await;
+        }
+        if !column_exists(pool, "ics_evidence_events", "strength").await {
+            let _ = sqlx::query("ALTER TABLE ics_evidence_events ADD COLUMN strength REAL NOT NULL DEFAULT 0.0")
+                .execute(pool)
+                .await;
+        }
         Ok(())
     }
 
@@ -4347,6 +4618,152 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         ids
     }
 
+    pub async fn rank_evidence_ids_by_strength(
+        &self,
+        source_types: &[&str],
+        limit: i64,
+    ) -> Vec<i64> {
+        let limit = limit.max(1);
+        let query = if source_types.is_empty() {
+            "SELECT id FROM ics_evidence_events
+             ORDER BY (strength + (0.2 / (1.0 + max(0.0, julianday('now') - julianday(created_at))))) DESC,
+                      datetime(created_at) DESC
+             LIMIT ?"
+                .to_string()
+        } else {
+            let placeholders = source_types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            format!(
+                "SELECT id FROM ics_evidence_events
+                 WHERE source_type IN ({})
+                 ORDER BY (strength + (0.2 / (1.0 + max(0.0, julianday('now') - julianday(created_at))))) DESC,
+                          datetime(created_at) DESC
+                 LIMIT ?",
+                placeholders
+            )
+        };
+        let mut builder = sqlx::query(&query);
+        if !source_types.is_empty() {
+            for source_type in source_types.iter() {
+                builder = builder.bind(source_type);
+            }
+        }
+        builder = builder.bind(limit);
+        let rows = builder.fetch_all(&self.pool).await.unwrap_or_default();
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for row in rows {
+            let id: i64 = row.try_get("id").unwrap_or(0);
+            if id > 0 && seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    pub async fn average_evidence_strength(
+        &self,
+        lookback_days: i64,
+    ) -> Option<f64> {
+        let lookback_days = lookback_days.max(1);
+        let lookback = format!("-{} days", lookback_days);
+        let row: Option<f64> = sqlx::query_scalar(
+            "SELECT AVG(strength) FROM ics_evidence_events
+             WHERE datetime(created_at) >= datetime('now', ?)",
+        )
+        .bind(lookback)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        row
+    }
+
+    pub async fn evidence_quality_stats(
+        &self,
+        evidence_ids: &[i64],
+    ) -> Option<EvidenceQualityStats> {
+        if evidence_ids.is_empty() {
+            return None;
+        }
+        let mut unique: Vec<i64> = evidence_ids.iter().copied().filter(|id| *id > 0).collect();
+        unique.sort();
+        unique.dedup();
+        if unique.is_empty() {
+            return None;
+        }
+        let placeholders = unique.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query_ics = format!(
+            "SELECT source_type, weight, strength, max(0.0, julianday('now') - julianday(created_at)) as age_days
+             FROM ics_evidence_events WHERE id IN ({})",
+            placeholders
+        );
+        let query_self = format!(
+            "SELECT source_type, weight, NULL as strength, max(0.0, julianday('now') - julianday(created_at)) as age_days
+             FROM self_evidence_events WHERE id IN ({})",
+            placeholders
+        );
+        let mut ics_stmt = sqlx::query(&query_ics);
+        for id in unique.iter() {
+            ics_stmt = ics_stmt.bind(id);
+        }
+        let mut self_stmt = sqlx::query(&query_self);
+        for id in unique.iter() {
+            self_stmt = self_stmt.bind(id);
+        }
+        let mut scores: Vec<f32> = Vec::new();
+        let rows = ics_stmt.fetch_all(&self.pool).await.unwrap_or_default();
+        for row in rows.iter() {
+            let source_raw: String = row.try_get("source_type").unwrap_or_default();
+            let weight = row.try_get::<f64, _>("weight").unwrap_or(0.0) as f32;
+            let strength = row.try_get::<f64, _>("strength").ok().map(|v| v as f32);
+            let age_days = row.try_get::<f64, _>("age_days").unwrap_or(0.0) as f32;
+            let source = match source_raw.trim().to_lowercase().as_str() {
+                "user" | "user_focus" => SourceType::User,
+                "tool" => SourceType::Tool,
+                "inference" => SourceType::Inference,
+                _ => SourceType::System,
+            };
+            let quality = compute_evidence_quality(source, weight, strength, age_days);
+            scores.push(quality);
+        }
+        let rows = self_stmt.fetch_all(&self.pool).await.unwrap_or_default();
+        for row in rows.iter() {
+            let source_raw: String = row.try_get("source_type").unwrap_or_default();
+            let weight = row.try_get::<f64, _>("weight").unwrap_or(0.0) as f32;
+            let age_days = row.try_get::<f64, _>("age_days").unwrap_or(0.0) as f32;
+            let source = match source_raw.trim().to_lowercase().as_str() {
+                "user" | "user_focus" => SourceType::User,
+                "tool" => SourceType::Tool,
+                "inference" => SourceType::Inference,
+                _ => SourceType::System,
+            };
+            let quality = compute_evidence_quality(source, weight, None, age_days);
+            scores.push(quality);
+        }
+        if scores.is_empty() {
+            return None;
+        }
+        let mut min = 1.0_f32;
+        let mut max = 0.0_f32;
+        let mut sum = 0.0_f32;
+        for score in scores.iter().copied() {
+            if score < min {
+                min = score;
+            }
+            if score > max {
+                max = score;
+            }
+            sum += score;
+        }
+        let avg = (sum / scores.len() as f32).clamp(0.0, 1.0);
+        Some(EvidenceQualityStats {
+            min: min.clamp(0.0, 1.0),
+            max: max.clamp(0.0, 1.0),
+            avg,
+            count: scores.len(),
+        })
+    }
+
     pub async fn get_latest_self_memory_fact(
         &self,
         key: &str,
@@ -4422,6 +4839,46 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             }
         }
         entries
+    }
+
+    pub async fn evidence_ids_are_user_anchored(&self, evidence_ids: &[i64]) -> bool {
+        if evidence_ids.is_empty() {
+            return false;
+        }
+        let mut unique: Vec<i64> = evidence_ids.iter().copied().filter(|id| *id > 0).collect();
+        unique.sort();
+        unique.dedup();
+        if unique.is_empty() {
+            return false;
+        }
+        let placeholders = unique.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT id, source_type FROM ics_evidence_events WHERE id IN ({})",
+            placeholders
+        );
+        let mut builder = sqlx::query(&query);
+        for id in unique.iter() {
+            builder = builder.bind(id);
+        }
+        let rows = builder.fetch_all(&self.pool).await.unwrap_or_default();
+        if rows.len() != unique.len() {
+            return false;
+        }
+        let mut has_user = false;
+        let mut has_non_user = false;
+        for row in rows {
+            let source_type: String = row.try_get("source_type").unwrap_or_default();
+            let lowered = source_type.trim().to_lowercase();
+            if lowered.starts_with("user") {
+                has_user = true;
+            } else {
+                has_non_user = true;
+            }
+            if has_user && has_non_user {
+                break;
+            }
+        }
+        has_user && !has_non_user
     }
 
     pub async fn create_user_utterance_evidence(
@@ -5016,6 +5473,8 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         source_ref: Option<&str>,
         snippet: &str,
         source_type: &str,
+        context_json: Option<&str>,
+        strength: Option<f64>,
     ) -> Option<i64> {
         let key = key.trim();
         let value = value.trim();
@@ -5159,9 +5618,13 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             .collect::<String>()
             .replace('\n', " ")
             .replace('\r', " ");
+        let context_json = context_json
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let strength = strength.unwrap_or(0.0).clamp(0.0, 1.0);
         let event_row = sqlx::query(
-            "INSERT INTO ics_evidence_events (belief_id, source_type, source_ref, snippet, weight, episodic_event_id)
-             VALUES (?, ?, ?, ?, ?, NULL)
+            "INSERT INTO ics_evidence_events (belief_id, source_type, source_ref, snippet, weight, episodic_event_id, context_json, strength)
+             VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
              RETURNING id",
         )
         .bind(belief_id)
@@ -5169,6 +5632,8 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         .bind(source_ref)
         .bind(&snippet)
         .bind(weight)
+        .bind(context_json)
+        .bind(strength)
         .fetch_one(&self.pool)
         .await
         .ok();
@@ -5203,6 +5668,58 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             source_ref,
             snippet,
             "system",
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn emit_system_evidence_event(
+        &self,
+        conversation_id: &str,
+        source_type: &str,
+        source_ref: Option<&str>,
+        snippet: &str,
+    ) -> Option<i64> {
+        let source_type = source_type.trim();
+        if source_type.is_empty() {
+            return None;
+        }
+        self.create_system_evidence_event_internal(
+            conversation_id,
+            "system_event",
+            source_type,
+            source_ref,
+            snippet,
+            source_type,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn emit_system_evidence_event_with_context(
+        &self,
+        conversation_id: &str,
+        source_type: &str,
+        source_ref: Option<&str>,
+        snippet: &str,
+        context_json: Option<&str>,
+        strength: Option<f64>,
+    ) -> Option<i64> {
+        let source_type = source_type.trim();
+        if source_type.is_empty() {
+            return None;
+        }
+        self.create_system_evidence_event_internal(
+            conversation_id,
+            "system_event",
+            source_type,
+            source_ref,
+            snippet,
+            source_type,
+            context_json,
+            strength,
         )
         .await
     }
@@ -5220,6 +5737,8 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             Some("memory_status"),
             snippet,
             "system",
+            None,
+            None,
         )
         .await
     }
@@ -5237,6 +5756,8 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             source_ref,
             snapshot,
             "qualia_snapshot",
+            None,
+            None,
         )
         .await;
         if let Some(event_id) = event_id {
@@ -5265,6 +5786,8 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         tool_name: &str,
         output: &str,
         snippet: &str,
+        context_json: Option<&str>,
+        strength: Option<f64>,
     ) -> Option<i64> {
         let tool_name = tool_name.trim();
         let output = output.trim();
@@ -5405,15 +5928,21 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             .collect::<String>()
             .replace('\n', " ")
             .replace('\r', " ");
+        let context_json = context_json
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let strength = strength.unwrap_or(0.0).clamp(0.0, 1.0);
         let event_row = sqlx::query(
-            "INSERT INTO ics_evidence_events (belief_id, source_type, source_ref, snippet, weight, episodic_event_id)
-             VALUES (?, 'tool', ?, ?, ?, NULL)
+            "INSERT INTO ics_evidence_events (belief_id, source_type, source_ref, snippet, weight, episodic_event_id, context_json, strength)
+             VALUES (?, 'tool', ?, ?, ?, NULL, ?, ?)
              RETURNING id",
         )
         .bind(belief_id)
         .bind(tool_name)
         .bind(&snippet)
         .bind(weight)
+        .bind(context_json)
+        .bind(strength)
         .fetch_one(&self.pool)
         .await
         .ok();
@@ -7187,6 +7716,48 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         Ok(())
     }
 
+    pub async fn create_self_model_checkpoint_with_id(
+        &self,
+        model: &SelfModel,
+        reason: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let snapshot = serde_json::json!({
+            "capabilities": model.capabilities.clone(),
+            "limitations": model.limitations.clone(),
+            "active_tools": model.active_tools.clone(),
+            "memory_health": model.memory_health.clone(),
+            "persona": model.persona.clone(),
+            "persona_daily_delta": model.persona_daily_delta.clone(),
+            "persona_last_delta_date": model.persona_last_delta_date.clone(),
+            "goals": model.goals.clone(),
+            "identity_thread": model.identity_thread.clone(),
+            "identity_confidence": model.identity_confidence,
+            "identity_uncertainty_note": model.identity_uncertainty_note.clone(),
+            "identity_updated_at": model.identity_updated_at.clone(),
+            "reflection_status": model.reflection_status.clone(),
+            "reflection_frozen": model.reflection_frozen,
+            "last_reflection_at": model.last_reflection_at.clone(),
+            "internal_state_summary": model.internal_state_summary.clone(),
+            "internal_state_map_version": model.internal_state_map_version,
+            "unified_state": model.unified_state.clone(),
+            "unified_state_evidence": model.unified_state_evidence.clone(),
+            "unified_state_updated_at": model.unified_state_updated_at.clone(),
+            "updated_at": model.updated_at.clone(),
+        })
+        .to_string();
+
+        let row = sqlx::query(
+            "INSERT INTO self_model_checkpoints (snapshot_json, reason, created_at)
+             VALUES (?, ?, CURRENT_TIMESTAMP)
+             RETURNING id",
+        )
+        .bind(snapshot)
+        .bind(reason)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("id"))
+    }
+
     pub async fn restore_last_self_model_checkpoint(&self) -> Result<Option<SelfModel>, Box<dyn std::error::Error + Send + Sync>> {
         let row = sqlx::query(
             "SELECT snapshot_json FROM self_model_checkpoints ORDER BY id DESC LIMIT 1"
@@ -8102,6 +8673,26 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         } else {
             target_type.trim()
         };
+        if !outcome_taxonomy::is_valid_outcome(target_type, verdict) {
+            let _ = system_log::log_event(
+                &self.pool,
+                None,
+                "warn",
+                "outcome",
+                run_id,
+                trace_id,
+                json!({
+                    "event": "outcome_taxonomy_violation",
+                    "target_type": target_type,
+                    "verdict": verdict,
+                    "allowed_targets": outcome_taxonomy::allowed_target_types(),
+                    "allowed_verdicts": outcome_taxonomy::allowed_verdicts(),
+                    "taxonomy_version": outcome_taxonomy::version(),
+                }),
+            )
+            .await;
+            return Err("outcome_taxonomy_violation".to_string());
+        }
         let outcome_id = Uuid::new_v4().to_string();
         let evidence_json = serde_json::to_string(evidence_event_ids).unwrap_or_else(|_| "[]".to_string());
         sqlx::query(
@@ -8135,6 +8726,48 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
                 .bind(verdict)
                 .execute(&self.pool)
                 .await;
+            }
+        }
+
+        let verdict_normalized = verdict.trim().to_lowercase();
+        let strength = match verdict_normalized.as_str() {
+            "confirm" | "success" => 0.85,
+            "disconfirm" | "failure" | "error" => 0.2,
+            "inconclusive" => 0.45,
+            _ => 0.5,
+        };
+        for evidence_event_id in evidence_event_ids.iter().copied() {
+            let _ = sqlx::query(
+                "UPDATE ics_evidence_events SET strength = max(strength, ?) WHERE id = ?",
+            )
+            .bind(strength)
+            .bind(evidence_event_id)
+            .execute(&self.pool)
+            .await;
+        }
+
+        if let Some(target_id) = candidate_id.filter(|id| !id.trim().is_empty()) {
+            let target_type = target_type.trim();
+            let target_type = if target_type.is_empty() { "decision_report" } else { target_type };
+            for evidence_event_id in evidence_event_ids.iter().copied() {
+                let _ = self
+                    .link_evidence_to_target(
+                        evidence_event_id,
+                        target_type,
+                        target_id,
+                        "caused_by",
+                    )
+                    .await;
+                if verdict_normalized == "confirm" {
+                    let _ = self
+                        .link_evidence_to_target(
+                            evidence_event_id,
+                            target_type,
+                            target_id,
+                            "validated_by",
+                        )
+                        .await;
+                }
             }
         }
 
@@ -8407,6 +9040,39 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         Ok(())
     }
 
+    pub async fn link_evidence_to_target(
+        &self,
+        evidence_event_id: i64,
+        target_type: &str,
+        target_id: &str,
+        relation: &str,
+    ) -> Result<(), String> {
+        let target_type = target_type.trim();
+        let target_id = target_id.trim();
+        if target_type.is_empty() || target_id.is_empty() {
+            return Ok(());
+        }
+        let Some(evidence_id) = self.ensure_evidence_source_for_event(evidence_event_id).await else {
+            return Ok(());
+        };
+        let relation = relation.trim();
+        let relation = if relation.is_empty() { "supports" } else { relation };
+        let link_id = format!("link:{}:{}:{}:{}", evidence_id, target_type, target_id, relation);
+        sqlx::query(
+            "INSERT OR IGNORE INTO evidence_links (link_id, evidence_id, target_type, target_id, relation, created_at)
+             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        )
+        .bind(&link_id)
+        .bind(&evidence_id)
+        .bind(target_type)
+        .bind(target_id)
+        .bind(relation)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub async fn set_action_proposal_state(
         &self,
         proposal_id: &str,
@@ -8662,6 +9328,202 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
             });
         }
         Ok(snapshots)
+    }
+
+    pub async fn insert_baseline_metrics(
+        &self,
+        baseline_id: &str,
+        window_minutes: i64,
+        window_start: &str,
+        window_end: &str,
+        metrics_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query(
+            "INSERT INTO baseline_metrics
+             (baseline_id, window_minutes, window_start, window_end, metrics_json)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(baseline_id)
+        .bind(window_minutes)
+        .bind(window_start)
+        .bind(window_end)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_baseline_metrics(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<BaselineMetricsSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        let limit = limit.max(1).min(200);
+        let rows = sqlx::query(
+            "SELECT baseline_id, window_minutes, window_start, window_end, metrics_json, created_at
+             FROM baseline_metrics
+             ORDER BY datetime(created_at) DESC, rowid DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            snapshots.push(BaselineMetricsSnapshot {
+                baseline_id: row.get("baseline_id"),
+                window_minutes: row.get::<i64, _>("window_minutes"),
+                window_start: row.get("window_start"),
+                window_end: row.get("window_end"),
+                metrics_json: row.get("metrics_json"),
+                created_at: row.get("created_at"),
+            });
+        }
+        Ok(snapshots)
+    }
+
+    pub async fn get_latest_baseline_metrics(
+        &self,
+    ) -> Result<Option<BaselineMetricsSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = sqlx::query(
+            "SELECT baseline_id, window_minutes, window_start, window_end, metrics_json, created_at
+             FROM baseline_metrics
+             ORDER BY datetime(created_at) DESC, rowid DESC
+             LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| BaselineMetricsSnapshot {
+            baseline_id: row.get("baseline_id"),
+            window_minutes: row.get::<i64, _>("window_minutes"),
+            window_start: row.get("window_start"),
+            window_end: row.get("window_end"),
+            metrics_json: row.get("metrics_json"),
+            created_at: row.get("created_at"),
+        }))
+    }
+
+    pub async fn insert_recommendation_event(
+        &self,
+        recommendation_id: &str,
+        conversation_id: Option<&str>,
+        kind: &str,
+        status: &str,
+        snapshot_id: Option<&str>,
+        action_json: Option<&str>,
+        gate_json: Option<&str>,
+        recovery_metric: Option<&str>,
+        recovery_target: Option<f64>,
+        baseline_value: Option<f64>,
+        resolved_value: Option<f64>,
+        time_to_recovery_ms: Option<i64>,
+    ) -> Result<RecommendationEvent, Box<dyn std::error::Error + Send + Sync>> {
+        let event_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO recommendation_events
+             (event_id, recommendation_id, conversation_id, kind, status, snapshot_id, action_json, gate_json, recovery_metric, recovery_target, baseline_value, resolved_value, time_to_recovery_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&event_id)
+        .bind(recommendation_id)
+        .bind(conversation_id)
+        .bind(kind)
+        .bind(status)
+        .bind(snapshot_id)
+        .bind(action_json)
+        .bind(gate_json)
+        .bind(recovery_metric)
+        .bind(recovery_target)
+        .bind(baseline_value)
+        .bind(resolved_value)
+        .bind(time_to_recovery_ms)
+        .execute(&self.pool)
+        .await?;
+
+        let created_at = Utc::now().to_rfc3339();
+        Ok(RecommendationEvent {
+            event_id,
+            recommendation_id: recommendation_id.to_string(),
+            conversation_id: conversation_id.map(|s| s.to_string()),
+            kind: kind.to_string(),
+            status: status.to_string(),
+            snapshot_id: snapshot_id.map(|s| s.to_string()),
+            action_json: action_json.map(|s| s.to_string()),
+            gate_json: gate_json.map(|s| s.to_string()),
+            recovery_metric: recovery_metric.map(|s| s.to_string()),
+            recovery_target,
+            baseline_value,
+            resolved_value,
+            time_to_recovery_ms,
+            created_at,
+        })
+    }
+
+    pub async fn list_recommendation_events(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<RecommendationEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let limit = limit.max(1).min(500);
+        let rows = sqlx::query(
+            "SELECT event_id, recommendation_id, conversation_id, kind, status, snapshot_id, action_json, gate_json, recovery_metric, recovery_target, baseline_value, resolved_value, time_to_recovery_ms, created_at
+             FROM recommendation_events
+             ORDER BY datetime(created_at) DESC, rowid DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(RecommendationEvent {
+                event_id: row.get("event_id"),
+                recommendation_id: row.get("recommendation_id"),
+                conversation_id: row.try_get("conversation_id").ok(),
+                kind: row.get("kind"),
+                status: row.get("status"),
+                snapshot_id: row.try_get("snapshot_id").ok(),
+                action_json: row.try_get("action_json").ok(),
+                gate_json: row.try_get("gate_json").ok(),
+                recovery_metric: row.try_get("recovery_metric").ok(),
+                recovery_target: row.try_get("recovery_target").ok(),
+                baseline_value: row.try_get("baseline_value").ok(),
+                resolved_value: row.try_get("resolved_value").ok(),
+                time_to_recovery_ms: row.try_get("time_to_recovery_ms").ok(),
+                created_at: row.get("created_at"),
+            });
+        }
+        Ok(events)
+    }
+
+    pub async fn get_latest_recommendation_event(
+        &self,
+        recommendation_id: &str,
+    ) -> Result<Option<RecommendationEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = sqlx::query(
+            "SELECT event_id, recommendation_id, conversation_id, kind, status, snapshot_id, action_json, gate_json, recovery_metric, recovery_target, baseline_value, resolved_value, time_to_recovery_ms, created_at
+             FROM recommendation_events
+             WHERE recommendation_id = ?
+             ORDER BY datetime(created_at) DESC, rowid DESC
+             LIMIT 1",
+        )
+        .bind(recommendation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| RecommendationEvent {
+            event_id: row.get("event_id"),
+            recommendation_id: row.get("recommendation_id"),
+            conversation_id: row.try_get("conversation_id").ok(),
+            kind: row.get("kind"),
+            status: row.get("status"),
+            snapshot_id: row.try_get("snapshot_id").ok(),
+            action_json: row.try_get("action_json").ok(),
+            gate_json: row.try_get("gate_json").ok(),
+            recovery_metric: row.try_get("recovery_metric").ok(),
+            recovery_target: row.try_get("recovery_target").ok(),
+            baseline_value: row.try_get("baseline_value").ok(),
+            resolved_value: row.try_get("resolved_value").ok(),
+            time_to_recovery_ms: row.try_get("time_to_recovery_ms").ok(),
+            created_at: row.get("created_at"),
+        }))
     }
 
     pub async fn search_conversation_summary_chunks(
@@ -9994,6 +10856,64 @@ thread_max_depth = ?, allow_shell_tool = ?, shell_command_allowlist = ?, ask_bud
         tx.commit().await.map_err(|e| e.to_string())?;
 
         Ok(ids.len() as i64)
+    }
+
+    pub async fn purge_evidence_events_older_than(&self, days: i64) -> Result<i64, String> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let window = format!("-{} days", days.max(1));
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+
+        let count_ics: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ics_evidence_events WHERE datetime(created_at) < datetime('now', ?)",
+        )
+        .bind(&window)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        let count_self: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM self_evidence_events WHERE datetime(created_at) < datetime('now', ?)",
+        )
+        .bind(&window)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+
+        let _ = sqlx::query(
+            "DELETE FROM evidence_links
+             WHERE evidence_id IN (
+                 SELECT evidence_id FROM evidence_sources WHERE datetime(created_at) < datetime('now', ?)
+             )",
+        )
+        .bind(&window)
+        .execute(&mut *tx)
+        .await;
+        let _ = sqlx::query(
+            "DELETE FROM evidence_sources WHERE datetime(created_at) < datetime('now', ?)",
+        )
+        .bind(&window)
+        .execute(&mut *tx)
+        .await;
+        let _ = sqlx::query(
+            "DELETE FROM ics_evidence_events WHERE datetime(created_at) < datetime('now', ?)",
+        )
+        .bind(&window)
+        .execute(&mut *tx)
+        .await;
+        let _ = sqlx::query(
+            "DELETE FROM self_evidence_events WHERE datetime(created_at) < datetime('now', ?)",
+        )
+        .bind(&window)
+        .execute(&mut *tx)
+        .await;
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(count_ics + count_self)
     }
 
     pub async fn backfill_state_disclosure_metadata(&self) -> Result<i64, String> {
@@ -11430,6 +12350,7 @@ fn parse_hypotheses_json(
                         speculative: false,
                         evidence_event_ids: Vec::new(),
                         belief_ids: Vec::new(),
+                        evidence_quality: None,
                     })
                 }
             })

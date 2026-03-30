@@ -8,7 +8,7 @@ use super::arbitration::{
 };
 use crate::core::sensitivity::{phi_consent_allowed, redact_sensitive_text, redact_sensitive_json};
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -48,6 +48,7 @@ struct RateLimitState {
 
 const PROMPT_TRIM_CRITICAL_WINDOW_SECS: u64 = 60;
 const MONOLOGUE_PARSE_FAIL_WINDOW_SECS: u64 = 30;
+const PLAN_STEP_FAILURE_THRESHOLD: i64 = 2;
 
 static PROMPT_TRIM_CRITICAL_RATE: Lazy<StdMutex<HashMap<String, RateLimitState>>> =
     Lazy::new(|| StdMutex::new(HashMap::new()));
@@ -546,6 +547,20 @@ fn extract_plan_id_from_step_id(step_id: &str) -> Option<String> {
     }
 }
 
+fn extract_step_index_from_step_id(step_id: &str) -> Option<usize> {
+    let trimmed = step_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (_, last) = trimmed.rsplit_once(':')?;
+    let idx = last.trim().parse::<i64>().ok()?;
+    if idx <= 0 {
+        None
+    } else {
+        Some((idx - 1) as usize)
+    }
+}
+
 fn append_uncertainty_marker(content: &str, _controller_state: Option<&ControllerState>) -> String {
     // UX: never append evidence markers to user-visible responses.
     content.to_string()
@@ -914,6 +929,21 @@ fn ensure_candidate_evidence_fields(payload: &mut Value) {
         }
         obj.insert("belief_ids".to_string(), json!(ids));
     }
+}
+
+pub(crate) fn append_candidate_evidence_id(candidate: &mut Candidate, evidence_id: i64) {
+    if evidence_id <= 0 {
+        return;
+    }
+    if let Some(obj) = candidate.payload.as_object_mut() {
+        let entry = obj.entry("evidence_event_ids".to_string()).or_insert(json!([]));
+        if let Some(arr) = entry.as_array_mut() {
+            if !arr.iter().any(|v| v.as_i64() == Some(evidence_id)) {
+                arr.push(json!(evidence_id));
+            }
+        }
+    }
+    candidate.refresh_meta();
 }
 
 fn coerce_prediction_response(value: &Value) -> PredictionResponse {
@@ -1459,11 +1489,53 @@ impl Kernel {
                 })
             })
             .collect::<Vec<_>>();
+        let conversation_id = if let Some(run_id) = run_id {
+            sqlx::query_scalar::<_, String>(
+                "SELECT conversation_id FROM runs WHERE run_id = ?",
+            )
+            .bind(run_id)
+            .fetch_optional(&self.db.pool)
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
         let mut evidence_event_ids = Vec::new();
         for candidate in &decision.accepted {
             evidence_event_ids.extend(extract_id_list(&candidate.payload, "evidence_event_ids"));
         }
-        let evidence_event_ids = normalize_id_list(&evidence_event_ids);
+        let mut evidence_event_ids = normalize_id_list(&evidence_event_ids);
+        if evidence_event_ids.is_empty() {
+            if let Some(conversation_id) = conversation_id.as_deref() {
+                let payload = json!({
+                    "run_id": run_id,
+                    "reason": "missing_evidence",
+                });
+                let context_json = serde_json::to_string(&payload).ok();
+                if let Some(event_id) = self
+                    .db
+                    .emit_system_evidence_event_with_context(
+                        conversation_id,
+                        "missing_evidence",
+                        run_id,
+                        "missing evidence for decision report",
+                        context_json.as_deref(),
+                        Some(0.1),
+                    )
+                    .await
+                {
+                    evidence_event_ids.push(event_id);
+                    if let Some(run_id) = run_id {
+                        let _ = self
+                            .db
+                            .link_evidence_to_target(event_id, "run", run_id, "supports")
+                            .await;
+                    }
+                }
+            }
+            evidence_event_ids = normalize_id_list(&evidence_event_ids);
+        }
         let _ = system_log::log_event(
             &self.db.pool,
             Some(&self.app_handle),
@@ -1487,6 +1559,10 @@ impl Kernel {
                 "snapshot_hash": report.snapshot_hash,
                 "gate_decision_id": report.gate_decision_id,
                 "gate_decision": report.gate_decision,
+                "gate_penalty": report.gate_penalty,
+                "gate_penalty_reasons": report.gate_penalty_reasons,
+                "soft_gate_decision": report.soft_gate_decision,
+                "soft_gate_reasons": report.soft_gate_reasons,
                 "verification_outcome": report.verification_outcome,
                 "verification_reasons": report.verification_reasons,
                 "verification_confidence": report.verification_confidence,
@@ -1523,19 +1599,6 @@ impl Kernel {
               }),
           )
           .await;
-
-        let conversation_id = if let Some(run_id) = run_id {
-            sqlx::query_scalar::<_, String>(
-                "SELECT conversation_id FROM runs WHERE run_id = ?",
-            )
-            .bind(run_id)
-            .fetch_optional(&self.db.pool)
-            .await
-            .ok()
-            .flatten()
-        } else {
-            None
-        };
         let mut report_value = serde_json::to_value(report).unwrap_or_else(|_| json!({}));
         if let Some(obj) = report_value.as_object_mut() {
             obj.insert("candidate_scores".to_string(), json!(candidate_scores));
@@ -2932,7 +2995,7 @@ impl Kernel {
         };
         let intent: String = row.try_get("intent").unwrap_or_default();
         let steps_json: String = row.try_get("steps_json").unwrap_or_default();
-        let mut steps: Vec<crate::models::GoalStep> = Vec::new();
+        let mut step_texts: Vec<String> = Vec::new();
         if let Ok(value) = serde_json::from_str::<Value>(&steps_json) {
             if let Some(list) = value.get("steps").and_then(|v| v.as_array()) {
                 for (idx, step) in list.iter().enumerate() {
@@ -2944,44 +3007,14 @@ impl Kernel {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| format!("Step {}", idx + 1));
-                    steps.push(crate::models::GoalStep {
-                        text,
-                        status: None,
-                        evidence_event_ids: Vec::new(),
-                        belief_ids: Vec::new(),
-                        completed_at: None,
-                    });
-                    if steps.len() >= 6 {
+                    step_texts.push(text);
+                    if step_texts.len() >= 6 {
                         break;
                     }
                 }
             }
         }
-        if steps.is_empty() {
-            steps = vec![
-                crate::models::GoalStep {
-                    text: "Clarify objective and constraints".to_string(),
-                    status: None,
-                    evidence_event_ids: Vec::new(),
-                    belief_ids: Vec::new(),
-                    completed_at: None,
-                },
-                crate::models::GoalStep {
-                    text: "Execute the next concrete step".to_string(),
-                    status: None,
-                    evidence_event_ids: Vec::new(),
-                    belief_ids: Vec::new(),
-                    completed_at: None,
-                },
-                crate::models::GoalStep {
-                    text: "Verify outcome and capture evidence".to_string(),
-                    status: None,
-                    evidence_event_ids: Vec::new(),
-                    belief_ids: Vec::new(),
-                    completed_at: None,
-                },
-            ];
-        }
+        let steps = Self::build_goal_steps(step_texts);
         let goal_text = if intent.trim().is_empty() {
             format!("Plan: {}", plan_id)
         } else {
@@ -3028,6 +3061,247 @@ impl Kernel {
         .await;
     }
 
+    #[allow(dead_code)]
+    fn sanitize_plan_step_text(text: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let mut cleaned = trimmed.trim_end_matches(|c: char| c == '.' || c == ';' || c == ',').trim().to_string();
+        if cleaned.len() > 160 {
+            cleaned = summarize_snippet(&cleaned, 160);
+        }
+        cleaned
+    }
+
+    #[allow(dead_code)]
+    fn extract_bulleted_steps(input: &str) -> Vec<String> {
+        let mut steps = Vec::new();
+        for line in input.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut content: Option<&str> = None;
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                content = Some(rest);
+            } else if let Some(rest) = trimmed.strip_prefix("* ") {
+                content = Some(rest);
+            } else {
+                let mut digits = String::new();
+                for ch in trimmed.chars() {
+                    if ch.is_ascii_digit() {
+                        digits.push(ch);
+                    } else {
+                        break;
+                    }
+                }
+                if !digits.is_empty() {
+                    let rest = trimmed[digits.len()..].trim_start();
+                    if rest.starts_with('.') || rest.starts_with(')') {
+                        let rest = rest[1..].trim_start();
+                        if !rest.is_empty() {
+                            content = Some(rest);
+                        }
+                    }
+                }
+            }
+            if let Some(content) = content {
+                let cleaned = Self::sanitize_plan_step_text(content);
+                if !cleaned.is_empty() {
+                    steps.push(cleaned);
+                }
+            }
+        }
+        steps
+    }
+
+    #[allow(dead_code)]
+    fn extract_sentence_steps(input: &str) -> Vec<String> {
+        let mut steps = Vec::new();
+        for segment in input.split(|c| c == '.' || c == '!' || c == '?') {
+            let cleaned = Self::sanitize_plan_step_text(segment);
+            if !cleaned.is_empty() {
+                steps.push(cleaned);
+            }
+        }
+        steps
+    }
+
+    fn parse_plan_steps_from_input(input: &str) -> Vec<String> {
+        planner::parse_plan_steps_from_input(input)
+    }
+
+    fn goal_status_complete(status: Option<&str>) -> bool {
+        let Some(status) = status else {
+            return false;
+        };
+        matches!(
+            status.trim().to_lowercase().as_str(),
+            "done" | "complete" | "completed" | "finished"
+        )
+    }
+
+    fn build_goal_steps(step_texts: Vec<String>) -> Vec<crate::models::GoalStep> {
+        planner::build_goal_steps(step_texts)
+    }
+
+    fn plan_goal_text(input: &str) -> String {
+        planner::plan_goal_text(input)
+    }
+
+    fn plan_hash(goal: &str, steps: &[crate::models::GoalStep]) -> String {
+        planner::plan_hash(goal, steps)
+    }
+
+    fn tokenize_plan_text(text: &str) -> HashSet<String> {
+        planner::tokenize_plan_text(text)
+    }
+
+    fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
+        planner::jaccard_similarity(a, b)
+    }
+
+    fn payload_step_index(payload: &Value) -> Option<usize> {
+        planner::payload_step_index(payload)
+    }
+
+    async fn maybe_build_deterministic_plan(
+        &self,
+        state: &mut KernelState,
+        input: &str,
+        input_kind: CoreInputKind,
+        settings: &crate::models::Settings,
+        conversation_id: &str,
+        run_id: &str,
+        trace_id: &str,
+    ) {
+        if !settings.planner_enabled.unwrap_or(true) {
+            return;
+        }
+        if !matches!(input_kind, CoreInputKind::User) {
+            return;
+        }
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let explicit_plan = {
+            let lower = trimmed.to_lowercase();
+            ["plan", "steps", "roadmap", "strategy", "phase"]
+                .iter()
+                .any(|k| lower.contains(k))
+        };
+        let has_active_goal = state
+            .workspace_goal_stack
+            .iter()
+            .any(|item| !Self::goal_status_complete(item.status.as_deref()));
+        if has_active_goal && !explicit_plan {
+            return;
+        }
+        let step_texts = Self::parse_plan_steps_from_input(trimmed);
+        if step_texts.len() < 2 && !explicit_plan && trimmed.len() < 140 {
+            return;
+        }
+        let steps = Self::build_goal_steps(step_texts);
+        let goal_text = Self::plan_goal_text(trimmed);
+        let plan_hash = Self::plan_hash(&goal_text, &steps);
+        let created_at = Utc::now().to_rfc3339();
+        let mut goal_item = crate::models::GoalStackItem {
+            goal: goal_text.clone(),
+            steps,
+            current_step_index: 0,
+            status: None,
+            evidence_event_ids: Vec::new(),
+            belief_ids: Vec::new(),
+            updated_at: Some(created_at.clone()),
+        };
+
+        let payload = json!({
+            "goal": goal_text,
+            "plan_hash": plan_hash,
+            "step_count": goal_item.steps.len(),
+            "current_step_index": goal_item.current_step_index,
+        });
+        let snippet = format!("plan created goal={} steps={}", goal_item.goal, goal_item.steps.len());
+        if let Some(event_id) = self
+            .emit_system_evidence(
+                state,
+                settings,
+                conversation_id,
+                "planner_plan_created",
+                Some(run_id),
+                &snippet,
+                Some(&payload),
+            )
+            .await
+        {
+            goal_item.evidence_event_ids.push(event_id);
+            let meta = state
+                .workspace_meta
+                .goal_thread
+                .get_or_insert_with(WorkspaceFieldMeta::default);
+            if !meta.evidence_event_ids.contains(&event_id) {
+                meta.evidence_event_ids.push(event_id);
+            }
+        }
+
+        state.workspace_goal_thread = Some(goal_item.goal.clone());
+        state.workspace_goal_stack = vec![goal_item];
+        ensure_workspace_meta_alignment(state);
+        state.last_plan_hash = Some(plan_hash.clone());
+        let runtime = state.workspace_meta.runtime.get_or_insert_with(|| json!({}));
+        if let Some(obj) = runtime.as_object_mut() {
+            obj.insert(
+                "planner".to_string(),
+                json!({
+                    "goal": state.workspace_goal_thread.clone(),
+                    "plan_hash": plan_hash,
+                    "step_count": state.workspace_goal_stack.first().map(|g| g.steps.len()).unwrap_or(0),
+                    "current_step_index": state.workspace_goal_stack.first().map(|g| g.current_step_index).unwrap_or(0),
+                    "evidence_event_ids": state.workspace_goal_stack.first().map(|g| g.evidence_event_ids.clone()).unwrap_or_default(),
+                    "updated_at": created_at,
+                }),
+            );
+        }
+
+        let workspace_state = crate::models::WorkspaceState {
+            conversation_id: conversation_id.to_string(),
+            goal_thread: state.workspace_goal_thread.clone(),
+            active_plan_id: state.workspace_active_plan_id.clone(),
+            goal_stack: state.workspace_goal_stack.clone(),
+            open_questions: state.workspace_open_questions.clone(),
+            active_hypotheses: state.workspace_active_hypotheses.clone(),
+            working_set_topics: state.workspace_working_set_topics.clone(),
+            current_focus: state.workspace_current_focus.clone(),
+            focus_rationale: state.workspace_focus_rationale.clone(),
+            workspace_meta: state.workspace_meta.clone(),
+            updated_at: None,
+        };
+        let _ = self.db.set_workspace_state(&workspace_state).await;
+        self.persist_state(state).await;
+        let _ = system_log::log_event(
+            &self.db.pool,
+            Some(&self.app_handle),
+            "info",
+            "kernel",
+            Some(run_id),
+            Some(trace_id),
+            json!({
+                "event": "planner_plan_created",
+                "conversation_id": conversation_id,
+                "goal": goal_text,
+                "plan_hash": plan_hash,
+                "step_count": state.workspace_goal_stack.first().map(|g| g.steps.len()).unwrap_or(0),
+            }),
+        )
+        .await;
+    }
+
+    fn assign_plan_step_indices(&self, candidates: &mut [Candidate], state: &KernelState) {
+        planner::assign_plan_step_indices(candidates, state);
+    }
+
     pub(super) async fn run_input_once(
         &self,
         input: String,
@@ -3056,6 +3330,54 @@ impl Kernel {
         self.sync_self_model_runtime(&settings).await;
         self.maybe_seed_telemetry_snapshot(Some(&run_id), Some(&trace_id)).await;
         let mut state = self.load_state(&conversation_id).await;
+        self.reset_evidence_emit_budget(&mut state, &settings);
+        let retention_days = settings.evidence_retention_days.unwrap_or(30);
+        if retention_days > 0 {
+            let purge_needed = self
+                .db
+                .get_key("evidence_purge_last_at")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
+                .map(|ts| {
+                    let now = Utc::now();
+                    now.signed_duration_since(ts.with_timezone(&Utc)).num_seconds() > 86_400
+                })
+                .unwrap_or(true);
+            if purge_needed {
+                if let Ok(count) = self.db.purge_evidence_events_older_than(retention_days as i64).await {
+                    let _ = self
+                        .db
+                        .set_key("evidence_purge_last_at", &Utc::now().to_rfc3339())
+                        .await;
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "kernel",
+                        Some(&run_id),
+                        Some(&trace_id),
+                        json!({
+                            "event": "evidence_purged",
+                            "purged_count": count,
+                            "retention_days": retention_days,
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+        self.maybe_build_deterministic_plan(
+            &mut state,
+            &input,
+            input_kind,
+            &settings,
+            &conversation_id,
+            &run_id,
+            &trace_id,
+        )
+        .await;
         let mut anchor_shift_event: Option<AnchorShiftEvent> = None;
         let explicit_feedback = original_input
             .as_deref()
@@ -3584,6 +3906,120 @@ impl Kernel {
             state.self_state.updated_at = Some(now.to_rfc3339());
         }
 
+        let mut input_evidence_ids: Vec<i64> = Vec::new();
+        if settings.evidence_auto_capture.unwrap_or(true) {
+            match input_kind {
+                CoreInputKind::User => {
+                    if settings.enable_user_utterance_evidence.unwrap_or(true) {
+                        if state.last_user_message_id.is_none() {
+                            if let Ok(Some(message_id)) = self.db.get_user_message_id_for_run(&run_id).await {
+                                state.last_user_message_id = Some(message_id);
+                            }
+                        }
+                        let message_id = state.last_user_message_id.clone();
+                        let payload = json!({
+                            "content": input.clone(),
+                            "message_id": message_id,
+                            "source": input_source,
+                            "kind": "user_message",
+                        });
+                        let snippet = summarize_snippet(&input, 160);
+                        if let Some(event_id) = self
+                            .emit_system_evidence(
+                                &mut state,
+                                &settings,
+                                &conversation_id,
+                                "user_message",
+                                Some(&run_id),
+                                &snippet,
+                                Some(&payload),
+                            )
+                            .await
+                        {
+                            input_evidence_ids.push(event_id);
+                            let _ = self
+                                .db
+                                .link_evidence_to_target(event_id, "run", &run_id, "supports")
+                                .await;
+                            if let Some(message_id) = message_id.as_deref() {
+                                let _ = self
+                                    .db
+                                    .link_evidence_to_target(event_id, "message", message_id, "supports")
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                CoreInputKind::ToolResult | CoreInputKind::ToolError => {
+                    let mut existing_id: Option<i64> = None;
+                    if let Ok(row) = sqlx::query_scalar::<_, i64>(
+                        "SELECT evidence_event_id
+                         FROM tool_dispatches
+                         WHERE run_id = ? AND tool_name = ? AND evidence_event_id IS NOT NULL
+                         ORDER BY datetime(updated_at) DESC, action_id DESC
+                         LIMIT 1",
+                    )
+                    .bind(&run_id)
+                    .bind(input_source)
+                    .fetch_optional(&self.db.pool)
+                    .await
+                    {
+                        existing_id = row;
+                    }
+                    if let Some(event_id) = existing_id {
+                        input_evidence_ids.push(event_id);
+                    } else {
+                        let is_error = matches!(input_kind, CoreInputKind::ToolError);
+                        let payload = json!({
+                            "tool_name": input_source,
+                            "output": input.clone(),
+                            "is_error": is_error,
+                        });
+                        let snippet = format!(
+                            "tool_result_input {} {}",
+                            input_source,
+                            if is_error { "error" } else { "success" }
+                        );
+                        let source_type = if is_error { "tool_result_error" } else { "tool_result" };
+                        if let Some(event_id) = self
+                            .emit_system_evidence(
+                                &mut state,
+                                &settings,
+                                &conversation_id,
+                                source_type,
+                                Some(&run_id),
+                                &snippet,
+                                Some(&payload),
+                            )
+                            .await
+                        {
+                            input_evidence_ids.push(event_id);
+                            let _ = self
+                                .db
+                                .link_evidence_to_target(event_id, "run", &run_id, "supports")
+                                .await;
+                        }
+                    }
+                }
+                CoreInputKind::SystemContext => {}
+            }
+        }
+        state.last_input_evidence_event_ids = input_evidence_ids.clone();
+        if settings.context_extraction_boost.unwrap_or(true) {
+            self.apply_context_extraction(
+                &mut state,
+                &settings,
+                &conversation_id,
+                &run_id,
+                &trace_id,
+                &input,
+                input_kind,
+                input_source,
+                &input_evidence_ids,
+            )
+            .await;
+        }
+
         self.refresh_controller_state(&mut state, &settings).await;
         let original_input = original_input.or_else(|| state.last_user_input.clone());
         self.refresh_research_budget(&mut state, &settings);
@@ -3619,6 +4055,7 @@ impl Kernel {
             source: input_source.to_string(),
             failure_kind: None,
             target_key: None,
+            tags: Vec::new(),
             action_id: None,
             timestamp: now.to_rfc3339(),
         };
@@ -3940,6 +4377,10 @@ impl Kernel {
                     source: "user_feedback".to_string(),
                     failure_kind: None,
                     target_key: None,
+                    tags: vec![
+                        "candidate_kind::EmitMessage".to_string(),
+                        format!("feedback::{}", kind.as_str()),
+                    ],
                     action_id: assistant_message_id,
                     timestamp: now.to_rfc3339(),
                 });
@@ -4163,6 +4604,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                         wave_context,
                         qualia_context,
                         residual_context,
+                        None,
                         Some(&run_id),
                     );
                     self.defer_throttled_tools(&mut decision, &decision_state).await;
@@ -6047,6 +6489,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     speculative: false,
                     evidence_event_ids: Vec::new(),
                     belief_ids: Vec::new(),
+                    evidence_quality: None,
                 };
                 candidates.push(self.make_candidate(
                     CandidateKind::UpdateWorkspace,
@@ -6302,6 +6745,90 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             .await;
         }
 
+        self.assign_plan_step_indices(&mut candidates, &state);
+        let mut plan_rejected: Vec<RejectedCandidate> = Vec::new();
+        if settings.planner_enabled.unwrap_or(true) {
+            if let Some(active_goal) = planner::active_goal(&state) {
+                let (filtered, rejected) = planner::filter_candidates_for_active_step(&state, candidates);
+                let kept_count = filtered.len();
+                let rejected_count = rejected.len();
+                if rejected_count > 0 {
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "kernel",
+                        Some(&run_id),
+                        Some(&trace_id),
+                        json!({
+                            "event": "plan_step_filter_applied",
+                            "kept": kept_count,
+                            "rejected": rejected_count,
+                            "current_step_index": active_goal.current_step_index,
+                            "goal": active_goal.goal,
+                        }),
+                    )
+                    .await;
+                }
+                candidates = filtered;
+                plan_rejected = rejected;
+                if candidates.is_empty() {
+                    let step_idx = active_goal
+                        .current_step_index
+                        .min(active_goal.steps.len().saturating_sub(1));
+                    let question = if let Some(step) = active_goal.steps.get(step_idx) {
+                        format!("What is the next step for: {}? (Current: {})", active_goal.goal, step.text)
+                    } else {
+                        format!("What is the next step for: {}?", active_goal.goal)
+                    };
+                    let mut payload = json!({
+                        "question": question,
+                        "content": question,
+                        "step_index": (step_idx + 1) as i64,
+                    });
+                    if let Some(step) = active_goal.steps.get(step_idx) {
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert("plan_step_text".to_string(), Value::String(step.text.clone()));
+                        }
+                    }
+                    let step_id = if let Some(active_plan_id) = state.workspace_active_plan_id.as_deref() {
+                        format!("{}:{}", active_plan_id, step_idx + 1)
+                    } else if let Some(hash) = state.last_plan_hash.as_ref() {
+                        format!("{}:{}", hash, step_idx + 1)
+                    } else {
+                        String::new()
+                    };
+                    if !step_id.is_empty() {
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert("plan_step_id".to_string(), Value::String(step_id));
+                        }
+                    }
+                    let fallback = self.make_candidate(
+                        CandidateKind::AskUserQuestion,
+                        payload,
+                        "planner",
+                        &mut created_at,
+                    );
+                    candidates.push(fallback);
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "warn",
+                        "kernel",
+                        Some(&run_id),
+                        Some(&trace_id),
+                        json!({
+                            "event": "plan_step_filter_fallback",
+                            "reason": "no_candidates_for_step",
+                            "current_step_index": step_idx,
+                            "goal": active_goal.goal,
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+
         let pipeline_mode = kernel_pipeline_mode();
         let arbitration = match pipeline_mode {
             KernelPipelineMode::Legacy => {
@@ -6338,6 +6865,15 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             }
         };
         let mut decision = arbitration.decision;
+        if !plan_rejected.is_empty() {
+            decision
+                .report
+                .blocked_candidates_count = decision
+                .report
+                .blocked_candidates_count
+                .saturating_add(plan_rejected.len());
+            decision.rejected.extend(plan_rejected);
+        }
         let mut inline_pending: Option<PendingPromptSelection> = None;
         let allow_inline_monologue = !matches!(input_kind, CoreInputKind::User);
         let response_ready = !response_content_no_tags.trim().is_empty();
@@ -6736,6 +7272,27 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             )
             .await;
             for tool_dispatch in commit_result.tool_dispatches.iter() {
+                let dispatch_payload = json!({
+                    "tool_name": tool_dispatch.tool_name,
+                    "action_id": tool_dispatch.action_id,
+                    "args_hash": hash_payload(&tool_dispatch.args_json),
+                    "plan_step_id": tool_dispatch.plan_step_id,
+                });
+                let dispatch_snippet = format!(
+                    "tool_dispatch {} action={}",
+                    tool_dispatch.tool_name, tool_dispatch.action_id
+                );
+                let _ = self
+                    .emit_system_evidence(
+                        &mut state,
+                        &settings,
+                        &conversation_id,
+                        "tool_dispatch",
+                        Some(&run_id),
+                        &dispatch_snippet,
+                        Some(&dispatch_payload),
+                    )
+                    .await;
                 let tool_started = Instant::now();
                 tool_result = self
                     .dispatch_tool(
@@ -6749,6 +7306,29 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     if result.is_error {
                         tool_failed = true;
                     }
+                    let result_payload = json!({
+                        "tool_name": result.tool_name,
+                        "action_id": tool_dispatch.action_id,
+                        "output": result.output,
+                        "is_error": result.is_error,
+                    });
+                    let snippet = format!(
+                        "tool_result {} {}",
+                        result.tool_name,
+                        if result.is_error { "error" } else { "success" }
+                    );
+                    let source_type = if result.is_error { "tool_result_error" } else { "tool_result" };
+                    let _ = self
+                        .emit_system_evidence(
+                            &mut state,
+                            &settings,
+                            &conversation_id,
+                            source_type,
+                            Some(&run_id),
+                            &snippet,
+                            Some(&result_payload),
+                        )
+                        .await;
                 }
                 tool_ms += tool_started.elapsed().as_millis() as i64;
             }
@@ -11475,9 +12055,12 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             let anchor_vocab = build_anchor_vocab(state, &tool_names);
             let anchor_hits = count_anchor_hits(&candidate_relevance_text(selected), &anchor_vocab);
             let signals = self
-                .compute_gate_signals(state, &subject_state, Some(&decision), selected, anchor_hits, settings)
+                .compute_gate_signals_score(state, &subject_state, Some(&decision), selected, anchor_hits, settings)
                 .await;
-            let soft_gate = subject_controller::build_gate_decision(&subject_state, selected, &state.stop_state, &signals);
+            self.commit_gate_signal_state(state, &signals);
+
+            let soft_gate =
+                subject_controller::build_gate_decision(&subject_state, selected, &state.stop_state, &signals);
             let legacy_gate =
                 subject_controller::build_gate_decision_legacy(&subject_state, selected, &state.stop_state);
             let soft_decision = soft_gate.decision.clone();
@@ -11485,12 +12068,108 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             let rollout_percent = settings.gate_rollout_percent.unwrap_or(100).clamp(0, 100);
             let shadow_mode = settings.gate_shadow_mode.unwrap_or(false);
             let rollout_bucket = gate_rollout_bucket(conversation_id);
-            let use_soft_gate = !shadow_mode && (rollout_percent >= 100 || rollout_bucket < rollout_percent);
-            let (gate, _shadow_gate) = if use_soft_gate {
-                (soft_gate, legacy_gate)
+            let gate_penalty_enabled = settings.gate_penalty_integration.unwrap_or(true);
+            let use_soft_gate = gate_penalty_enabled
+                && !shadow_mode
+                && (rollout_percent >= 100 || rollout_bucket < rollout_percent);
+
+            let soft_reasons: Vec<String> = serde_json::from_str::<Value>(&soft_gate.evidence_refs_json)
+                .ok()
+                .and_then(|v| v.get("reasons").and_then(|r| r.as_array()).cloned())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str())
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let soft_penalty = if use_soft_gate {
+                crate::core::subject_controller::gate_penalty_for_candidate(
+                    &subject_state,
+                    selected,
+                    &state.stop_state,
+                    &signals,
+                    settings.learning_feedback.unwrap_or(true),
+                )
             } else {
-                (legacy_gate, soft_gate)
+                crate::core::subject_controller::GatePenalty {
+                    penalty: 0.0,
+                    reasons: Vec::new(),
+                }
             };
+
+            let mut hard_decision: Option<String> = None;
+            let mut hard_reasons: Vec<String> = Vec::new();
+            let mut tool_gate_detail: Option<String> = None;
+            if use_soft_gate {
+                if state.stop_state.active {
+                    hard_decision = Some("DEFER".to_string());
+                    hard_reasons.push("stop_state_active".to_string());
+                }
+                if !self.plan_preconditions_met(state, selected) {
+                    hard_decision = Some("VERIFY".to_string());
+                    hard_reasons.push("plan_precondition_unmet".to_string());
+                }
+                if matches!(selected.kind, CandidateKind::ToolCall) {
+                    let tool_name = selected
+                        .payload
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !tool_name.is_empty() {
+                        let args_json = selected
+                            .payload
+                            .get("arguments")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "{}".to_string());
+                        let tool_gate = self.tool_gate_decision(&tool_name, &args_json, settings, true);
+                        if !tool_gate.allowed {
+                            hard_decision = Some("DENY".to_string());
+                            let reason = tool_gate
+                                .reason
+                                .unwrap_or_else(|| "TOOL_BLOCK".to_string());
+                            hard_reasons.push(format!("tool_contract_{}", reason.to_lowercase()));
+                            tool_gate_detail = tool_gate.detail.clone();
+                        }
+                    }
+                }
+            }
+
+            let hard_gate = hard_decision.clone().map(|decision_label| subject_controller::GateDecisionRecord {
+                decision_id: Uuid::new_v4().to_string(),
+                decision: decision_label,
+                evidence_refs_json: json!({ "reasons": hard_reasons }).to_string(),
+                metrics_json: json!({
+                    "hard_gate": true,
+                    "tool_gate_detail": tool_gate_detail,
+                })
+                .to_string(),
+            });
+
+            let mut gate = if !use_soft_gate {
+                legacy_gate
+            } else if let Some(hard_gate) = hard_gate {
+                hard_gate
+            } else {
+                let mut gate = soft_gate.clone();
+                if !gate_allows_response(&gate.decision) {
+                    gate.decision = "ALLOW_WITH_NOTICE".to_string();
+                }
+                gate
+            };
+
+            let mut metrics = serde_json::from_str::<Value>(&gate.metrics_json).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = metrics.as_object_mut() {
+                obj.insert("soft_gate_decision".to_string(), json!(soft_gate.decision));
+                obj.insert("soft_gate_reasons".to_string(), json!(soft_reasons.clone()));
+                obj.insert("gate_penalty".to_string(), json!(soft_penalty.penalty));
+                obj.insert("gate_penalty_reasons".to_string(), json!(soft_penalty.reasons.clone()));
+                obj.insert("hard_gate_triggered".to_string(), json!(use_soft_gate && hard_decision.is_some()));
+            }
+            gate.metrics_json = metrics.to_string();
             let gate_reasons_log = serde_json::from_str::<Value>(&gate.evidence_refs_json)
                 .ok()
                 .and_then(|value| value.get("reasons").cloned())
@@ -11512,6 +12191,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     "legacy_decision": legacy_decision,
                     "enforced_decision": gate.decision,
                     "gate_reasons": gate_reasons_log,
+                    "gate_penalty": soft_penalty.penalty,
+                    "gate_penalty_reasons": soft_penalty.reasons,
+                    "hard_gate_decision": hard_decision,
                     "shadow_mode": shadow_mode,
                     "rollout_percent": rollout_percent,
                     "rollout_bucket": rollout_bucket,
@@ -11552,6 +12234,14 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             decision.report.snapshot_hash = Some(snapshot.snapshot_hash.clone());
             decision.report.gate_decision_id = Some(gate.decision_id.clone());
             decision.report.gate_decision = Some(gate.decision.clone());
+            decision.report.gate_penalty = Some(soft_penalty.penalty as f64);
+            if !soft_penalty.reasons.is_empty() {
+                decision.report.gate_penalty_reasons = Some(soft_penalty.reasons.clone());
+            }
+            decision.report.soft_gate_decision = Some(soft_decision);
+            if !soft_reasons.is_empty() {
+                decision.report.soft_gate_reasons = Some(soft_reasons.clone());
+            }
             let reasons: Vec<String> = serde_json::from_str::<Value>(&gate.evidence_refs_json)
                 .ok()
                 .and_then(|v| v.get("reasons").and_then(|r| r.as_array()).cloned())
@@ -12200,9 +12890,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         count > 0
     }
 
-    pub(super) async fn compute_gate_signals(
+    pub(super) async fn compute_gate_signals_score(
         &self,
-        state: &mut KernelState,
+        state: &KernelState,
         subject_state: &subject_state::SubjectState,
         decision: Option<&KernelDecision>,
         candidate: &Candidate,
@@ -12366,7 +13056,6 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         } else {
             0
         };
-        state.gate_high_risk_streak = high_risk_streak;
 
         subject_controller::GateSignals {
             anchor_hits,
@@ -12390,6 +13079,71 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             qualia_novelty_delta,
             qualia_uncertainty_delta,
         }
+    }
+
+    pub(super) fn commit_gate_signal_state(
+        &self,
+        state: &mut KernelState,
+        signals: &subject_controller::GateSignals,
+    ) {
+        state.gate_high_risk_streak = signals.high_risk_streak;
+    }
+
+    pub(super) fn plan_preconditions_met(&self, state: &KernelState, candidate: &Candidate) -> bool {
+        if state.workspace_goal_stack.is_empty() {
+            return true;
+        }
+        let Some(active_goal) = state
+            .workspace_goal_stack
+            .iter()
+            .find(|item| !Self::goal_status_complete(item.status.as_deref()))
+        else {
+            return true;
+        };
+        let Some(step_idx) = Self::payload_step_index(&candidate.payload) else {
+            return true;
+        };
+        if active_goal.steps.is_empty() {
+            return true;
+        }
+        if step_idx >= active_goal.steps.len() {
+            return false;
+        }
+        let current_idx = active_goal.current_step_index.min(active_goal.steps.len().saturating_sub(1));
+        if step_idx != current_idx {
+            return false;
+        }
+        let step = &active_goal.steps[step_idx];
+        if step.status.as_deref() == Some("blocked") {
+            return false;
+        }
+        if step.preconditions.is_empty() {
+            return true;
+        }
+        for pre in step.preconditions.iter() {
+            let trimmed = pre.trim();
+            if trimmed.is_empty() || trimmed == "input_parsed" {
+                continue;
+            }
+            if let Some(label) = trimmed.strip_prefix("step_").and_then(|s| s.strip_suffix("_complete")) {
+                if let Ok(idx) = label.parse::<usize>() {
+                    let target_idx = idx.saturating_sub(1);
+                    if target_idx >= active_goal.steps.len() {
+                        return false;
+                    }
+                    let target = &active_goal.steps[target_idx];
+                    let completed = Self::goal_status_complete(target.status.as_deref())
+                        || !target.evidence_event_ids.is_empty()
+                        || !target.belief_ids.is_empty();
+                    if !completed {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            return false;
+        }
+        true
     }
 
     pub(super) fn is_meaningful_run(
@@ -13488,10 +14242,11 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             )
             .await;
             if !plan.intent_tags.is_empty() {
+                let intent_evidence_ids = state.last_input_evidence_event_ids.clone();
                 let summary = format!("intent_tags: {}", plan.intent_tags.join(", "));
                 let _ = self
                     .db
-                    .upsert_user_intent_summary(conversation_id, &summary, false, &[])
+                    .upsert_user_intent_summary(conversation_id, &summary, false, &intent_evidence_ids)
                     .await;
                 for tag in plan.intent_tags.iter() {
                     let _ = self
@@ -13501,7 +14256,7 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                             tag,
                             0.6,
                             true,
-                            &[],
+                            &intent_evidence_ids,
                             Some("context_hydration"),
                         )
                         .await;
@@ -13514,29 +14269,11 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                     "Plan: {}",
                     summarize_snippet(&input, 120)
                 );
-                let steps = vec![
-                    crate::models::GoalStep {
-                        text: "Clarify objective and constraints".to_string(),
-                        status: None,
-                        evidence_event_ids: Vec::new(),
-                        belief_ids: Vec::new(),
-                        completed_at: None,
-                    },
-                    crate::models::GoalStep {
-                        text: "Outline concrete steps".to_string(),
-                        status: None,
-                        evidence_event_ids: Vec::new(),
-                        belief_ids: Vec::new(),
-                        completed_at: None,
-                    },
-                    crate::models::GoalStep {
-                        text: "Confirm success criteria".to_string(),
-                        status: None,
-                        evidence_event_ids: Vec::new(),
-                        belief_ids: Vec::new(),
-                        completed_at: None,
-                    },
-                ];
+                let steps = Self::build_goal_steps(vec![
+                    "Clarify objective and constraints".to_string(),
+                    "Outline concrete steps".to_string(),
+                    "Confirm success criteria".to_string(),
+                ]);
                 state.workspace_goal_stack = vec![crate::models::GoalStackItem {
                     goal: goal_text.clone(),
                     steps,
@@ -18547,6 +19284,500 @@ Decision packet (optional, internal only):
         Some(gated)
     }
 
+    async fn apply_context_extraction(
+        &self,
+        state: &mut KernelState,
+        settings: &Settings,
+        conversation_id: &str,
+        run_id: &str,
+        trace_id: &str,
+        input: &str,
+        input_kind: CoreInputKind,
+        input_source: &str,
+        input_evidence_ids: &[i64],
+    ) {
+        if input.trim().is_empty() {
+            return;
+        }
+        if matches!(input_kind, CoreInputKind::SystemContext) {
+            return;
+        }
+
+        let mut evidence_ids = input_evidence_ids.to_vec();
+        if evidence_ids.is_empty() && settings.evidence_auto_capture.unwrap_or(true) {
+            let payload = json!({
+                "content": summarize_snippet(input, 160),
+                "source": input_source,
+                "kind": format!("{:?}", input_kind),
+            });
+            let snippet = format!("context_extraction {}", summarize_snippet(input, 80));
+            if let Some(event_id) = self
+                .emit_system_evidence(
+                    state,
+                    settings,
+                    conversation_id,
+                    "context_extraction",
+                    Some(run_id),
+                    &snippet,
+                    Some(&payload),
+                )
+                .await
+            {
+                evidence_ids.push(event_id);
+            }
+        }
+
+        let intent = crate::core::prompt_builder::detect_context_intent(input, false, false);
+        let mut tags = intent.tags.clone();
+        if matches!(input_kind, CoreInputKind::ToolResult) {
+            tags.push("tool_result".to_string());
+            let tool_tag = format!("tool:{}", input_source.trim().to_lowercase());
+            if !tool_tag.trim().is_empty() {
+                tags.push(tool_tag);
+            }
+        } else if matches!(input_kind, CoreInputKind::ToolError) {
+            tags.push("tool_error".to_string());
+            let tool_tag = format!("tool:{}", input_source.trim().to_lowercase());
+            if !tool_tag.trim().is_empty() {
+                tags.push(tool_tag);
+            }
+        }
+        if matches!(input_kind, CoreInputKind::User) {
+            let lower = input.to_lowercase();
+            let preference_triggers = [
+                "i like",
+                "i love",
+                "i prefer",
+                "my favorite",
+                "my preference",
+                "i want",
+                "i'd like",
+                "i would like",
+            ];
+            if preference_triggers.iter().any(|t| lower.contains(t)) {
+                tags.push("user_preference".to_string());
+            }
+        }
+        let mut deduped = Vec::new();
+        for tag in tags {
+            let trimmed = tag.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !deduped.iter().any(|existing: &String| existing == trimmed) {
+                deduped.push(trimmed.to_string());
+            }
+        }
+
+        if !deduped.is_empty() {
+            let confidence = if matches!(input_kind, CoreInputKind::User) { 0.6 } else { 0.5 };
+            for tag in deduped.iter() {
+                let _ = self
+                    .db
+                    .upsert_context_tag(
+                        conversation_id,
+                        tag,
+                        confidence as f32,
+                        true,
+                        &evidence_ids,
+                        Some("context_extraction"),
+                    )
+                    .await;
+            }
+            if matches!(input_kind, CoreInputKind::User) && !intent.tags.is_empty() {
+                let summary = format!("intent_tags: {}", intent.tags.join(", "));
+                let _ = self
+                    .db
+                    .upsert_user_intent_summary(conversation_id, &summary, false, &evidence_ids)
+                    .await;
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "context",
+                    Some(run_id),
+                    Some(trace_id),
+                    json!({
+                        "event": "context_intent_extracted",
+                        "tags": intent.tags,
+                        "evidence_event_ids": evidence_ids,
+                    }),
+                )
+                .await;
+            }
+        }
+
+        let entity_candidates = extract_entity_candidates(input);
+        if entity_candidates.is_empty() {
+            return;
+        }
+        let source = match input_kind {
+            CoreInputKind::User => SourceType::User,
+            CoreInputKind::ToolResult | CoreInputKind::ToolError => SourceType::Tool,
+            CoreInputKind::SystemContext => SourceType::System,
+        };
+        let source_ref = if evidence_ids.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "context_extraction:evidence_event_ids:{}",
+                evidence_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+        };
+        let write_ctx = crate::core::memory::writer::WriteContext {
+            pool: self.db.pool.clone(),
+            model_client: None,
+            scope: Scope::Global,
+            source,
+            source_ref,
+            now: Utc::now(),
+            embedding_config: None,
+            conversation_id: Some(conversation_id.to_string()),
+        };
+        for label in entity_candidates {
+            if let Ok(entity_id) = crate::core::memory::writer::create_entity(&label, None, &write_ctx).await {
+                let payload = json!({
+                    "entity_id": entity_id,
+                    "label": label,
+                    "source": input_source,
+                    "kind": format!("{:?}", input_kind),
+                });
+                let snippet = format!("entity_extracted {}", summarize_snippet(&label, 80));
+                if let Some(event_id) = self
+                    .emit_system_evidence(
+                        state,
+                        settings,
+                        conversation_id,
+                        "entity_extracted",
+                        Some(run_id),
+                        &snippet,
+                        Some(&payload),
+                    )
+                    .await
+                {
+                    let _ = self
+                        .db
+                        .link_evidence_to_target(event_id, "entity", &entity_id.to_string(), "mentions")
+                        .await;
+                    let tag = format!("entity:{}", label);
+                    let _ = self
+                        .db
+                        .upsert_context_tag(
+                            conversation_id,
+                            &tag,
+                            0.55,
+                            true,
+                            &[event_id],
+                            Some("entity_extraction"),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    fn evidence_dedup_key(&self, source_type: &str, payload: &Value, fallback: &str) -> String {
+        let material = if self.payload_is_empty(payload) {
+            fallback.to_string()
+        } else {
+            self.payload_fingerprint(payload)
+        };
+        format!("{}:{}", source_type, hash_payload(&material))
+    }
+
+    fn evidence_strength_for(&self, source_type: &str, payload: &Value) -> f64 {
+        let mut strength: f64 = match source_type {
+            "candidate_created" => 0.45,
+            "candidate_accepted" => 0.6,
+            "arbitration_outcome" => 0.55,
+            "gate_decision" => 0.45,
+            "tool_dispatch" => 0.55,
+            "tool_result" => 0.7,
+            "tool_result_error" => 0.2,
+            "memory_write" => 0.65,
+            "memory_write_blocked" => 0.3,
+            "self_report_snapshot" => 0.5,
+            "scheduler_evidence_health" => 0.4,
+            "scheduler_goal_reconciliation" => 0.4,
+            "scheduler_strategy_audit" => 0.4,
+            _ => 0.5,
+        };
+        if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
+            strength = if success { strength.max(0.7) } else { strength.min(0.3) };
+        }
+        if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
+            let lowered = status.to_lowercase();
+            if lowered.contains("fail") || lowered.contains("error") || lowered.contains("deny") {
+                strength = strength.min(0.25);
+            } else if lowered.contains("success") || lowered.contains("confirm") {
+                strength = strength.max(0.75);
+            }
+        }
+        strength.clamp(0.0, 1.0)
+    }
+
+    fn build_evidence_context(&self, source_type: &str, payload: &Value) -> Option<String> {
+        let (context, sanitized) = self.sanitize_evidence_payload(payload);
+        if self.payload_is_empty(&context) {
+            return None;
+        }
+        let serialized = serde_json::to_string(&context).ok()?;
+        if serialized.len() > 2000 {
+            let fallback = json!({
+                "source_type": source_type,
+                "truncated": true,
+                "payload_fingerprint": self.payload_fingerprint(payload),
+                "payload_size_estimate": self.payload_size_estimate(payload),
+                "sanitized": sanitized,
+            });
+            return serde_json::to_string(&fallback).ok();
+        }
+        Some(serialized)
+    }
+
+    fn payload_is_empty(&self, payload: &Value) -> bool {
+        matches!(payload, Value::Null)
+            || matches!(payload, Value::Object(ref obj) if obj.is_empty())
+            || matches!(payload, Value::Array(ref arr) if arr.is_empty())
+    }
+
+    fn payload_size_estimate(&self, payload: &Value) -> usize {
+        match payload {
+            Value::Null => 0,
+            Value::Bool(_) => 4,
+            Value::Number(n) => n.to_string().len(),
+            Value::String(s) => s.len(),
+            Value::Array(arr) => arr.len().saturating_mul(8),
+            Value::Object(map) => map.len().saturating_mul(12),
+        }
+    }
+
+    fn payload_fingerprint(&self, payload: &Value) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut stack: Vec<(String, &Value, usize)> = vec![("root".to_string(), payload, 0)];
+        let mut visited = 0usize;
+        const MAX_DEPTH: usize = 2;
+        const MAX_ITEMS: usize = 32;
+        const MAX_STRING: usize = 48;
+        while let Some((path, value, depth)) = stack.pop() {
+            if visited >= MAX_ITEMS {
+                parts.push("truncated".to_string());
+                break;
+            }
+            visited += 1;
+            match value {
+                Value::Null => parts.push(format!("{}=null", path)),
+                Value::Bool(b) => parts.push(format!("{}={}", path, b)),
+                Value::Number(n) => parts.push(format!("{}={}", path, n)),
+                Value::String(s) => {
+                    let trimmed = if s.len() > MAX_STRING {
+                        format!("{}…", s.chars().take(MAX_STRING).collect::<String>())
+                    } else {
+                        s.clone()
+                    };
+                    parts.push(format!("{}=\"{}\"", path, trimmed));
+                }
+                Value::Array(arr) => {
+                    parts.push(format!("{}[len]={}", path, arr.len()));
+                    if depth < MAX_DEPTH {
+                        for (idx, item) in arr.iter().take(4).enumerate() {
+                            stack.push((format!("{}[{}]", path, idx), item, depth + 1));
+                        }
+                    }
+                }
+                Value::Object(map) => {
+                    parts.push(format!("{}{{keys}}={}", path, map.len()));
+                    if depth < MAX_DEPTH {
+                        let mut keys: Vec<&String> = map.keys().collect();
+                        keys.sort();
+                        for key in keys.into_iter().take(6) {
+                            if let Some(val) = map.get(key) {
+                                stack.push((format!("{}.{}", path, key), val, depth + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        parts.sort();
+        parts.join("|")
+    }
+
+    fn sanitize_evidence_payload(&self, payload: &Value) -> (Value, bool) {
+        let mut sanitized = false;
+        match payload {
+            Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                const MAX_KEYS: usize = 24;
+                for key in keys.into_iter().take(MAX_KEYS) {
+                    if let Some(value) = map.get(key) {
+                        match value {
+                            Value::String(s) => {
+                                let mut handled = false;
+                                if key == "output" || key == "content" || key == "summary" {
+                                    if s.len() > 400 {
+                                        out.insert(format!("{}_hash", key), Value::String(hash_payload(s)));
+                                        out.insert(format!("{}_len", key), Value::Number((s.len() as i64).into()));
+                                        sanitized = true;
+                                        handled = true;
+                                    }
+                                }
+                                if !handled {
+                                    if s.len() > 600 {
+                                        out.insert(
+                                            format!("{}_hash", key),
+                                            Value::String(hash_payload(s)),
+                                        );
+                                        out.insert(
+                                            format!("{}_len", key),
+                                            Value::Number((s.len() as i64).into()),
+                                        );
+                                        sanitized = true;
+                                    } else {
+                                        out.insert(key.clone(), Value::String(s.clone()));
+                                    }
+                                }
+                            }
+                            Value::Number(_) | Value::Bool(_) | Value::Null => {
+                                out.insert(key.clone(), value.clone());
+                            }
+                            Value::Array(arr) => {
+                                out.insert(
+                                    key.clone(),
+                                    json!({
+                                        "type": "array",
+                                        "len": arr.len(),
+                                    }),
+                                );
+                                sanitized = true;
+                            }
+                            Value::Object(obj) => {
+                                out.insert(
+                                    key.clone(),
+                                    json!({
+                                        "type": "object",
+                                        "keys": obj.len(),
+                                    }),
+                                );
+                                sanitized = true;
+                            }
+                        }
+                    }
+                }
+                if map.len() > MAX_KEYS {
+                    out.insert("truncated_keys".to_string(), Value::Number((map.len() as i64).into()));
+                    sanitized = true;
+                }
+                (Value::Object(out), sanitized)
+            }
+            Value::Array(arr) => {
+                (
+                    json!({
+                        "type": "array",
+                        "len": arr.len(),
+                    }),
+                    true,
+                )
+            }
+            _ => (payload.clone(), sanitized),
+        }
+    }
+
+    fn reset_evidence_emit_budget(&self, state: &mut KernelState, settings: &crate::models::Settings) {
+        let budget = settings.evidence_emit_budget.unwrap_or(50).max(0);
+        state.evidence_emit_budget_remaining = budget;
+        state.evidence_emit_dedup.clear();
+    }
+
+    pub(super) async fn emit_system_evidence(
+        &self,
+        state: &mut KernelState,
+        settings: &crate::models::Settings,
+        conversation_id: &str,
+        source_type: &str,
+        source_ref: Option<&str>,
+        snippet: &str,
+        payload: Option<&Value>,
+    ) -> Option<i64> {
+        if !settings.evidence_auto_capture.unwrap_or(true) {
+            return None;
+        }
+        if state.evidence_emit_budget_remaining <= 0 {
+            return None;
+        }
+        let payload_value = payload.cloned().unwrap_or_else(|| json!({}));
+        let dedup_key = self.evidence_dedup_key(source_type, &payload_value, snippet);
+        if state.evidence_emit_dedup.contains(&dedup_key) {
+            return None;
+        }
+        state.evidence_emit_budget_remaining = state.evidence_emit_budget_remaining.saturating_sub(1);
+        state.evidence_emit_dedup.insert(dedup_key);
+
+        let semantics_enabled = settings.evidence_semantics_v2.unwrap_or(true);
+        let context_json = if semantics_enabled {
+            self.build_evidence_context(source_type, &payload_value)
+        } else {
+            None
+        };
+        let strength = if semantics_enabled {
+            Some(self.evidence_strength_for(source_type, &payload_value))
+        } else {
+            None
+        };
+
+        let event_id = if source_type == "tool_result" {
+            let tool_name = payload_value
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let output = payload_value
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !tool_name.trim().is_empty() && !output.trim().is_empty() {
+                self.db
+                    .create_tool_output_evidence_event(
+                        conversation_id,
+                        tool_name,
+                        output,
+                        snippet,
+                        context_json.as_deref(),
+                        strength,
+                    )
+                    .await
+            } else {
+                self.db
+                    .emit_system_evidence_event_with_context(
+                        conversation_id,
+                        source_type,
+                        source_ref,
+                        snippet,
+                        context_json.as_deref(),
+                        strength,
+                    )
+                    .await
+            }
+        } else {
+            self.db
+                .emit_system_evidence_event_with_context(
+                    conversation_id,
+                    source_type,
+                    source_ref,
+                    snippet,
+                    context_json.as_deref(),
+                    strength,
+                )
+                .await
+        };
+        event_id
+    }
+
     pub(super) fn make_candidate(
         &self,
         kind: CandidateKind,
@@ -19257,6 +20488,19 @@ Decision packet (optional, internal only):
                             "Return ONLY JSON using the required schema.\nPrediction packet (minimal):\n{}",
                             compact_packet
                         );
+                        let _ = system_log::log_event(
+                            &db.pool,
+                            Some(&app_handle),
+                            "warn",
+                            "kernel",
+                            run_id.as_deref(),
+                            trace_id.as_deref(),
+                            json!({
+                                "event": "prediction_generation_fallback",
+                                "reason": "empty_content_json_mode",
+                            }),
+                        )
+                        .await;
                         let fallback_request = ChatCompletionRequest {
                             model: json_model_id.clone(),
                             messages: vec![
@@ -19335,6 +20579,19 @@ Decision packet (optional, internal only):
                 trace_id.as_deref(),
                 json!({
                     "event": "prediction_generation_retry",
+                    "reason": "json_parse_error",
+                }),
+            )
+            .await;
+            let _ = system_log::log_event(
+                &db.pool,
+                Some(&app_handle),
+                "warn",
+                "kernel",
+                run_id.as_deref(),
+                trace_id.as_deref(),
+                json!({
+                    "event": "prediction_generation_fallback",
                     "reason": "json_parse_error",
                 }),
             )
@@ -20303,6 +21560,27 @@ Decision packet (optional, internal only):
             .await;
         }
 
+        let settings = self.db.get_settings().await.ok();
+        let semantics_enabled = settings
+            .as_ref()
+            .and_then(|s| s.evidence_semantics_v2)
+            .unwrap_or(true);
+        let payload = json!({
+            "tool_name": dispatch.tool_name,
+            "action_id": dispatch.action_id,
+            "status": "success",
+            "output": output,
+        });
+        let context_json = if semantics_enabled {
+            self.build_evidence_context("tool_result", &payload)
+        } else {
+            None
+        };
+        let strength = if semantics_enabled {
+            Some(self.evidence_strength_for("tool_result", &payload))
+        } else {
+            None
+        };
         let evidence_event_id = self
             .db
             .create_tool_output_evidence_event(
@@ -20310,6 +21588,8 @@ Decision packet (optional, internal only):
                 &dispatch.tool_name,
                 output,
                 &snippet,
+                context_json.as_deref(),
+                strength,
             )
             .await?;
         let _ = self
@@ -21251,7 +22531,7 @@ Decision packet (optional, internal only):
         let cursor_time = state.last_processed_dispatch_at.clone().unwrap_or_else(|| "".to_string());
         let cursor_id = state.last_processed_dispatch_id.clone().unwrap_or_else(|| "".to_string());
         let rows = sqlx::query(
-            "SELECT action_id, run_id, tool_name, status, last_error, result_text, args_json, updated_at, failure_kind, evidence_event_id
+            "SELECT action_id, run_id, tool_name, status, last_error, result_text, args_json, updated_at, failure_kind, evidence_event_id, plan_step_id
              FROM tool_dispatches
              WHERE status IN ('success','failed')
                AND (updated_at > ? OR (updated_at = ? AND action_id > ?))
@@ -21277,6 +22557,7 @@ Decision packet (optional, internal only):
             let args_json: Option<String> = row.try_get("args_json").ok();
             let failure_kind: Option<String> = row.try_get("failure_kind").ok();
             let evidence_event_id: Option<i64> = row.try_get("evidence_event_id").ok();
+            let plan_step_id: Option<String> = row.try_get("plan_step_id").ok();
             let success = status == "success";
             let observations = if success {
                 result_text.unwrap_or_default()
@@ -21340,6 +22621,27 @@ Decision packet (optional, internal only):
                         &evidence_event_ids,
                     )
                     .await;
+                for evidence_event_id in evidence_event_ids.iter().copied() {
+                    if let Some(step_id) = plan_step_id.as_deref() {
+                        let relation = if success { "validated_by" } else { "caused_by" };
+                        let _ = self
+                            .db
+                            .link_evidence_to_target(
+                                evidence_event_id,
+                                "plan_step",
+                                step_id,
+                                relation,
+                            )
+                            .await;
+                    }
+                }
+            }
+            let mut tags = vec![
+                "candidate_kind::ToolCall".to_string(),
+                format!("tool::{}", tool_name),
+            ];
+            if let Some(step_id) = plan_step_id.as_deref() {
+                tags.push(format!("plan_step_id::{}", step_id));
             }
             outcomes.push(Outcome {
                 action_type: format!("tool_dispatch_{}", status),
@@ -21348,6 +22650,7 @@ Decision packet (optional, internal only):
                 source: tool_name.clone(),
                 failure_kind,
                 target_key,
+                tags,
                 action_id: Some(action_id.clone()),
                 timestamp: updated_at.clone(),
             });
@@ -21394,6 +22697,7 @@ Decision packet (optional, internal only):
                 source: "thread".to_string(),
                 failure_kind: None,
                 target_key: None,
+                tags: vec!["candidate_kind::Thread".to_string()],
                 action_id: Some(thread_id.clone()),
                 timestamp: updated_at.clone(),
             });
@@ -21420,7 +22724,90 @@ Decision packet (optional, internal only):
         outcomes
     }
 
+    fn update_plan_step_outcome(
+        &self,
+        state: &mut KernelState,
+        step_id: &str,
+        success: bool,
+    ) -> Option<Value> {
+        let step_id = step_id.trim();
+        if step_id.is_empty() {
+            return None;
+        }
+        let plan_id = extract_plan_id_from_step_id(step_id)?;
+        let step_idx = extract_step_index_from_step_id(step_id)?;
+        let active_plan_id = state
+            .workspace_active_plan_id
+            .as_deref()
+            .or(state.last_plan_hash.as_deref())
+            .unwrap_or("");
+        if !active_plan_id.is_empty() && plan_id != active_plan_id {
+            return None;
+        }
+        let Some(active_goal) = state
+            .workspace_goal_stack
+            .iter_mut()
+            .find(|item| !Self::goal_status_complete(item.status.as_deref()))
+        else {
+            return None;
+        };
+        let steps_len = active_goal.steps.len();
+        if step_idx >= steps_len {
+            return None;
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut status_change: Option<String> = None;
+        let mut advance = false;
+        {
+            let step = &mut active_goal.steps[step_idx];
+            if success {
+                if step.failure_count > 0 {
+                    step.failure_count = (step.failure_count - 1).max(0);
+                }
+            } else {
+                step.failure_count += 1;
+                step.last_failure_at = Some(now.clone());
+                if step.failure_count >= PLAN_STEP_FAILURE_THRESHOLD {
+                    if step.status.as_deref() != Some("blocked") {
+                        step.status = Some("blocked".to_string());
+                        status_change = Some("blocked".to_string());
+                    }
+                    if active_goal.current_step_index == step_idx && step_idx + 1 < steps_len {
+                        advance = true;
+                    }
+                }
+            }
+        }
+        if advance {
+            active_goal.current_step_index = step_idx + 1;
+        }
+        active_goal.updated_at = Some(now.clone());
+        let (failure_count, status) = {
+            let step = &active_goal.steps[step_idx];
+            (step.failure_count, step.status.clone())
+        };
+        Some(json!({
+            "plan_id": plan_id,
+            "step_id": step_id,
+            "step_index": step_idx + 1,
+            "success": success,
+            "failure_count": failure_count,
+            "status": status,
+            "status_change": status_change,
+            "timestamp": now,
+        }))
+    }
+
     pub(super) async fn apply_outcomes(&self, state: &mut KernelState, outcomes: &[Outcome]) {
+        let settings = self.db.get_settings().await.ok();
+        let learning_feedback = settings
+            .as_ref()
+            .and_then(|s| s.learning_feedback)
+            .unwrap_or(true);
+        let confidence_calibration = settings
+            .as_ref()
+            .and_then(|s| s.confidence_calibration)
+            .unwrap_or(true);
         for outcome in outcomes {
             let action = outcome.action_type.to_lowercase();
             let skip_tool_penalty = matches!(
@@ -21505,6 +22892,120 @@ Decision packet (optional, internal only):
         state.pressure_signals = signals;
         self.update_mode(state).await;
         self.update_stance(state).await;
+
+        let mut controller_state = match state.controller_state.clone() {
+            Some(state) => state,
+            None => self.db.get_controller_state().await.ok().flatten().unwrap_or_default(),
+        };
+
+        let alpha = 0.2_f32;
+        let mut reliability_updates: Vec<(String, f32, f32)> = Vec::new();
+        if learning_feedback {
+            for outcome in outcomes {
+                let mut keys = outcome.tags.clone();
+                if keys.is_empty() {
+                    if !outcome.source.trim().is_empty() {
+                        keys.push(outcome.source.trim().to_string());
+                    } else if !outcome.action_type.trim().is_empty() {
+                        keys.push(outcome.action_type.trim().to_string());
+                    }
+                }
+                let target = if outcome.success { 1.0 } else { 0.0 };
+                for key in keys.into_iter() {
+                    if key.trim().is_empty() {
+                        continue;
+                    }
+                    let entry = controller_state.reliability.entry(key.clone()).or_insert(0.7);
+                    let prev = *entry;
+                    *entry = ((*entry) * (1.0 - alpha) + alpha * target).clamp(0.0, 1.0);
+                    if (prev - *entry).abs() > 0.001 {
+                        reliability_updates.push((key, prev, *entry));
+                    }
+                }
+            }
+        }
+        if learning_feedback {
+            if let Ok(outcome_events) = self.db.list_outcome_events(200).await {
+                let outcome_reliability =
+                    self_model_controller::compute_outcome_reliability(&outcome_events);
+                for (key, score) in outcome_reliability {
+                    let entry = controller_state.reliability.entry(key.clone()).or_insert(score);
+                    let prev = *entry;
+                    *entry = ((*entry) * (1.0 - alpha) + alpha * score).clamp(0.0, 1.0);
+                    if (prev - *entry).abs() > 0.001 {
+                        reliability_updates.push((key, prev, *entry));
+                    }
+                }
+            }
+        }
+
+        let mut plan_step_updates = Vec::new();
+        if learning_feedback {
+            for outcome in outcomes {
+                for tag in outcome.tags.iter() {
+                    if let Some(step_id) = tag.strip_prefix("plan_step_id::") {
+                        if let Some(summary) = self.update_plan_step_outcome(state, step_id, outcome.success) {
+                            plan_step_updates.push(summary);
+                        }
+                    }
+                }
+            }
+        }
+
+        if confidence_calibration {
+            let outcome_quality = outcome_quality_from_outcomes(&state.recent_outcomes).unwrap_or(0.5);
+            controller_state.outcome_quality = Some(outcome_quality);
+            let overall_entry = controller_state
+                .reliability
+                .entry("overall".to_string())
+                .or_insert(outcome_quality);
+            *overall_entry = ((*overall_entry) * (1.0 - alpha) + alpha * outcome_quality).clamp(0.0, 1.0);
+
+            let target_confidence = (0.2 + 0.8 * outcome_quality).clamp(0.0, 1.0);
+            controller_state.confidence =
+                (controller_state.confidence * (1.0 - alpha) + target_confidence * alpha).clamp(0.0, 1.0);
+            controller_state.uncertainty = (1.0 - controller_state.confidence).clamp(0.0, 1.0);
+        }
+
+        if learning_feedback || confidence_calibration {
+            controller_state.updated_at = Some(Utc::now().to_rfc3339());
+            state.controller_state = Some(controller_state.clone());
+            state.controller_gate = Some(self_model_controller::evaluate_gates(&controller_state));
+            let _ = self.db.set_controller_state(&controller_state).await;
+        }
+
+        if !reliability_updates.is_empty() {
+            let _ = self.db.insert_controller_state_snapshot(&controller_state).await;
+            let _ = system_log::log_event(
+                &self.db.pool,
+                Some(&self.app_handle),
+                "info",
+                "kernel",
+                None,
+                None,
+                json!({
+                    "event": "reliability_updated",
+                    "updates": reliability_updates,
+                }),
+            )
+            .await;
+        }
+
+        if !plan_step_updates.is_empty() {
+            let _ = system_log::log_event(
+                &self.db.pool,
+                Some(&self.app_handle),
+                "info",
+                "kernel",
+                None,
+                None,
+                json!({
+                    "event": "plan_step_outcome_updates",
+                    "updates": plan_step_updates,
+                }),
+            )
+            .await;
+        }
     }
 
     pub(super) async fn update_mode(&self, state: &mut KernelState) {
@@ -23083,4 +24584,83 @@ fn ambiguity_score(input: &str) -> f32 {
         score += 0.2;
     }
     score.min(1.0)
+}
+
+fn extract_entity_candidates(input: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return candidates;
+    }
+
+    let mut quoted = Vec::new();
+    let mut buffer = String::new();
+    let mut in_quote: Option<char> = None;
+    for ch in trimmed.chars() {
+        if let Some(q) = in_quote {
+            if ch == q {
+                let snippet = buffer.trim().to_string();
+                if snippet.len() >= 3 && snippet.len() <= 60 {
+                    quoted.push(snippet);
+                }
+                buffer.clear();
+                in_quote = None;
+            } else {
+                buffer.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+        }
+    }
+    for item in quoted.into_iter() {
+        if !candidates.iter().any(|c| c.eq_ignore_ascii_case(&item)) {
+            candidates.push(item);
+        }
+    }
+
+    let stopwords = [
+        "i", "you", "we", "they", "he", "she", "it", "the", "a", "an", "and", "or", "but",
+        "this", "that", "these", "those", "my", "your", "our", "their", "me", "us", "him", "her",
+    ];
+
+    let tokens = trimmed
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-'))
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut current: Vec<String> = Vec::new();
+    for token in tokens {
+        let lowered = token.to_lowercase();
+        let has_upper = token.chars().any(|c| c.is_ascii_uppercase());
+        let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
+        let has_digit = token.chars().any(|c| c.is_ascii_digit());
+        let has_connector = token.contains('_') || token.contains('-');
+        let is_stopword = stopwords.iter().any(|s| *s == lowered);
+        let is_candidate = !is_stopword
+            && token.len() >= 2
+            && ((has_upper && has_lower) || has_digit || has_connector);
+        if is_candidate {
+            current.push(token.to_string());
+        } else if !current.is_empty() {
+            let phrase = current.join(" ").trim().to_string();
+            if phrase.len() >= 2 && phrase.len() <= 80 {
+                if !candidates.iter().any(|c| c.eq_ignore_ascii_case(&phrase)) {
+                    candidates.push(phrase);
+                }
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        let phrase = current.join(" ").trim().to_string();
+        if phrase.len() >= 2 && phrase.len() <= 80 {
+            if !candidates.iter().any(|c| c.eq_ignore_ascii_case(&phrase)) {
+                candidates.push(phrase);
+            }
+        }
+    }
+
+    candidates.truncate(4);
+    candidates
 }
