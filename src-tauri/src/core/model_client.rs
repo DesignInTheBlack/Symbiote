@@ -1467,14 +1467,37 @@ impl ModelClient {
         request: &ChatCompletionRequest,
     ) -> Result<ChatResponseMeta, String> {
         let mut final_request = request.clone();
+        let diag = std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if diag {
+            eprintln!("[diag] chat_with_meta: start (label={:?})", final_request.request_label);
+        }
         let allow_side_effects = request.skip_memory != Some(true);
         let mut should_reinforce_on_use = false;
-        if request.skip_injection != Some(true) {
+        let force_skip_injection = std::env::var("SYMBIOTE_FORCE_SKIP_INJECTION")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if request.skip_injection != Some(true) && !force_skip_injection {
+            if diag {
+                eprintln!("[diag] chat_with_meta: step=1 before_extract_user_query");
+            }
             let mut query = self.extract_user_query(&final_request.messages);
+            if diag {
+                eprintln!("[diag] chat_with_meta: step=2 after_extract_user_query");
+            }
             if query.as_deref().map(|q| q.trim().is_empty()).unwrap_or(true) {
+                if diag {
+                    eprintln!("[diag] chat_with_meta: step=3 before_resolve_user_message_for_memory");
+                }
                 let fallback = self
                     .resolve_user_message_for_memory(request.run_id.as_deref(), &final_request.messages)
                     .await;
+                if diag {
+                    eprintln!("[diag] chat_with_meta: step=4 after_resolve_user_message_for_memory");
+                }
                 if !fallback.trim().is_empty() {
                     query = Some(fallback);
                 }
@@ -1488,12 +1511,21 @@ impl ModelClient {
                     });
                 }
                 let repair_mode = is_repair_request(&query);
+                if diag {
+                    eprintln!("[diag] chat_with_meta: step=5 before_is_clarify_mode");
+                }
                 let reduce_injection = self
                     .is_clarify_mode(&final_request.messages, final_request.run_id.as_deref())
                     .await
                     || repair_mode;
+                if diag {
+                    eprintln!("[diag] chat_with_meta: step=6 after_is_clarify_mode");
+                }
                 let base_prompt_tokens = estimate_prompt_tokens(&final_request.messages);
                 let force_expand = final_request.memory_expand.unwrap_or(false);
+                if diag {
+                    eprintln!("[diag] chat_with_meta: step=7 before_build_injection_context");
+                }
                 let injection = self
                     .build_injection_context(
                         &query,
@@ -1505,6 +1537,9 @@ impl ModelClient {
                         force_expand,
                     )
                     .await;
+                if diag {
+                    eprintln!("[diag] chat_with_meta: step=8 after_build_injection_context");
+                }
                 should_reinforce_on_use = !injection.semantic_context.trim().is_empty();
                 self.inject_context_blocks(
                     &mut final_request.messages,
@@ -1514,17 +1549,132 @@ impl ModelClient {
 
                 let _ = self.append_pending_clarify(&mut final_request.messages).await;
             }
+        } else if diag {
+            eprintln!(
+                "[diag] chat_with_meta: injection_skipped force={} request_skip={:?}",
+                force_skip_injection,
+                request.skip_injection
+            );
         }
 
-        self.log_prompt_messages(&final_request, "chat_meta");
-        self.log_final_request(&final_request);
+        let _ = system_log::log_event(
+            &self.db_pool,
+            Some(&self.app_handle),
+            "warn",
+            "diagnostic",
+            final_request.run_id.as_deref(),
+            None,
+            serde_json::json!({
+                "event": "diag_chat_meta_start",
+                "request_label": final_request.request_label.clone(),
+                "model": final_request.model,
+                "stream": final_request.stream,
+            }),
+        )
+        .await;
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!(
+                "[diag] execute_chat_request: entry (label={:?}, model={}, stream={})",
+                request.request_label,
+                request.model,
+                request.stream
+            );
+        }
 
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!("[diag] chat_with_meta: before log_prompt");
+        }
+        self.log_prompt_messages(&final_request, "chat_meta");
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!("[diag] chat_with_meta: after log_prompt");
+        }
+        let _ = system_log::log_event(
+            &self.db_pool,
+            Some(&self.app_handle),
+            "warn",
+            "diagnostic",
+            final_request.run_id.as_deref(),
+            None,
+            serde_json::json!({
+                "event": "diag_chat_meta_after_log_prompt",
+                "request_label": final_request.request_label.clone(),
+            }),
+        )
+        .await;
+
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!("[diag] chat_with_meta: before log_final");
+        }
+        self.log_final_request(&final_request);
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!("[diag] chat_with_meta: after log_final");
+        }
+        let _ = system_log::log_event(
+            &self.db_pool,
+            Some(&self.app_handle),
+            "warn",
+            "diagnostic",
+            final_request.run_id.as_deref(),
+            None,
+            serde_json::json!({
+                "event": "diag_chat_meta_after_log_final",
+                "request_label": final_request.request_label.clone(),
+            }),
+        )
+        .await;
+
+        let _ = system_log::log_event(
+            &self.db_pool,
+            Some(&self.app_handle),
+            "warn",
+            "diagnostic",
+            final_request.run_id.as_deref(),
+            None,
+            serde_json::json!({
+                "event": "diag_chat_meta_before_execute",
+                "request_label": final_request.request_label.clone(),
+            }),
+        )
+        .await;
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!("[diag] chat_with_meta: before execute_chat_request");
+        }
         let (raw_content, tool_calls) = self
             .execute_chat_request(base_url, api_key, &final_request)
             .await?;
+        if diag {
+            eprintln!("[diag] chat_with_meta: step=9 after_execute_chat_request");
+        }
 
         let (content_no_tags, tag_set) =
             crate::core::memory::inject_context::strip_system_tags(&raw_content);
+        if diag {
+            eprintln!("[diag] chat_with_meta: step=10 after_strip_system_tags");
+        }
 
         if allow_side_effects && should_reinforce_on_use && !tag_set.clarify {
             let client = self.clone();
@@ -1535,11 +1685,20 @@ impl ModelClient {
         }
 
         let mut content = crate::core::memory::inject_context::strip_memory_blocks(&content_no_tags);
+        if diag {
+            eprintln!("[diag] chat_with_meta: step=11 after_strip_memory_blocks");
+        }
         let reminder_specs = if request.skip_reminders == Some(true) {
             Vec::new()
         } else {
             reminder_blocks::parse_reminder_blocks(&content_no_tags)
         };
+        if diag {
+            eprintln!(
+                "[diag] chat_with_meta: step=12 after_parse_reminder_blocks count={}",
+                reminder_specs.len()
+            );
+        }
         if !reminder_specs.is_empty() {
             content = reminder_blocks::strip_reminder_blocks(&content);
             content = reminder_blocks::append_reminder_markers(&content, &reminder_specs);
@@ -3014,6 +3173,35 @@ impl ModelClient {
         })
     }
 
+    fn json_max_depth(value: &Value, cap: usize) -> usize {
+        let mut max_depth = 0usize;
+        let mut stack: Vec<(&Value, usize)> = vec![(value, 1)];
+        while let Some((node, depth)) = stack.pop() {
+            if depth > max_depth {
+                max_depth = depth;
+                if max_depth >= cap {
+                    return cap;
+                }
+            }
+            match node {
+                Value::Array(items) => {
+                    let next = depth + 1;
+                    for item in items {
+                        stack.push((item, next));
+                    }
+                }
+                Value::Object(map) => {
+                    let next = depth + 1;
+                    for val in map.values() {
+                        stack.push((val, next));
+                    }
+                }
+                _ => {}
+            }
+        }
+        max_depth
+    }
+
     fn simplify_json_prompt(messages: &mut Vec<ChatMessage>) {
         let minimal = "Return ONLY valid JSON. Do not include any other text.";
         if let Some(first) = messages.iter_mut().find(|m| m.role == "system") {
@@ -3174,98 +3362,205 @@ impl ModelClient {
         api_key: Option<&str>,
         request: &ChatCompletionRequest,
     ) -> Result<(String, Option<Vec<crate::models::ToolCall>>), String> {
+        let diag = std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if diag {
+            eprintln!("[diag] execute_chat_request step=0 entry");
+        }
         let mut request = request.clone();
+        if diag {
+            eprintln!("[diag] execute_chat_request step=0.5 after_request_clone");
+        }
         let mut retried_json_reasoning = false;
         let mut retried_json_strict = false;
         let mut retried_prediction_reduce = false;
         let mut retried_thinking_prefill = false;
         let mut reasoning_only_count: usize = 0;
         let mut reasoning_only_repeat_logged = false;
-        let (empty_retry_max, empty_retry_timeout_ms) = self.empty_response_retry_config().await;
+        if diag {
+            eprintln!("[diag] execute_chat_request step=0.6 before_empty_retry_config");
+        }
+        let skip_empty_retry_config = std::env::var("SYMBIOTE_SKIP_EMPTY_RETRY_CONFIG")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let (empty_retry_max, empty_retry_timeout_ms) = if skip_empty_retry_config {
+            (3usize, 4000u64)
+        } else {
+            self.empty_response_retry_config().await
+        };
+        if diag {
+            eprintln!("[diag] execute_chat_request step=0.7 after_empty_retry_config");
+        }
         let mut empty_retry_count: usize = 0;
         let mut relaxed_empty_retry = false;
 
-        if request.enable_thinking.is_none() || request.prefill.is_none() {
-            if let Ok(settings) = (Db { pool: self.db_pool.clone() }).get_settings().await {
-                if let Some(defaults) = settings.request_defaults.as_ref() {
-                    if request.enable_thinking.is_none() {
-                        request.enable_thinking = defaults.get("enable_thinking").and_then(|v| v.as_bool());
-                    }
-                    if request.prefill.is_none() {
-                        if let Some(value) = defaults.get("prefill") {
-                            request.prefill = Some(value.clone());
-                        }
-                    }
-                }
-            }
+        if diag {
+            eprintln!("[diag] execute_chat_request step=1 before_entry_log");
         }
-
-        if request.enable_thinking == Some(true) && request.prefill.is_some() {
-            request.prefill = None;
+        let disable_exec_logs = std::env::var("SYMBIOTE_DISABLE_EXECUTE_CHAT_LOGS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !disable_exec_logs {
             let _ = system_log::log_event(
                 &self.db_pool,
                 Some(&self.app_handle),
-                "info",
-                "model",
+                "warn",
+                "diagnostic",
                 request.run_id.as_deref(),
                 None,
-                serde_json::json!( {
-                    "event": "prefill_disabled_for_thinking",
-                    "model": request.model,
+                serde_json::json!({
+                    "event": "diag_execute_chat_request_entry",
                     "request_label": request.request_label.clone(),
+                    "model": request.model,
+                    "stream": request.stream,
                 }),
             )
             .await;
         }
+        if diag {
+            eprintln!(
+                "[diag] execute_chat_request step=2 after_entry_log disabled={}",
+                disable_exec_logs
+            );
+        }
 
+        if diag {
+            eprintln!("[diag] execute_chat_request step=3 before_defaults");
+        }
+        let skip_request_defaults = std::env::var("SYMBIOTE_SKIP_REQUEST_DEFAULTS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if (request.enable_thinking.is_none() || request.prefill.is_none()) && !skip_request_defaults {
+            if let Ok(settings) = (Db { pool: self.db_pool.clone() }).get_settings().await {
+                if let Some(defaults) = settings.request_defaults.as_ref() {
+                    if request.enable_thinking.is_none() {
+                        request.enable_thinking =
+                            defaults.get("enable_thinking").and_then(|v| v.as_bool());
+                    }
+                    if request.prefill.is_none() {
+                        let disable_prefill_default = std::env::var("SYMBIOTE_DISABLE_PREFILL_DEFAULT")
+                            .ok()
+                            .as_deref()
+                            == Some("1");
+                        if !disable_prefill_default {
+                            if let Some(value) = defaults.get("prefill") {
+                                let depth = Self::json_max_depth(value, 128);
+                                if depth >= 128 {
+                                    if diag {
+                                        eprintln!(
+                                            "[diag] execute_chat_request prefill_default_skipped depth={}",
+                                            depth
+                                        );
+                                    }
+                                } else {
+                                    request.prefill = Some(value.clone());
+                                }
+                            }
+                        } else if diag {
+                            eprintln!("[diag] execute_chat_request prefill_default_disabled");
+                        }
+                    }
+                }
+            }
+        } else if skip_request_defaults && diag {
+            eprintln!("[diag] execute_chat_request request_defaults_skipped");
+        }
+        if diag {
+            eprintln!("[diag] execute_chat_request step=4 after_defaults");
+        }
+
+        if request.enable_thinking == Some(true) && request.prefill.is_some() {
+            request.prefill = None;
+            if !disable_exec_logs {
+                let _ = system_log::log_event(
+                    &self.db_pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "model",
+                    request.run_id.as_deref(),
+                    None,
+                    serde_json::json!( {
+                        "event": "prefill_disabled_for_thinking",
+                        "model": request.model,
+                        "request_label": request.request_label.clone(),
+                    }),
+                )
+                .await;
+            }
+        }
+
+        if diag {
+            eprintln!("[diag] execute_chat_request step=5 before_json_mode_check");
+        }
         if Self::request_expects_json(&request)
             && self.json_only_disabled_for_model(&request.model).await
         {
             request.response_format = None;
             request.json_strict = Some(false);
-            let _ = system_log::log_event(
-                &self.db_pool,
-                Some(&self.app_handle),
-                "info",
-                "model",
-                request.run_id.as_deref(),
-                None,
-                serde_json::json!( {
-                    "event": "json_mode_disabled_for_model",
-                    "model": request.model,
-                }),
-            )
-            .await;
+            if !disable_exec_logs {
+                let _ = system_log::log_event(
+                    &self.db_pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "model",
+                    request.run_id.as_deref(),
+                    None,
+                    serde_json::json!( {
+                        "event": "json_mode_disabled_for_model",
+                        "model": request.model,
+                    }),
+                )
+                .await;
+            }
+        }
+        if diag {
+            eprintln!("[diag] execute_chat_request step=6 after_json_mode_check");
         }
 
+        if diag {
+            eprintln!("[diag] execute_chat_request step=7 before_request_loop");
+        }
         loop {
+            if diag {
+                eprintln!("[diag] execute_chat_request step=8 loop_enter");
+            }
             let (prompt_len, prompt_hash) = summarize_messages(&request.messages);
             let tool_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0);
             let response_format = Self::response_format_summary(&request);
-            let _ = system_log::log_event(
-                &self.db_pool,
-                Some(&self.app_handle),
-                "info",
-                "model",
-                request.run_id.as_deref(),
-                None,
-                serde_json::json!({
-                    "event": "request",
-                    "model": request.model,
-                    "stream": request.stream,
-                    "message_count": request.messages.len(),
-                    "prompt_len": prompt_len,
-                    "prompt_hash": prompt_hash,
-                    "tool_count": tool_count,
-                    "request_label": request.request_label.clone(),
-                    "response_format": response_format.clone(),
-                    "max_tokens": request.max_tokens,
-                    "json_strict": request.json_strict,
-                    "enable_thinking": request.enable_thinking,
-                    "prefill_set": request.prefill.is_some(),
-                }),
-            )
-            .await;
+            if !disable_exec_logs {
+                let _ = system_log::log_event(
+                    &self.db_pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "model",
+                    request.run_id.as_deref(),
+                    None,
+                    serde_json::json!({
+                        "event": "request",
+                        "model": request.model,
+                        "stream": request.stream,
+                        "message_count": request.messages.len(),
+                        "prompt_len": prompt_len,
+                        "prompt_hash": prompt_hash,
+                        "tool_count": tool_count,
+                        "request_label": request.request_label.clone(),
+                        "response_format": response_format.clone(),
+                        "max_tokens": request.max_tokens,
+                        "json_strict": request.json_strict,
+                        "enable_thinking": request.enable_thinking,
+                        "prefill_set": request.prefill.is_some(),
+                    }),
+                )
+                .await;
+            }
+            if diag {
+                eprintln!("[diag] execute_chat_request step=9 after_request_log");
+            }
 
             let url = format!("{}/chat/completions", base_url);
             let mut req_builder = self.client.post(&url).json(&request);
@@ -3273,9 +3568,59 @@ impl ModelClient {
                 req_builder = req_builder.bearer_auth(key);
             }
 
+            let _ = system_log::log_event(
+                &self.db_pool,
+                Some(&self.app_handle),
+                "warn",
+                "diagnostic",
+                request.run_id.as_deref(),
+                None,
+                serde_json::json!({
+                    "event": "diag_execute_chat_request_before_send",
+                    "request_label": request.request_label.clone(),
+                }),
+            )
+            .await;
+            if std::env::var("SYMBIOTE_DIAG_STDERR")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!(
+                    "[diag] execute_chat_request: before send (label={:?})",
+                    request.request_label
+                );
+            }
+
             let call_started = Instant::now();
             let response = req_builder.send().await.map_err(|e| e.to_string())?;
             let call_ms = call_started.elapsed().as_millis() as i64;
+            let status_code = response.status().as_u16();
+            let _ = system_log::log_event(
+                &self.db_pool,
+                Some(&self.app_handle),
+                "warn",
+                "diagnostic",
+                request.run_id.as_deref(),
+                None,
+                serde_json::json!({
+                    "event": "diag_execute_chat_request_after_send",
+                    "request_label": request.request_label.clone(),
+                    "status": status_code,
+                }),
+            )
+            .await;
+            if std::env::var("SYMBIOTE_DIAG_STDERR")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!(
+                    "[diag] execute_chat_request: after send (label={:?}, status={})",
+                    request.request_label,
+                    status_code
+                );
+            }
             let _ = system_log::log_event(
                 &self.db_pool,
                 Some(&self.app_handle),
@@ -3334,7 +3679,33 @@ impl ModelClient {
                 return Err(format!("LLM Error: {}", error_text));
             }
 
+            let _ = system_log::log_event(
+                &self.db_pool,
+                Some(&self.app_handle),
+                "warn",
+                "diagnostic",
+                request.run_id.as_deref(),
+                None,
+                serde_json::json!({
+                    "event": "diag_execute_chat_request_before_json",
+                    "request_label": request.request_label.clone(),
+                }),
+            )
+            .await;
             let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+            let _ = system_log::log_event(
+                &self.db_pool,
+                Some(&self.app_handle),
+                "warn",
+                "diagnostic",
+                request.run_id.as_deref(),
+                None,
+                serde_json::json!({
+                    "event": "diag_execute_chat_request_after_json",
+                    "request_label": request.request_label.clone(),
+                }),
+            )
+            .await;
             let choice = &json["choices"][0]["message"];
             let reasoning_content = choice
                 .get("reasoning_content")
@@ -3595,9 +3966,35 @@ impl ModelClient {
             }
             let mut content = raw_content;
             let skip_sanitization = request.skip_sanitization.unwrap_or(false);
-            if !request.stream && self.non_stream_sanitization_enabled().await && !skip_sanitization {
+            if diag {
+                eprintln!("[diag] execute_chat_request step=10 before_non_stream_sanitize");
+            }
+            if diag {
+                eprintln!(
+                    "[diag] execute_chat_request step=10a pre_sanitize_flags stream={} skip_sanitization={}",
+                    request.stream,
+                    skip_sanitization
+                );
+            }
+            let non_stream_sanitize_enabled = self.non_stream_sanitization_enabled().await;
+            if diag {
+                eprintln!(
+                    "[diag] execute_chat_request step=10b non_stream_sanitization_enabled={}",
+                    non_stream_sanitize_enabled
+                );
+            }
+            if !request.stream && non_stream_sanitize_enabled && !skip_sanitization {
+                if diag {
+                    eprintln!("[diag] execute_chat_request step=10.1 non_stream_sanitization_enabled=true");
+                }
                 let allow_diagnostics = request.allow_diagnostics.unwrap_or(false);
+                if diag {
+                    eprintln!("[diag] execute_chat_request step=10.2 before_fetch_display_names");
+                }
                 let (user_name, assistant_name) = self.fetch_display_names().await;
+                if diag {
+                    eprintln!("[diag] execute_chat_request step=10.3 after_fetch_display_names");
+                }
                 let (sanitized, removed_chars, modified, meta_reason) =
                     self.sanitize_non_stream_content(
                         &content,
@@ -3605,6 +4002,9 @@ impl ModelClient {
                         assistant_name.as_deref(),
                         user_name.as_deref(),
                     );
+                if diag {
+                    eprintln!("[diag] execute_chat_request step=10.4 after_sanitize_non_stream_content");
+                }
                 if modified {
                     let _ = system_log::log_event(
                         &self.db_pool,
@@ -3640,6 +4040,12 @@ impl ModelClient {
                     .await;
                 }
                 content = sanitized;
+            }
+            if diag {
+                eprintln!("[diag] execute_chat_request step=10c after_non_stream_sanitize_block");
+            }
+            if diag {
+                eprintln!("[diag] execute_chat_request step=11 after_non_stream_sanitize");
             }
             let has_phrase = content.to_lowercase().contains("working hypothesis");
             let (stripped, removed) = strip_working_hypothesis_prefix(&content);
@@ -3677,6 +4083,9 @@ impl ModelClient {
                 .await;
             }
 
+            if diag {
+                eprintln!("[diag] execute_chat_request step=12 before_return");
+            }
             return Ok((content, tool_calls));
         }
     }
@@ -3688,6 +4097,13 @@ impl ModelClient {
         assistant_name: Option<&str>,
         user_name: Option<&str>,
     ) -> (String, usize, bool, Option<&'static str>) {
+        let diag = std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=0 entry");
+        }
         let mut memory_trigger_filter =
             crate::core::memory::inject_context::MemoryTriggerStreamFilter::new();
         let mut memory_filter = crate::core::memory::inject_context::MemoryStreamFilter::new();
@@ -3695,14 +4111,35 @@ impl ModelClient {
         let mut scaffold_filter = ScaffoldStreamFilter::new();
         let mut internal_filter =
             InternalStreamFilter::new(allow_diagnostics, assistant_name, user_name);
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=1 filters_ready");
+        }
 
         let filtered_trigger = memory_trigger_filter.filter_chunk(raw);
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=2 after_trigger_filter");
+        }
         let filtered_memory = memory_filter.filter_chunk(&filtered_trigger);
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=3 after_memory_filter");
+        }
         let filtered_reminder = reminder_filter.filter_chunk(&filtered_memory);
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=4 after_reminder_filter");
+        }
         let mut output = scaffold_filter.filter_chunk(&filtered_reminder);
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=5 after_scaffold_filter");
+        }
         output = internal_filter.filter_chunk(&output);
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=6 after_internal_filter");
+        }
 
         let remaining_trigger = memory_trigger_filter.finalize();
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=7 after_trigger_finalize");
+        }
         if !remaining_trigger.is_empty() {
             let filtered_memory = memory_filter.filter_chunk(&remaining_trigger);
             let filtered_reminder = reminder_filter.filter_chunk(&filtered_memory);
@@ -3710,27 +4147,54 @@ impl ModelClient {
             let filtered = internal_filter.filter_chunk(&filtered);
             output.push_str(&filtered);
         }
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=8 after_trigger_flush");
+        }
         let remaining_memory = memory_filter.finalize();
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=9 after_memory_finalize");
+        }
         if !remaining_memory.is_empty() {
             let filtered_reminder = reminder_filter.filter_chunk(&remaining_memory);
             let filtered = scaffold_filter.filter_chunk(&filtered_reminder);
             let filtered = internal_filter.filter_chunk(&filtered);
             output.push_str(&filtered);
         }
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=10 after_memory_flush");
+        }
         let reminder_remaining = reminder_filter.finalize();
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=11 after_reminder_finalize");
+        }
         if !reminder_remaining.is_empty() {
             let filtered = scaffold_filter.filter_chunk(&reminder_remaining);
             let filtered = internal_filter.filter_chunk(&filtered);
             output.push_str(&filtered);
         }
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=12 after_reminder_flush");
+        }
         let scaffold_remaining = scaffold_filter.finalize();
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=13 after_scaffold_finalize");
+        }
         if !scaffold_remaining.is_empty() {
             let filtered = internal_filter.filter_chunk(&scaffold_remaining);
             output.push_str(&filtered);
         }
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=14 after_scaffold_flush");
+        }
         let internal_remaining = internal_filter.finalize();
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=15 after_internal_finalize");
+        }
         if !internal_remaining.is_empty() {
             output.push_str(&internal_remaining);
+        }
+        if diag {
+            eprintln!("[diag] sanitize_non_stream_content step=16 after_internal_flush");
         }
 
         let mut meta_reason: Option<&'static str> = None;
@@ -3753,6 +4217,13 @@ impl ModelClient {
     }
 
     fn log_final_request(&self, request: &ChatCompletionRequest) {
+        if std::env::var("SYMBIOTE_SKIP_PROMPT_LOGS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return;
+        }
         if !debug_logging_enabled() {
             return;
         }
@@ -3762,6 +4233,13 @@ impl ModelClient {
     }
 
     fn log_prompt_messages(&self, request: &ChatCompletionRequest, phase: &str) {
+        if std::env::var("SYMBIOTE_SKIP_PROMPT_LOGS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return;
+        }
         let payload = serde_json::json!({
             "phase": phase,
             "run_id": request.run_id,
@@ -4312,19 +4790,25 @@ impl ModelClient {
     }
 
     async fn fetch_display_names(&self) -> (Option<String>, Option<String>) {
-        let settings = Db { pool: self.db_pool.clone() }.get_settings().await.ok();
-        let user_name = settings
+        let row = sqlx::query(
+            "SELECT user_display_name, assistant_display_name FROM settings WHERE id = 1",
+        )
+        .fetch_optional(&self.db_pool)
+        .await
+        .ok()
+        .flatten();
+        let user_name = row
             .as_ref()
-            .and_then(|s| s.user_display_name.as_deref())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(|name| name.to_string());
-        let assistant_name = settings
+            .and_then(|r| r.try_get::<Option<String>, _>("user_display_name").ok())
+            .flatten()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let assistant_name = row
             .as_ref()
-            .and_then(|s| s.assistant_display_name.as_deref())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(|name| name.to_string());
+            .and_then(|r| r.try_get::<Option<String>, _>("assistant_display_name").ok())
+            .flatten()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
         (user_name, assistant_name)
     }
 
@@ -4404,12 +4888,14 @@ impl ModelClient {
     }
 
     async fn non_stream_sanitization_enabled(&self) -> bool {
-        Db { pool: self.db_pool.clone() }
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.stability_non_stream_sanitization)
-            .unwrap_or(true)
+        let flag: Option<i64> = sqlx::query_scalar(
+            "SELECT stability_non_stream_sanitization FROM settings WHERE id = 1",
+        )
+        .fetch_optional(&self.db_pool)
+        .await
+        .ok()
+        .flatten();
+        flag.map(|v| v != 0).unwrap_or(true)
     }
 
     async fn fetch_bound_handles_for_session(&self, session_id: &str) -> Vec<(String, String)> {

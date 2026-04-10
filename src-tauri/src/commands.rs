@@ -153,6 +153,14 @@ pub async fn start_voice_service(
     voice_manager: State<'_, VoiceManager>,
     db: State<'_, Arc<Db>>,
 ) -> Result<(), String> {
+    if std::env::var("SYMBIOTE_DISABLE_VOICE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("[VOICE] Disabled via SYMBIOTE_DISABLE_VOICE=1");
+        return Ok(());
+    }
     println!("[COMMAND] Starting Voice Service V2...");
     let control_map = system_controls::load_control_map(&db).await;
     let voice_mode = system_controls::mode_for("voice_output", &control_map);
@@ -169,6 +177,14 @@ pub async fn restart_voice_service(
     voice_manager: State<'_, VoiceManager>,
     db: State<'_, Arc<Db>>,
 ) -> Result<(), String> {
+    if std::env::var("SYMBIOTE_DISABLE_VOICE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("[VOICE] Disabled via SYMBIOTE_DISABLE_VOICE=1");
+        return Ok(());
+    }
     println!("[COMMAND] Restarting Voice Service V2...");
     let control_map = system_controls::load_control_map(&db).await;
     let voice_mode = system_controls::mode_for("voice_output", &control_map);
@@ -1704,6 +1720,13 @@ pub async fn read_theme_file(app: AppHandle, name: String) -> Result<String, Str
 
 #[tauri::command]
 pub async fn send_message(chat: State<'_, Arc<ChatManager>>, content: String) -> Result<(), String> {
+    if std::env::var("SYMBIOTE_DIAG_STDERR")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("[diag] command send_message len={}", content.len());
+    }
     chat.send_message(content).await.map_err(|e| e.to_string())
 }
 

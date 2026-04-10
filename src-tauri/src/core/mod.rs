@@ -1055,6 +1055,13 @@ impl ChatManager {
     }
 
     pub async fn send_message(&self, content: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!("[diag] ChatManager::send_message start len={}", content.len());
+        }
         let conversation_id = "default";
         let run_id = Uuid::new_v4().to_string();
         let trace_id = run_id.clone();
@@ -1280,6 +1287,16 @@ impl ChatManager {
         let original_input = raw_content.clone();
         let conversation_id_owned = conversation_id.to_string();
 
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!(
+                "[diag] ChatManager::send_message spawning run_user_input run_id={}",
+                run_id_clone
+            );
+        }
         tokio::spawn(async move {
             let cancel_state_rx = cancel_tx.subscribe();
             let run_id_for_exec = run_id_clone.clone();

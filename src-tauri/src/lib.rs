@@ -34,6 +34,15 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let app_handle_for_db = app_handle.clone(); // Clone for async move
 
+            let env_diag = std::env::var("SYMBIOTE_DIAG_STDERR").ok();
+            let env_skip_prompts = std::env::var("SYMBIOTE_SKIP_PROMPT_LOGS").ok();
+            let env_disable_scheduler = std::env::var("SYMBIOTE_DISABLE_SCHEDULER").ok();
+            let env_disable_voice = std::env::var("SYMBIOTE_DISABLE_VOICE").ok();
+            eprintln!(
+                "[Env] SYMBIOTE_DIAG_STDERR={:?} SYMBIOTE_SKIP_PROMPT_LOGS={:?} SYMBIOTE_DISABLE_SCHEDULER={:?} SYMBIOTE_DISABLE_VOICE={:?}",
+                env_diag, env_skip_prompts, env_disable_scheduler, env_disable_voice
+            );
+
             let init_result = tauri::async_runtime::block_on(async move {
                 let db = Db::new(&app_handle_for_db)
                     .await
@@ -65,13 +74,21 @@ pub fn run() {
                 app_handle_for_db.manage(model_client); // Manage ModelClient globally
                 app_handle_for_db.manage(chat_manager);
 
-                // Start Scheduler
-                let scheduler = Scheduler::new(
-                    db_arc.clone(),
-                    app_handle_for_db.clone(),
-                    chat_manager_for_scheduler.kernel.clone(),
-                );
-                scheduler.start();
+                // Start Scheduler (allow disabling for diagnostics)
+                if std::env::var("SYMBIOTE_DISABLE_SCHEDULER")
+                    .ok()
+                    .as_deref()
+                    != Some("1")
+                {
+                    let scheduler = Scheduler::new(
+                        db_arc.clone(),
+                        app_handle_for_db.clone(),
+                        chat_manager_for_scheduler.kernel.clone(),
+                    );
+                    scheduler.start();
+                } else {
+                    eprintln!("[Scheduler] Disabled via SYMBIOTE_DISABLE_SCHEDULER=1");
+                }
 
                 Ok::<(), String>(())
             });

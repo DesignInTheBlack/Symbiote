@@ -2283,13 +2283,22 @@ No other text before or after.
     }
 
     pub async fn get_settings(&self) -> Result<Settings, Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_settings_columns().await?;
+        let diag = std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if diag {
+            eprintln!("[diag] db.get_settings step=0 entry");
+        }
         let row = sqlx::query(
             "SELECT schema_version, api_base_url, api_key, streaming_enabled, history_window, injection_policy, request_defaults, active_model_id, json_reliable_model_id, system_prompt, voice_name, voice_speed, summarization_api_url, summarization_model, embedding_model, user_display_name, assistant_display_name, onboarding_completed, ui_theme, voice_pitch_semitones, voice_reverb_amount, voice_compression, voice_formant_shift, trace_history_limit, cockpit_write_enabled, episodic_enabled, episodic_injection_enabled, episodic_compaction_enabled, episodic_injection_limit, episodic_opt_out, memory_claims_enabled, phi_consent, seed_personal_user, lexical_fallback_enabled, memory_half_life_hours, research_budget_per_hour, research_budget_reset_window,
 research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, monologue_retry_timeout_secs, empty_response_retry_max, empty_response_retry_timeout_ms, monologue_max_per_hour, thread_max_depth, allow_shell_tool, shell_command_allowlist, ask_budget_max, calculator_followups_max, loop_similarity_threshold, loop_recent_k, meta_cog_outcome_turns, meta_cog_cycle_window_turns, meta_cog_outcome_timeout_s, meta_cog_cooldown_s, meta_cog_streak_limit, registry_profile_name, controller_enabled, monologue_stabilization_enabled, monologue_surface_enabled, show_monologue_in_chat, enable_introspection, heartbeat_enabled, dream_enabled, binding_enforcement_enabled, pending_prompt_alignment_enabled, pending_prompt_recency_secs, auto_memory_pass_enabled, summary_cohesion_enabled, compact_prompt_enabled, context_hydration_mode, context_budgeter_enabled, context_miss_detector_enabled, world_model_reconcile_mode, goal_loop_enabled, goal_loop_interval_turns, goal_loop_load_threshold_ms, json_only_disabled_models, tool_failure_gate_window_mins, tool_failure_gate_tool_names, gate_default_soft, gate_shadow_mode, gate_rollout_percent, self_report_channel, self_awareness_expression_mode, explicit_feedback_only, weight_user_satisfaction, weight_policy_rigor, weight_latency, weight_evidence_strictness, weight_exploration, evidence_emit_budget, evidence_retention_days, gate_penalty_integration, evidence_auto_capture, response_fallback_enabled, memory_soft_anchor, context_extraction_boost, planner_enabled, confidence_calibration, scheduler_cognition, learning_feedback, evidence_semantics_v2, narrative_continuity, monologue_provenance_guard, organism_decay, model_context_limit, introspection_confidence_threshold, introspection_drift_threshold, introspection_ambiguity_threshold, enable_attribution_gate, enable_user_utterance_evidence, enable_attribution_metadata, enable_tool_schema_validation, enable_context_evidence, enable_monologue_validator, enable_memory_evidence_gating, enable_speculative_workspace_containment, stability_prompt_override_guard, stability_monologue_tagged, stability_introspection_structured, stability_disable_working_hypothesis, stability_state_disclosure_expanded, stability_transcript_normalization, stability_memory_hygiene, stability_non_stream_sanitization FROM settings WHERE id = 1"
         )
         .fetch_one(&self.pool)
         .await?;
+        if diag {
+            eprintln!("[diag] db.get_settings step=1 after_fetch_one");
+        }
 
         use sqlx::Row;
         let mut settings = Settings {
@@ -2434,8 +2443,20 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
             trace_history_limit: row.get("trace_history_limit"),
             cockpit_write_enabled: row.try_get::<i32, _>("cockpit_write_enabled").ok().map(|v| v != 0),
         };
+        if diag {
+            eprintln!("[diag] db.get_settings step=2 after_build_settings");
+        }
         let adjustments = settings.validate();
+        if diag {
+            eprintln!(
+                "[diag] db.get_settings step=3 after_validate adjustments={}",
+                adjustments.len()
+            );
+        }
         if !adjustments.is_empty() {
+            if diag {
+                eprintln!("[diag] db.get_settings step=4 before_log_adjustments");
+            }
             let _ = system_log::log_event(
                 &self.pool,
                 None,
@@ -2449,13 +2470,18 @@ research_cost_per_call, monologue_interval_seconds, monologue_timeout_secs, mono
                 }),
             )
             .await;
+            if diag {
+                eprintln!("[diag] db.get_settings step=5 after_log_adjustments");
+            }
         }
 
+        if diag {
+            eprintln!("[diag] db.get_settings step=6 return");
+        }
         Ok(settings)
     }
 
     pub async fn update_settings(&self, settings: Settings) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_settings_columns().await?;
         let current = self.get_settings().await?;
         let request_defaults = settings.request_defaults.map(|v| v.to_string());
         let json_reliable_model_id = settings

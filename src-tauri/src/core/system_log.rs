@@ -82,6 +82,14 @@ pub async fn log_event(
 ) -> Result<SystemLogEntry, String> {
     let mut payload = payload;
     let event_name = payload.get("event").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let diag = std::env::var("SYMBIOTE_DIAG_STDERR")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let diag_target = diag && event_name.as_deref() == Some("monologue_digest_injected");
+    if diag_target {
+        eprintln!("[diag] system_log monologue_digest_injected step=0 entry");
+    }
     if let Some(event_name) = event_name.as_deref() {
         let event_name = event_name.to_string();
         if !system_log_schema::is_known_event(&event_name) {
@@ -89,6 +97,9 @@ pub async fn log_event(
                 obj.insert("schema_unknown_event".to_string(), json!(event_name));
             }
         }
+    }
+    if diag_target {
+        eprintln!("[diag] system_log monologue_digest_injected step=1 after_schema");
     }
     let conversation_id = conversation_id_from_payload(&payload);
     if !phi_consent_allowed(pool, conversation_id).await {
@@ -101,6 +112,9 @@ pub async fn log_event(
             }
         }
     }
+    if diag_target {
+        eprintln!("[diag] system_log monologue_digest_injected step=2 after_phi");
+    }
     let id = Uuid::new_v4().to_string();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
@@ -108,6 +122,9 @@ pub async fn log_event(
 
     let telemetry_mode = fetch_telemetry_mode(pool).await;
     if !telemetry_allows_event(&telemetry_mode, level, event_name.as_deref()) {
+        if diag_target {
+            eprintln!("[diag] system_log monologue_digest_injected step=3 telemetry_blocked");
+        }
         return Ok(SystemLogEntry {
             id,
             timestamp,
@@ -117,6 +134,9 @@ pub async fn log_event(
             trace_id: trace_id.map(|s| s.to_string()),
             payload,
         });
+    }
+    if diag_target {
+        eprintln!("[diag] system_log monologue_digest_injected step=4 before_insert");
     }
 
     sqlx::query(
@@ -133,6 +153,9 @@ pub async fn log_event(
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    if diag_target {
+        eprintln!("[diag] system_log monologue_digest_injected step=5 after_insert");
+    }
 
     let entry = SystemLogEntry {
         id,
@@ -145,7 +168,19 @@ pub async fn log_event(
     };
 
     if let Some(app) = app_handle {
-        let _ = app.emit("system_log", entry.clone());
+        let disable_emit = std::env::var("SYMBIOTE_DISABLE_SYSTEM_LOG_EMIT")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !disable_emit {
+            let _ = app.emit("system_log", entry.clone());
+        }
+        if diag_target {
+            eprintln!(
+                "[diag] system_log monologue_digest_injected step=6 after_emit disabled={}",
+                disable_emit
+            );
+        }
     }
 
     let tags_json = serde_json::json!({
@@ -166,6 +201,9 @@ pub async fn log_event(
     .bind(trace_id)
     .execute(pool)
     .await;
+    if diag_target {
+        eprintln!("[diag] system_log monologue_digest_injected step=7 after_ledger");
+    }
 
     Ok(entry)
 }

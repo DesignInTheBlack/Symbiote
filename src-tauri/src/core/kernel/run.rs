@@ -2629,6 +2629,13 @@ impl Kernel {
     }
 
     pub(super) async fn update_identity_ab_variant(&self, run_id: &str, trace_id: &str) -> String {
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!("[diag] update_identity_ab_variant entry run_id={}", run_id);
+        }
         let variant = self
             .db
             .get_key("identity_ab_variant")
@@ -2676,9 +2683,23 @@ impl Kernel {
         .await;
 
         if next_turns >= IDENTITY_AB_MIN_TURNS {
+            if std::env::var("SYMBIOTE_DIAG_STDERR")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!("[diag] update_identity_ab_variant before_collect_metrics turns={}", next_turns);
+            }
             let metrics = self
                 .collect_identity_ab_metrics(&variant, &window_start, next_turns)
                 .await;
+            if std::env::var("SYMBIOTE_DIAG_STDERR")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!("[diag] update_identity_ab_variant after_collect_metrics");
+            }
             let metrics_json =
                 serde_json::to_string(&metrics).unwrap_or_else(|_| "{}".to_string());
             let metrics_key = format!("identity_ab_metrics_{}", variant.to_uppercase());
@@ -2807,6 +2828,16 @@ impl Kernel {
         assistant_message_id: Option<String>,
         depth: usize,
     ) -> Result<RunOutput, String> {
+        if std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!(
+                "[diag] run_input_loop start run_id={} kind={:?} depth={}",
+                run_id, input_kind, depth
+            );
+        }
         let mut current_input = input;
         let mut current_kind = input_kind;
         let mut current_source = input_source.to_string();
@@ -3314,6 +3345,18 @@ impl Kernel {
         original_input: Option<String>,
         assistant_message_id: Option<String>,
     ) -> Result<RunOutput, String> {
+        let diag = std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if diag {
+            eprintln!(
+                "[diag] run_input_once step=0 entry run_id={} kind={:?} input_len={}",
+                run_id,
+                input_kind,
+                input.len()
+            );
+        }
         if *cancel_rx.borrow() {
             return Err("cancelled".to_string());
         }
@@ -3326,11 +3369,17 @@ impl Kernel {
 
         let now = Utc::now();
         let _ = self.db.touch_run_heartbeat(&run_id).await;
+        if diag { eprintln!("[diag] run_input_once step=1 after_touch_run_heartbeat"); }
         let settings = self.db.get_settings().await.map_err(|e| e.to_string())?;
+        if diag { eprintln!("[diag] run_input_once step=2 after_get_settings"); }
         self.sync_self_model_runtime(&settings).await;
+        if diag { eprintln!("[diag] run_input_once step=3 after_sync_self_model_runtime"); }
         self.maybe_seed_telemetry_snapshot(Some(&run_id), Some(&trace_id)).await;
+        if diag { eprintln!("[diag] run_input_once step=4 after_maybe_seed_telemetry"); }
         let mut state = self.load_state(&conversation_id).await;
+        if diag { eprintln!("[diag] run_input_once step=5 after_load_state"); }
         self.reset_evidence_emit_budget(&mut state, &settings);
+        if diag { eprintln!("[diag] run_input_once step=6 after_reset_evidence_emit_budget"); }
         let retention_days = settings.evidence_retention_days.unwrap_or(30);
         if retention_days > 0 {
             let purge_needed = self
@@ -3368,6 +3417,7 @@ impl Kernel {
                 }
             }
         }
+        if diag { eprintln!("[diag] run_input_once step=7 after_evidence_purge"); }
         self.maybe_build_deterministic_plan(
             &mut state,
             &input,
@@ -3378,6 +3428,7 @@ impl Kernel {
             &trace_id,
         )
         .await;
+        if diag { eprintln!("[diag] run_input_once step=8 after_maybe_build_deterministic_plan"); }
         let mut anchor_shift_event: Option<AnchorShiftEvent> = None;
         let explicit_feedback = original_input
             .as_deref()
@@ -3410,6 +3461,7 @@ impl Kernel {
                 Some(&trace_id),
             )
             .await;
+        if diag { eprintln!("[diag] run_input_once step=9 after_insert_event_ledger"); }
         let _ = advance_run_phase(
             &self.db.pool,
             Some(&self.app_handle),
@@ -3418,6 +3470,7 @@ impl Kernel {
             Some("input_once_start"),
         )
         .await;
+        if diag { eprintln!("[diag] run_input_once step=10 after_advance_run_phase"); }
         if matches!(input_kind, CoreInputKind::User) && state.diagnostics_disabled_turns_remaining > 0 {
             state.diagnostics_disabled_turns_remaining =
                 state.diagnostics_disabled_turns_remaining.saturating_sub(1);
@@ -3437,7 +3490,9 @@ impl Kernel {
             }
         }
         let _ = self.mark_stale_tool_dispatches().await;
+        if diag { eprintln!("[diag] run_input_once step=11 after_mark_stale_tool_dispatches"); }
         self.maybe_log_tool_baseline_snapshot().await;
+        if diag { eprintln!("[diag] run_input_once step=12 after_maybe_log_tool_baseline_snapshot"); }
         let disable_working_hypothesis = settings.stability_disable_working_hypothesis.unwrap_or(true);
         let expanded_state_disclosure = settings.stability_state_disclosure_expanded.unwrap_or(true);
         let calculator_mode = matches!(input_kind, CoreInputKind::User) && is_calculator_prompt(&input);
@@ -3449,6 +3504,7 @@ impl Kernel {
         } else {
             allow_diagnostics
         };
+        if diag { eprintln!("[diag] run_input_once step=13 after_allow_speculative_markers"); }
         let self_awareness_mode = settings
             .self_awareness_expression_mode
             .as_deref()
@@ -3463,8 +3519,10 @@ impl Kernel {
                 matched_rules: Vec::new(),
             }
         };
+        if diag { eprintln!("[diag] run_input_once step=14 after_detect_context_intent"); }
         let (self_awareness_requested, _self_awareness_requested_reason) =
             is_self_awareness_gate_requested(explicit_self_awareness, &intent_gate_detection.tags);
+        if diag { eprintln!("[diag] run_input_once step=15 after_is_self_awareness_gate_requested"); }
         let self_awareness_allowed =
             settings.self_report_channel.unwrap_or(true)
                 && !self_awareness_mode.eq_ignore_ascii_case("conservative");
@@ -3475,10 +3533,13 @@ impl Kernel {
             && is_self_audit_ambiguous(&input)
             && !user_requested_state(&input)
             && !is_introspection_request(&input);
+        if diag { eprintln!("[diag] run_input_once step=16 after_self_audit_ambiguous"); }
         let relational_mode = matches!(input_kind, CoreInputKind::User) && is_relational_input(&input);
+        if diag { eprintln!("[diag] run_input_once step=17 after_is_relational_input"); }
         let is_task_input =
             matches!(input_kind, CoreInputKind::User | CoreInputKind::SystemContext) && !relational_mode;
         let ingest_ms = ingest_started.elapsed().as_millis() as i64;
+        if diag { eprintln!("[diag] run_input_once step=18 after_is_task_input"); }
         if is_task_input {
             let new_task = state.task_id.as_deref() != Some(&run_id);
             if new_task {
@@ -3529,19 +3590,26 @@ impl Kernel {
                 state.task_phase = TaskPhase::Running;
             }
         }
+        if diag { eprintln!("[diag] run_input_once step=19 after_task_input_block"); }
         if matches!(input_kind, CoreInputKind::User | CoreInputKind::SystemContext) {
             let _ = self
                 .db
                 .create_memory_pass_token(&run_id, &conversation_id, 600)
                 .await;
         }
+        if diag { eprintln!("[diag] run_input_once step=20 after_create_memory_pass_token"); }
         if matches!(input_kind, CoreInputKind::User) {
+            if diag { eprintln!("[diag] run_input_once step=21 enter_user_block"); }
             let previous_input = state.last_user_input.clone().unwrap_or_default();
+            if diag { eprintln!("[diag] run_input_once step=22 after_previous_input"); }
             let (redirect_detected, redirect_overlap, redirect_reason) =
                 is_user_redirect(&previous_input, &input);
+            if diag { eprintln!("[diag] run_input_once step=23 after_is_user_redirect"); }
             let topic_shift_request = is_topic_shift_request(&input);
+            if diag { eprintln!("[diag] run_input_once step=24 after_is_topic_shift_request"); }
             let redirect_focus = extract_redirect_focus(&input)
                 .map(|focus| summarize_snippet(&focus, 160));
+            if diag { eprintln!("[diag] run_input_once step=25 after_extract_redirect_focus"); }
             if redirect_detected || topic_shift_request {
                 state.anchor_epoch = state.anchor_epoch.saturating_add(1);
                 state.user_redirect_turns_remaining = 2;
@@ -3696,11 +3764,13 @@ impl Kernel {
                     .await;
                 }
             }
+            if diag { eprintln!("[diag] run_input_once step=26 after_redirect_handling"); }
             state.last_user_input = Some(input.clone());
             state.last_user_input_at = Some(now.to_rfc3339());
             if let Ok(Some(message_id)) = self.db.get_user_message_id_for_run(&run_id).await {
                 state.last_user_message_id = Some(message_id);
             }
+            if diag { eprintln!("[diag] run_input_once step=27 after_update_last_user_input"); }
             if !redirect_detected {
                 if let Some(focus) = state.redirect_focus.clone() {
                     if redirect_focus_aligned(&input, &focus) {
@@ -3760,6 +3830,7 @@ impl Kernel {
                     }
                 }
             }
+            if diag { eprintln!("[diag] run_input_once step=28 after_redirect_focus_block"); }
             state.self_state.last_internal_thought = "Processing user input.".to_string();
             state.self_state.updated_at = Some(now.to_rfc3339());
             state.monologue_quiet_until = None;
@@ -3794,6 +3865,7 @@ impl Kernel {
                 )
                 .await;
             }
+            if diag { eprintln!("[diag] run_input_once step=29 after_state_disclosure_block"); }
             if settings.monologue_surface_enabled.unwrap_or(false)
                 && is_monologue_surface_request(&input)
             {
@@ -3815,6 +3887,7 @@ impl Kernel {
             } else {
                 state.monologue_surface_until = None;
             }
+            if diag { eprintln!("[diag] run_input_once step=30 after_monologue_surface_block"); }
             if calculator_mode && state.missing_input_policy.is_none() {
                 let lowered = input.to_lowercase();
                 if lowered.contains("strict") || lowered.contains("no defaults") || lowered.contains("don't assume") {
@@ -3823,6 +3896,7 @@ impl Kernel {
                     state.missing_input_policy = Some("use_defaults_and_label".to_string());
                 }
             }
+            if diag { eprintln!("[diag] run_input_once step=31 after_missing_input_policy"); }
             if is_refusal_input(&input) && !state.last_asked_slots.is_empty() {
                 state.user_refused = true;
                 state.refusal_count += 1;
@@ -3901,11 +3975,14 @@ impl Kernel {
                 )
                 .await;
             }
+            if diag { eprintln!("[diag] run_input_once step=32 after_refusal_block"); }
         } else if matches!(input_kind, CoreInputKind::SystemContext) {
             state.self_state.last_internal_thought = "Processing system input.".to_string();
             state.self_state.updated_at = Some(now.to_rfc3339());
         }
+        if diag { eprintln!("[diag] run_input_once step=33 after_user_block"); }
 
+        if diag { eprintln!("[diag] run_input_once step=34 before_input_evidence_block"); }
         let mut input_evidence_ids: Vec<i64> = Vec::new();
         if settings.evidence_auto_capture.unwrap_or(true) {
             match input_kind {
@@ -4004,6 +4081,7 @@ impl Kernel {
                 CoreInputKind::SystemContext => {}
             }
         }
+        if diag { eprintln!("[diag] run_input_once step=35 after_input_evidence_block"); }
         state.last_input_evidence_event_ids = input_evidence_ids.clone();
         if settings.context_extraction_boost.unwrap_or(true) {
             self.apply_context_extraction(
@@ -4019,11 +4097,16 @@ impl Kernel {
             )
             .await;
         }
+        if diag { eprintln!("[diag] run_input_once step=36 after_apply_context_extraction"); }
 
         self.refresh_controller_state(&mut state, &settings).await;
+        if diag { eprintln!("[diag] run_input_once step=37 after_refresh_controller_state"); }
         let original_input = original_input.or_else(|| state.last_user_input.clone());
         self.refresh_research_budget(&mut state, &settings);
+        if diag { eprintln!("[diag] run_input_once step=38 after_refresh_research_budget"); }
+        if diag { eprintln!("[diag] run_input_once step=39 before_research_budget_remaining"); }
         let budget_remaining = self.research_budget_remaining(&state, &settings);
+        if diag { eprintln!("[diag] run_input_once step=40 after_research_budget_remaining"); }
         let _ = system_log::log_event(
             &self.db.pool,
             Some(&self.app_handle),
@@ -4038,16 +4121,20 @@ impl Kernel {
             }),
         )
         .await;
+        if diag { eprintln!("[diag] run_input_once step=41 after_research_budget_log"); }
         if matches!(input_kind, CoreInputKind::User) && !state.pending_questions.is_empty() {
             state.pending_questions.clear();
             state.uncertainty_count = (state.uncertainty_count - 1).max(0);
         }
+        if diag { eprintln!("[diag] run_input_once step=42 after_pending_questions_clear"); }
 
         let outcomes = self.collect_outcomes(&mut state).await;
+        if diag { eprintln!("[diag] run_input_once step=43 after_collect_outcomes"); }
         let action_type = match input_kind {
             CoreInputKind::User => "user_message_processed",
             _ => "system_input_processed",
         };
+        if diag { eprintln!("[diag] run_input_once step=44 after_action_type"); }
         let input_outcome = Outcome {
             action_type: action_type.to_string(),
             success: true,
@@ -4059,12 +4146,15 @@ impl Kernel {
             action_id: None,
             timestamp: now.to_rfc3339(),
         };
+        if diag { eprintln!("[diag] run_input_once step=45 after_input_outcome"); }
         let mut all_outcomes = outcomes;
         all_outcomes.push(input_outcome);
+        if diag { eprintln!("[diag] run_input_once step=46 after_all_outcomes"); }
         let user_evidence_allowlist = self
             .db
             .get_recent_user_evidence(&conversation_id, 8)
             .await;
+        if diag { eprintln!("[diag] run_input_once step=47 after_get_recent_user_evidence"); }
         let user_evidence_ids: Vec<i64> = user_evidence_allowlist
             .iter()
             .map(|(id, _)| *id)
@@ -4074,6 +4164,7 @@ impl Kernel {
         let mut identity_evidence_ids: Vec<i64> = Vec::new();
         if matches!(input_kind, CoreInputKind::User) {
             if let Some((target, pattern)) = detect_identity_signal(&input) {
+                if diag { eprintln!("[diag] run_input_once step=48 after_detect_identity_signal"); }
                 if let Some((evidence_id, snippet)) = user_evidence_allowlist.first() {
                     identity_evidence_ids.push(*evidence_id);
                     let _ = system_log::log_event(
@@ -4096,6 +4187,7 @@ impl Kernel {
             }
         }
         let tool_failure_current = self.tool_failure_detected_for_run(&run_id).await;
+        if diag { eprintln!("[diag] run_input_once step=49 after_tool_failure_current"); }
         let mut tool_failure_cross_run = false;
         if let Some(window_mins) = settings
             .tool_failure_gate_window_mins
@@ -4124,7 +4216,9 @@ impl Kernel {
                 }
             }
         }
+        if diag { eprintln!("[diag] run_input_once step=50 after_tool_failure_cross_run"); }
         let tool_failure_detected = tool_failure_current || tool_failure_cross_run;
+        if diag { eprintln!("[diag] run_input_once step=51 after_tool_failure_detected"); }
         let context_evidence_ids = if matches!(input_kind, CoreInputKind::ToolResult)
             && input_source == "read_context"
         {
@@ -4132,8 +4226,18 @@ impl Kernel {
         } else {
             Vec::new()
         };
+        if diag { eprintln!("[diag] run_input_once step=52 after_context_evidence_ids"); }
+        if diag { eprintln!("[diag] run_input_once step=53 before_update_identity_ab_variant"); }
+        let disable_identity_ab = std::env::var("SYMBIOTE_DISABLE_IDENTITY_AB")
+            .ok()
+            .as_deref()
+            == Some("1");
         let _identity_ab_variant = if matches!(input_kind, CoreInputKind::User) {
-            self.update_identity_ab_variant(&run_id, &trace_id).await
+            if disable_identity_ab {
+                "A".to_string()
+            } else {
+                self.update_identity_ab_variant(&run_id, &trace_id).await
+            }
         } else {
             self.db
                 .get_key("identity_ab_variant")
@@ -4142,6 +4246,7 @@ impl Kernel {
                 .flatten()
                 .unwrap_or_else(|| "A".to_string())
         };
+        if diag { eprintln!("[diag] run_input_once step=54 after_update_identity_ab_variant"); }
         let identity_enforcement_enabled = true;
 
         let feedback_explicit_required = settings.explicit_feedback_only.unwrap_or(true);
@@ -4150,6 +4255,7 @@ impl Kernel {
         } else {
             true
         };
+        if diag { eprintln!("[diag] run_input_once step=55 before_feedback_block"); }
         if matches!(input_kind, CoreInputKind::User) && feedback_allowed {
             if let Some(kind) = classify_user_feedback(&input) {
                 let assistant_message = self
@@ -4418,6 +4524,7 @@ impl Kernel {
                 }
             }
         }
+        if diag { eprintln!("[diag] run_input_once step=56 after_feedback_block"); }
 
         let mut candidates = Vec::new();
         let mut created_at = 0i64;
@@ -4554,7 +4661,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         let mut prompt_build_snapshot: Option<CorePromptBuild> = None;
         let mut primary_json_packet: Option<PrimaryResponsePacket> = None;
 
+        if diag { eprintln!("[diag] run_input_once step=57 before_deliberation_loop"); }
         loop {
+            if diag { eprintln!("[diag] run_input_once step=58 deliberation_loop_enter"); }
             let _ = extra_notice.take();
             let _ = ask_override.take();
             let _ = registry_meta.take();
@@ -4671,6 +4780,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             };
             prompt_build_snapshot = Some(prompt_build);
             if let Some(build) = prompt_build_snapshot.as_ref() {
+                if diag { eprintln!("[diag] run_input_once step=59 before_prompt_capture"); }
                 self
                     .capture_prompt_snapshot(
                         &run_id,
@@ -4679,6 +4789,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                         attempt as i64,
                     )
                     .await;
+                if diag { eprintln!("[diag] run_input_once step=60 after_prompt_capture"); }
             }
 
             if *cancel_rx.borrow() {
@@ -4731,6 +4842,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     }
                 }
             }
+            if diag { eprintln!("[diag] run_input_once step=61 after_primary_response_parse"); }
 
             let (sanitized, stripped) = strip_internal_leak_tags(&response_content);
             if stripped {
@@ -4755,6 +4867,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 )
                 .await;
             }
+            if diag { eprintln!("[diag] run_input_once step=62 after_strip_internal_leak_tags"); }
 
             if self_audit_ambiguous && ask_override.is_none() {
                 let suggestion =
@@ -4941,6 +5054,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                     }
                 }
             }
+            if diag { eprintln!("[diag] run_input_once step=63 after_inline_tool_extract"); }
 
             if relational_mode && !tool_calls.is_empty() {
                 tool_calls.clear();
@@ -5025,6 +5139,7 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 response_meta.content_no_tags = response_content_no_tags.clone();
                 response_meta.raw_content = response_content.clone();
             }
+            if diag { eprintln!("[diag] run_input_once step=64 after_attribution_state_ref_extract"); }
             let attribution_claims = attribution_block
                 .as_ref()
                 .map(|b| b.claims.clone())
@@ -13458,14 +13573,30 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         state: &mut KernelState,
         policy_addendum: Option<String>,
     ) -> Result<(ChatResponseMeta, Vec<ToolCall>, CorePromptBuild), String> {
+        let diag = std::env::var("SYMBIOTE_DIAG_STDERR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if diag {
+            eprintln!("[diag] deliberate_input step=0 entry");
+        }
         let current_time = chrono::Local::now().format("%Y-%m-%d %I:%M %p %Z").to_string();
         let original_input = original_input_override.unwrap_or(input).to_string();
+        if diag {
+            eprintln!("[diag] deliberate_input step=1 before_semantic_hint");
+        }
         let semantic_hint = self
             .build_deliberation_semantic_hint(conversation_id, input)
             .await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=2 after_semantic_hint");
+        }
         let reflection_enabled = settings
             .stability_introspection_structured
             .unwrap_or(true);
+        if diag {
+            eprintln!("[diag] deliberate_input step=3 after_reflection_flag");
+        }
         if reflection_enabled {
             let db = self.db.clone();
             let model_client = self.model_client.clone();
@@ -13506,6 +13637,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
                 }
             });
         }
+        if diag {
+            eprintln!("[diag] deliberate_input step=4 after_reflection_spawn");
+        }
         let introspection_enabled = settings.enable_introspection.unwrap_or(true);
         let diagnostics_breaker_active = state.diagnostics_disabled_turns_remaining > 0;
         let confidence_threshold = settings.introspection_confidence_threshold.unwrap_or(0.5);
@@ -13540,11 +13674,17 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
         let mut introspection_summary = if should_introspect
             && settings.stability_introspection_structured.unwrap_or(true)
         {
+            if diag {
+                eprintln!("[diag] deliberate_input step=5 before_introspection_summary");
+            }
             self.build_introspection_summary(conversation_id, settings, &state)
                 .await
         } else {
             None
         };
+        if diag {
+            eprintln!("[diag] deliberate_input step=6 after_introspection_summary");
+        }
         let ignition_active = core_workspace::build_workspace_state(&state, None).ignition.active;
         if !ignition_active {
             introspection_summary = None;
@@ -13601,6 +13741,9 @@ You may call only get_workspace_state, get_inner_summary, get_rolling_summary, o
             input_kind,
             CoreInputKind::ToolResult | CoreInputKind::ToolError | CoreInputKind::SystemContext
         );
+        if diag {
+            eprintln!("[diag] deliberate_input step=7 after_prompt_mode_flags");
+        }
         let prompt_mode = if calculator_mode {
             "calculator"
         } else if self_audit_mode {
@@ -13658,6 +13801,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 policy_notes = Some(addendum.to_string());
             }
         }
+        if diag {
+            eprintln!("[diag] deliberate_input step=8 before_intent_sanity_check");
+        }
         if matches!(input_kind, CoreInputKind::User) {
             if let Some(note) = self
                 .intent_sanity_check_note(conversation_id, input, run_id, None)
@@ -13671,6 +13817,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 }
             }
         }
+        if diag {
+            eprintln!("[diag] deliberate_input step=9 after_intent_sanity_check");
+        }
         let compact_decision = self
             .evaluate_compact_prompt(
                 input,
@@ -13682,6 +13831,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 settings,
             )
             .await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=10 after_compact_prompt");
+        }
         let prompt_layout = if compact_decision.use_compact {
             PromptLayout::Compact
         } else {
@@ -13728,6 +13880,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
         let digest = self
             .select_monologue_digest(conversation_id, &state, MONOLOGUE_DIGEST_TTL_SECS)
             .await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=11 after_monologue_digest");
+        }
         if digest.stale {
             let _ = system_log::log_event(
                 &self.db.pool,
@@ -13791,6 +13946,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
         let now = Utc::now();
         let mut proaction_state = self.load_proaction_state().await;
         let hourly_metrics = self.compute_proaction_metrics(60).await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=12 after_proaction_metrics");
+        }
         let eval_hour = now.format("%Y-%m-%dT%H").to_string();
         if proaction_state.monologue_last_eval_hour.as_deref() != Some(eval_hour.as_str()) {
             let failures = monologue_acceptance_failures(&hourly_metrics);
@@ -13908,6 +14066,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
         .await
         .ok()
         .flatten();
+        if diag {
+            eprintln!("[diag] deliberate_input step=13 after_subject_snapshot");
+        }
         let mut attention_schema_summary: Option<String> = None;
         let mut workspace_contributors_summary: Option<String> = None;
         let mut reflective_narrative: Option<String> = None;
@@ -13950,6 +14111,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                     ),
                 );
             }
+        }
+        if diag {
+            eprintln!("[diag] deliberate_input step=14 after_attention_schema_parse");
         }
         if let Some((value, evidence_ids)) = self
             .db
@@ -14071,6 +14235,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
         };
         let context_intent_tags = intent_detection.tags.clone();
         let mut hydrated_context: Option<String> = None;
+        if diag {
+            eprintln!("[diag] deliberate_input step=15 before_context_hydration");
+        }
         if !context_selected_sections.is_empty() && !hydration_shadow {
             hydrated_context = self
                 .prefetch_context_hydration(
@@ -14080,6 +14247,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                     &context_intent_tags,
                 )
                 .await;
+        }
+        if diag {
+            eprintln!("[diag] deliberate_input step=16 after_context_hydration");
         }
         if let Some(reason) = fallback_reason.as_deref() {
             let _ = system_log::log_event(
@@ -14097,7 +14267,13 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             )
             .await;
         }
+        if diag {
+            eprintln!("[diag] deliberate_input step=17 before_memory_status");
+        }
         let memory_status = self.build_memory_status_snapshot(conversation_id, settings).await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=18 after_memory_status");
+        }
         let verified_focus = workspace_verified_focus(&state);
         let last_user_input_snapshot = state.last_user_input.clone();
         let context_spine = build_context_spine(
@@ -14143,6 +14319,9 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             context_spine: Some(context_spine),
             hydrated_context,
         };
+        if diag {
+            eprintln!("[diag] deliberate_input step=19 before_prompt_build");
+        }
         let _ = advance_run_phase(
             &self.db.pool,
             Some(&self.app_handle),
@@ -14154,8 +14333,14 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
         let prompt_started = Instant::now();
         let prompt_build =
             build_core_system_message_with_layout(&self.db, conversation_id, &prompt_input, prompt_layout).await?;
+        if diag {
+            eprintln!("[diag] deliberate_input step=20 after_prompt_build");
+        }
         let system_message = prompt_build.system_message.clone();
         state.prompt_section_hashes = prompt_build.section_hashes.clone();
+        if diag {
+            eprintln!("[diag] deliberate_input step=21 before_prompt_build_log");
+        }
         let _ = system_log::log_event(
             &self.db.pool,
             Some(&self.app_handle),
@@ -14179,7 +14364,13 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             }),
         )
         .await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=22 after_prompt_build_log");
+        }
         if let Some(plan) = prompt_build.context_hydration.as_ref() {
+            if diag {
+                eprintln!("[diag] deliberate_input step=23 before_context_hydration_log");
+            }
             let _ = system_log::log_event(
                 &self.db.pool,
                 Some(&self.app_handle),
@@ -14199,6 +14390,12 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 }),
             )
             .await;
+            if diag {
+                eprintln!("[diag] deliberate_input step=24 after_context_hydration_log");
+            }
+            if diag {
+                eprintln!("[diag] deliberate_input step=25 before_intent_tagging_log");
+            }
             let _ = system_log::log_event(
                 &self.db.pool,
                 Some(&self.app_handle),
@@ -14213,6 +14410,12 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 }),
             )
             .await;
+            if diag {
+                eprintln!("[diag] deliberate_input step=26 after_intent_tagging_log");
+            }
+            if diag {
+                eprintln!("[diag] deliberate_input step=27 before_intent_tagging_rules_log");
+            }
             let _ = system_log::log_event(
                 &self.db.pool,
                 Some(&self.app_handle),
@@ -14227,6 +14430,12 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 }),
             )
             .await;
+            if diag {
+                eprintln!("[diag] deliberate_input step=28 after_intent_tagging_rules_log");
+            }
+            if diag {
+                eprintln!("[diag] deliberate_input step=29 before_hydration_intent_log");
+            }
             let _ = system_log::log_event(
                 &self.db.pool,
                 Some(&self.app_handle),
@@ -14241,7 +14450,13 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                 }),
             )
             .await;
+            if diag {
+                eprintln!("[diag] deliberate_input step=30 after_hydration_intent_log");
+            }
             if !plan.intent_tags.is_empty() {
+                if diag {
+                    eprintln!("[diag] deliberate_input step=31 before_intent_tag_upserts");
+                }
                 let intent_evidence_ids = state.last_input_evidence_event_ids.clone();
                 let summary = format!("intent_tags: {}", plan.intent_tags.join(", "));
                 let _ = self
@@ -14261,10 +14476,16 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                         )
                         .await;
                 }
+                if diag {
+                    eprintln!("[diag] deliberate_input step=32 after_intent_tag_upserts");
+                }
             }
             if plan.intent_tags.iter().any(|t| t == "planning")
                 && state.workspace_goal_stack.is_empty()
             {
+                if diag {
+                    eprintln!("[diag] deliberate_input step=33 before_goal_stack_seed");
+                }
                 let goal_text = format!(
                     "Plan: {}",
                     summarize_snippet(&input, 120)
@@ -14311,200 +14532,23 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                     }),
                 )
                 .await;
-            }
-        }
-        if monologue_digest_used {
-            let _ = system_log::log_event(
-                &self.db.pool,
-                Some(&self.app_handle),
-                "info",
-                "kernel",
-                Some(run_id),
-                None,
-                json!({
-                    "event": "monologue_digest_injected",
-                    "prompt_hash": prompt_build.primary_prompt_hash,
-                    "digest_hash": monologue_digest_hash,
-                    "digest_len": monologue_digest_len,
-                }),
-            )
-            .await;
-        }
-        if prompt_build.override_mismatch && !prompt_build.override_guard_skipped.is_empty() {
-            let _ = system_log::log_event(
-                &self.db.pool,
-                Some(&self.app_handle),
-                "warn",
-                "kernel",
-                Some(run_id),
-                None,
-                json!({
-                    "event": "prompt_override_guard_applied",
-                    "skipped_sections": prompt_build.override_guard_skipped,
-                    "override_hash": prompt_build.override_hash,
-                    "canonical_primary_hash": prompt_build.canonical_primary_hash,
-                }),
-            )
-            .await;
-        }
-        for event in prompt_build.trim_events.iter() {
-            let _ = system_log::log_event(
-                &self.db.pool,
-                Some(&self.app_handle),
-                "info",
-                "kernel",
-                Some(run_id),
-                None,
-                json!({
-                    "event": "prompt_trim",
-                    "title": event.title,
-                    "original_chars": event.original_chars,
-                    "trimmed_chars": event.trimmed_chars,
-                    "reason": event.reason,
-                    "hash": event.hash,
-                }),
-            )
-            .await;
-            let is_critical = matches!(
-                event.title.as_str(),
-                "Response Style"
-                    | "Identity Anchor"
-                    | "SYMBIOTE_PHILOSOPHY"
-                    | "SYMBIOTE_POLICY_SUMMARY"
-                    | "Symbiote System Overview"
-                    | "Tool Availability"
-                    | "Working Memory"
-                    | "User Input"
-                    | "Rolling Summary"
-                    | "Memory Context"
-            ) || event.reason == "anchor_floor_exceeded";
-            if is_critical {
-                let hash_key = event.hash.as_deref().unwrap_or("unknown");
-                let key = format!("{}::{}", event.title, hash_key);
-                let (allow_log, suppressed) = rate_limit_event(
-                    &PROMPT_TRIM_CRITICAL_RATE,
-                    &key,
-                    Duration::from_secs(PROMPT_TRIM_CRITICAL_WINDOW_SECS),
-                );
-                if allow_log {
-                    if suppressed > 0 {
-                        let _ = system_log::log_event(
-                            &self.db.pool,
-                            Some(&self.app_handle),
-                            "info",
-                            "kernel",
-                            Some(run_id),
-                            None,
-                            json!({
-                                "event": "prompt_trim_critical_suppressed",
-                                "title": event.title,
-                                "hash": event.hash,
-                                "count": suppressed,
-                                "window_secs": PROMPT_TRIM_CRITICAL_WINDOW_SECS,
-                            }),
-                        )
-                        .await;
-                    }
-                    let _ = system_log::log_event(
-                        &self.db.pool,
-                        Some(&self.app_handle),
-                        "warn",
-                        "kernel",
-                        Some(run_id),
-                        None,
-                        json!({
-                            "event": "prompt_trim_critical",
-                            "title": event.title,
-                            "original_chars": event.original_chars,
-                            "trimmed_chars": event.trimmed_chars,
-                            "reason": event.reason,
-                            "hash": event.hash,
-                        }),
-                    )
-                    .await;
+                if diag {
+                    eprintln!("[diag] deliberate_input step=34 after_goal_stack_seed");
                 }
             }
         }
-        if prompt_build.prompt_overflow {
-            let _ = system_log::log_event(
-                &self.db.pool,
-                Some(&self.app_handle),
-                "warn",
-                "kernel",
-                Some(run_id),
-                None,
-                json!({
-                    "event": "prompt_overflow",
-                    "total_tokens": prompt_build.total_tokens,
-                }),
-            )
-            .await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=35 after_context_plan_block");
         }
-        let prompt_ms = prompt_started.elapsed().as_millis() as i64;
-        let _ = system_log::log_event(
-            &self.db.pool,
-            Some(&self.app_handle),
-            "info",
-            "kernel",
-            Some(run_id),
-            None,
-            json!({
-                "event": "timing_prompt_build",
-                "duration_ms": prompt_ms,
-                "prompt_mode": prompt_mode,
-                "compact": compact_decision.use_compact,
-                "input_len": input.len(),
-            }),
-        )
-        .await;
-        self.update_latency_avg("prompt_build", prompt_ms).await;
-        if prompt_ms > PERF_WARN_PROMPT_MS {
-            let _ = system_log::log_event(
-                &self.db.pool,
-                Some(&self.app_handle),
-                "warn",
-                "perf",
-                Some(run_id),
-                None,
-                json!({
-                    "event": "performance_regression",
-                    "stage": "prompt_build",
-                    "duration_ms": prompt_ms,
-                }),
-            )
-            .await;
-        }
-        let _ = system_log::log_event(
-            &self.db.pool,
-            Some(&self.app_handle),
-            "info",
-            "kernel",
-            Some(run_id),
-            None,
-            json!({
-                "event": "binding_hashes",
-                "workspace_hash": prompt_build.workspace_hash,
-                "inner_summary_hash": prompt_build.inner_summary_hash,
-                "rolling_summary_hash": prompt_build.rolling_summary_hash,
-                "capability_manifest_hash": prompt_build.capability_manifest_hash,
-            }),
-        )
-        .await;
-
-        if let Some(message_id) = assistant_message_id.as_deref() {
-            let updated = sqlx::query(
-                "UPDATE messages
-                 SET status = 'streaming'
-                 WHERE message_id = ?
-                   AND (status IS NULL OR status = 'pending')",
-            )
-            .bind(message_id)
-            .execute(&self.db.pool)
-            .await
-            .map(|res| res.rows_affected())
-            .unwrap_or(0);
-            if updated > 0 {
-                let _ = self.app_handle.emit("message_updated", ());
+        if monologue_digest_used {
+            if diag {
+                eprintln!("[diag] deliberate_input step=36 before_monologue_digest_log");
+            }
+            let disable_monologue_log = std::env::var("SYMBIOTE_DISABLE_MONOLOGUE_DIGEST_LOG")
+                .ok()
+                .as_deref()
+                == Some("1");
+            if !disable_monologue_log {
                 let _ = system_log::log_event(
                     &self.db.pool,
                     Some(&self.app_handle),
@@ -14513,36 +14557,282 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
                     Some(run_id),
                     None,
                     json!({
-                        "event": "assistant_streaming_started",
-                        "message_id": message_id,
+                        "event": "monologue_digest_injected",
+                        "prompt_hash": prompt_build.primary_prompt_hash,
+                        "digest_hash": monologue_digest_hash,
+                        "digest_len": monologue_digest_len,
+                    }),
+                )
+                .await;
+            } else if diag {
+                eprintln!("[diag] deliberate_input step=36a monologue_digest_log_disabled");
+            }
+            if diag {
+                eprintln!("[diag] deliberate_input step=37 after_monologue_digest_log");
+            }
+        }
+        let skip_prompt_trim_logs = std::env::var("SYMBIOTE_DISABLE_PROMPT_TRIM_LOGS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !skip_prompt_trim_logs {
+            if prompt_build.override_mismatch && !prompt_build.override_guard_skipped.is_empty() {
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "warn",
+                    "kernel",
+                    Some(run_id),
+                    None,
+                    json!({
+                        "event": "prompt_override_guard_applied",
+                        "skipped_sections": prompt_build.override_guard_skipped,
+                        "override_hash": prompt_build.override_hash,
+                        "canonical_primary_hash": prompt_build.canonical_primary_hash,
                     }),
                 )
                 .await;
             }
+            for event in prompt_build.trim_events.iter() {
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "info",
+                    "kernel",
+                    Some(run_id),
+                    None,
+                    json!({
+                        "event": "prompt_trim",
+                        "title": event.title,
+                        "original_chars": event.original_chars,
+                        "trimmed_chars": event.trimmed_chars,
+                        "reason": event.reason,
+                        "hash": event.hash,
+                    }),
+                )
+                .await;
+                let is_critical = matches!(
+                    event.title.as_str(),
+                    "Response Style"
+                        | "Identity Anchor"
+                        | "SYMBIOTE_PHILOSOPHY"
+                        | "SYMBIOTE_POLICY_SUMMARY"
+                        | "Symbiote System Overview"
+                        | "Tool Availability"
+                        | "Working Memory"
+                        | "User Input"
+                        | "Rolling Summary"
+                        | "Memory Context"
+                ) || event.reason == "anchor_floor_exceeded";
+                if is_critical {
+                    let hash_key = event.hash.as_deref().unwrap_or("unknown");
+                    let key = format!("{}::{}", event.title, hash_key);
+                    let (allow_log, suppressed) = rate_limit_event(
+                        &PROMPT_TRIM_CRITICAL_RATE,
+                        &key,
+                        Duration::from_secs(PROMPT_TRIM_CRITICAL_WINDOW_SECS),
+                    );
+                    if allow_log {
+                        if suppressed > 0 {
+                            let _ = system_log::log_event(
+                                &self.db.pool,
+                                Some(&self.app_handle),
+                                "info",
+                                "kernel",
+                                Some(run_id),
+                                None,
+                                json!({
+                                    "event": "prompt_trim_critical_suppressed",
+                                    "title": event.title,
+                                    "hash": event.hash,
+                                    "count": suppressed,
+                                    "window_secs": PROMPT_TRIM_CRITICAL_WINDOW_SECS,
+                                }),
+                            )
+                            .await;
+                        }
+                        let _ = system_log::log_event(
+                            &self.db.pool,
+                            Some(&self.app_handle),
+                            "warn",
+                            "kernel",
+                            Some(run_id),
+                            None,
+                            json!({
+                                "event": "prompt_trim_critical",
+                                "title": event.title,
+                                "original_chars": event.original_chars,
+                                "trimmed_chars": event.trimmed_chars,
+                                "reason": event.reason,
+                                "hash": event.hash,
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+            if prompt_build.prompt_overflow {
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "warn",
+                    "kernel",
+                    Some(run_id),
+                    None,
+                    json!({
+                        "event": "prompt_overflow",
+                        "total_tokens": prompt_build.total_tokens,
+                    }),
+                )
+                .await;
+            }
+        } else if diag {
+            eprintln!("[diag] deliberate_input step=38 prompt_trim_logs_disabled");
+        }
+        if diag {
+            eprintln!("[diag] deliberate_input step=39 after_prompt_trim_logs");
+        }
+        let disable_post_prompt_metrics = std::env::var("SYMBIOTE_DISABLE_POST_PROMPT_METRICS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !disable_post_prompt_metrics {
+            let prompt_ms = prompt_started.elapsed().as_millis() as i64;
+            let _ = system_log::log_event(
+                &self.db.pool,
+                Some(&self.app_handle),
+                "info",
+                "kernel",
+                Some(run_id),
+                None,
+                json!({
+                    "event": "timing_prompt_build",
+                    "duration_ms": prompt_ms,
+                    "prompt_mode": prompt_mode,
+                    "compact": compact_decision.use_compact,
+                    "input_len": input.len(),
+                }),
+            )
+            .await;
+            self.update_latency_avg("prompt_build", prompt_ms).await;
+            if prompt_ms > PERF_WARN_PROMPT_MS {
+                let _ = system_log::log_event(
+                    &self.db.pool,
+                    Some(&self.app_handle),
+                    "warn",
+                    "perf",
+                    Some(run_id),
+                    None,
+                    json!({
+                        "event": "performance_regression",
+                        "stage": "prompt_build",
+                        "duration_ms": prompt_ms,
+                    }),
+                )
+                .await;
+            }
+            let _ = system_log::log_event(
+                &self.db.pool,
+                Some(&self.app_handle),
+                "info",
+                "kernel",
+                Some(run_id),
+                None,
+                json!({
+                    "event": "binding_hashes",
+                    "workspace_hash": prompt_build.workspace_hash,
+                    "inner_summary_hash": prompt_build.inner_summary_hash,
+                    "rolling_summary_hash": prompt_build.rolling_summary_hash,
+                    "capability_manifest_hash": prompt_build.capability_manifest_hash,
+                }),
+            )
+            .await;
+
+            if let Some(message_id) = assistant_message_id.as_deref() {
+                let updated = sqlx::query(
+                    "UPDATE messages
+                     SET status = 'streaming'
+                     WHERE message_id = ?
+                       AND (status IS NULL OR status = 'pending')",
+                )
+                .bind(message_id)
+                .execute(&self.db.pool)
+                .await
+                .map(|res| res.rows_affected())
+                .unwrap_or(0);
+                if updated > 0 {
+                    let _ = self.app_handle.emit("message_updated", ());
+                    let _ = system_log::log_event(
+                        &self.db.pool,
+                        Some(&self.app_handle),
+                        "info",
+                        "kernel",
+                        Some(run_id),
+                        None,
+                        json!({
+                            "event": "assistant_streaming_started",
+                            "message_id": message_id,
+                        }),
+                    )
+                    .await;
+                }
+            }
+        } else if diag {
+            eprintln!("[diag] deliberate_input step=40 post_prompt_metrics_disabled");
+        }
+        if diag {
+            eprintln!("[diag] deliberate_input step=41 after_post_prompt_metrics");
         }
 
-        let (tool_defs, tool_choice) = if self_audit_mode {
+        if diag {
+            eprintln!("[diag] deliberate_input step=42 before_tool_defs");
+        }
+        let disable_tool_defs = std::env::var("SYMBIOTE_DISABLE_TOOL_DEFS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let (tool_defs, tool_choice) = if self_audit_mode || disable_tool_defs {
             (None, Some("none".to_string()))
         } else {
             (Some(self.tools.definitions_for_settings(settings)), Some("auto".to_string()))
         };
-        let parse_error_count: i64 = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM system_logs
-             WHERE json_extract(payload, '$.event') = 'prediction_generation_rejected'
-               AND json_extract(payload, '$.reason') = 'json_parse_error'
-               AND datetime(timestamp) >= datetime('now', '-1 hour')",
-        )
-        .fetch_optional(&self.db.pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+        if diag {
+            eprintln!("[diag] deliberate_input step=43 after_tool_defs");
+        }
+        if diag {
+            eprintln!("[diag] deliberate_input step=44 before_parse_error_count");
+        }
+        let disable_parse_error_count = std::env::var("SYMBIOTE_DISABLE_PARSE_ERROR_COUNT")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let parse_error_count: i64 = if disable_parse_error_count {
+            0
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM system_logs
+                 WHERE json_extract(payload, '$.event') = 'prediction_generation_rejected'
+                   AND json_extract(payload, '$.reason') = 'json_parse_error'
+                   AND datetime(timestamp) >= datetime('now', '-1 hour')",
+            )
+            .fetch_optional(&self.db.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+        };
+        if diag {
+            eprintln!("[diag] deliberate_input step=45 after_parse_error_count");
+        }
         let (temperature, max_tokens) = if parse_error_count >= 3 {
             (Some(0.1), Some(300))
         } else {
             (None, None)
         };
 
+        if diag {
+            eprintln!("[diag] deliberate_input step=46 before_request_build");
+        }
         let request = ChatCompletionRequest {
             model: settings
                 .active_model_id
@@ -14571,7 +14861,13 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             run_id: Some(run_id.to_string()),
             request_label: Some("primary_response".to_string()),
         };
+        if diag {
+            eprintln!("[diag] deliberate_input step=47 after_request_build");
+        }
 
+        if diag {
+            eprintln!("[diag] deliberate_input step=48 before_advance_run_phase_model_call");
+        }
         let _ = advance_run_phase(
             &self.db.pool,
             Some(&self.app_handle),
@@ -14580,13 +14876,27 @@ Do not invent capabilities or gaps. If something is unknown, say so. Do not call
             Some("model_call"),
         )
         .await;
+        if diag {
+            eprintln!("[diag] deliberate_input step=49 after_advance_run_phase_model_call");
+        }
 
         let is_context_error = |err: &str| {
             let lowered = err.to_lowercase();
             lowered.contains("context") || lowered.contains("maximum context") || lowered.contains("context length") || lowered.contains("max tokens")
         };
 
-        let response_meta = match if settings.streaming_enabled {
+        let force_nonstream = std::env::var("SYMBIOTE_DISABLE_STREAMING")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if diag {
+            eprintln!(
+                "[diag] deliberate_input step=50 before_model_call streaming_enabled={} force_nonstream={}",
+                settings.streaming_enabled,
+                force_nonstream
+            );
+        }
+        let response_meta = match if settings.streaming_enabled && !force_nonstream {
             self.model_client
                 .chat_with_meta_stream(&settings.api_base_url, settings.api_key.as_deref(), &request)
                 .await
